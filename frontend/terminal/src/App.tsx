@@ -249,22 +249,35 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 
 		// --- Permission modal (MUST be before busy check — modal appears while busy) ---
 		if (session.modal?.kind === 'permission') {
-			if (chunk.toLowerCase() === 'y') {
+			const denyPermission = (): void => {
 				session.sendRequest({
 					type: 'permission_response',
-					request_id: session.modal.request_id,
-					allowed: true,
+					request_id: session.modal?.request_id,
+					allowed: false,
+					permission_scope: 'once',
 				});
 				session.setModal(null);
+			};
+			const allowPermission = (scope: 'once' | 'session'): void => {
+				session.sendRequest({
+					type: 'permission_response',
+					request_id: session.modal?.request_id,
+					allowed: true,
+					permission_scope: scope,
+				});
+				session.setModal(null);
+			};
+			const normalized = chunk.toLowerCase();
+			if (normalized === '1' || normalized === 'n' || isEscape) {
+				denyPermission();
 				return;
 			}
-			if (chunk.toLowerCase() === 'n' || isEscape) {
-				session.sendRequest({
-					type: 'permission_response',
-					request_id: session.modal.request_id,
-					allowed: false,
-				});
-				session.setModal(null);
+			if (normalized === '2' || normalized === 'y') {
+				allowPermission('once');
+				return;
+			}
+			if (normalized === '3' || normalized === 's') {
+				allowPermission('session');
 				return;
 			}
 			return;

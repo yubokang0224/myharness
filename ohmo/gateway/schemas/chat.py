@@ -15,6 +15,14 @@ class SessionInfo(BaseModel):
     id: str
     title: str
     agent_name: str | None = None
+    conversation_id: str | None = None
+    session_key: str | None = None
+    channel: str = "web"
+    platform: str = "web"
+    bot_name: str | None = None
+    chat_id: str | None = None
+    sender_id: str | None = None
+    sender_name: str | None = None
     created_at: float
     updated_at: float
     message_count: int = 0
@@ -84,3 +92,4 @@ class SSEPermissionRequest(BaseModel):
 class ApproveRequest(BaseModel):
     request_id: str
     approved: bool
+    scope: Literal["once", "session"] = "once"

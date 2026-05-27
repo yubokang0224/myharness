@@ -4,7 +4,7 @@ from pathlib import Path
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage
 
-from ohmo.session_storage import OhmoSessionBackend, get_session_dir
+from ohmo.session_storage import OhmoSessionBackend, get_session_dir, list_snapshots
 from ohmo.workspace import initialize_workspace
 
 
@@ -47,11 +47,40 @@ def test_ohmo_session_backend_loads_latest_for_session_key(tmp_path: Path):
         },
     )
 
+    session_dir = get_session_dir(workspace)
+    assert not (session_dir / "latest.json").exists()
+
     loaded = backend.load_latest_for_session_key("feishu:chat-1")
     assert loaded is not None
     assert loaded["session_id"] == "abc123"
     assert loaded["session_key"] == "feishu:chat-1"
     assert loaded["tool_metadata"]["task_focus_state"]["goal"] == "Continue the same Feishu task"
+
+
+def test_ohmo_session_backend_records_remote_session_metadata(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    backend = OhmoSessionBackend(workspace)
+    backend.save_snapshot(
+        cwd=tmp_path,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("hello dingtalk")],
+        usage=UsageSnapshot(),
+        session_id="abc123",
+        session_key="dingtalk:production-bot:production-agent:chat-1:user-1",
+        sender_name="张三",
+    )
+
+    snapshots = list_snapshots(workspace)
+
+    assert snapshots[0]["conversation_id"]
+    assert snapshots[0]["channel"] == "dingtalk"
+    assert snapshots[0]["bot_name"] == "production-bot"
+    assert snapshots[0]["agent_name"] == "production-agent"
+    assert snapshots[0]["chat_id"] == "chat-1"
+    assert snapshots[0]["sender_id"] == "user-1"
+    assert snapshots[0]["sender_name"] == "张三"
 
 
 def test_ohmo_session_backend_sanitizes_legacy_empty_assistant_messages(tmp_path: Path):

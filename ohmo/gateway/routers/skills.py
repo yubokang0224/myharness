@@ -42,6 +42,21 @@ def _skill_to_response(skill, disabled: set[str]) -> SkillResponse:
     )
 
 
+def _load_skill_registry_for_runtime(runtime: _RuntimeState):
+    """Load the same skill universe that ohmo runtimes expose to agents."""
+    from openharness.config.settings import load_settings
+    from openharness.skills.loader import load_skill_registry
+    from ohmo.workspace import get_plugins_dir, get_skills_dir
+
+    workspace = getattr(runtime, "workspace", None)
+    return load_skill_registry(
+        Path.cwd(),
+        extra_skill_dirs=(get_skills_dir(workspace),),
+        extra_plugin_roots=(get_plugins_dir(workspace),),
+        settings=load_settings(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Skill endpoints
 # ---------------------------------------------------------------------------
@@ -52,9 +67,7 @@ async def list_skills(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """List all registered Agent-framework skills."""
-    from openharness.skills.loader import load_skill_registry
-
-    registry = load_skill_registry()
+    registry = _load_skill_registry_for_runtime(runtime)
     disabled = runtime.disabled_skills
     return [_skill_to_response(s, disabled) for s in registry.list_skills()]
 
@@ -65,9 +78,7 @@ async def get_skill(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
-    from openharness.skills.loader import load_skill_registry
-
-    registry = load_skill_registry()
+    registry = _load_skill_registry_for_runtime(runtime)
     skill = registry.get(name)
     if skill is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Skill '{name}' not found")
@@ -127,9 +138,7 @@ async def update_skill(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Update a custom skill."""
-    from openharness.skills.loader import load_skill_registry
-
-    registry = load_skill_registry()
+    registry = _load_skill_registry_for_runtime(runtime)
     skill = registry.get(name)
     if skill is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Skill '{name}' not found")
@@ -161,9 +170,7 @@ async def delete_skill(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Delete a user-created custom skill."""
-    from openharness.skills.loader import load_skill_registry
-
-    registry = load_skill_registry()
+    registry = _load_skill_registry_for_runtime(runtime)
     skill = registry.get(name)
     if skill is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Skill '{name}' not found")

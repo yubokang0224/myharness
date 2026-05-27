@@ -24,8 +24,11 @@ from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.channels.impl.manager import ChannelManager
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
-from ohmo.gateway.config import save_gateway_config
+from ohmo.gateway.config import build_channel_manager_config, save_gateway_config
+from ohmo.gateway.dependencies import AuthContext
 from ohmo.gateway.models import GatewayConfig, GatewayState
+from ohmo.gateway.routers.chat import list_sessions, send_message
+from ohmo.gateway.schemas.chat import MessageRequest
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
@@ -91,6 +94,81 @@ def test_gateway_router_scopes_dingtalk_by_bot_agent_and_sender():
     assert session_key_for_message(message) == "dingtalk:ops-bot:ops-agent:chat-1:u1"
 
 
+@pytest.mark.asyncio
+async def test_chat_session_list_hides_remote_channel_sessions_by_default(tmp_path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("local")],
+        usage=UsageSnapshot(),
+        session_id="local-session",
+    )
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("remote")],
+        usage=UsageSnapshot(),
+        session_id="remote-session",
+        session_key="dingtalk:dingtalk-bot:general-purpose:u1:u1",
+    )
+
+    local_only = await list_sessions(
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+        include_remote=False,
+        channel=None,
+        agent_name=None,
+    )
+    with_remote = await list_sessions(
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+        include_remote=True,
+        channel=None,
+        agent_name=None,
+    )
+
+    assert [session.id for session in local_only] == ["local-session"]
+    assert {session.id for session in with_remote} == {"local-session", "remote-session"}
+    remote = next(session for session in with_remote if session.id == "remote-session")
+    assert remote.conversation_id
+    assert remote.channel == "dingtalk"
+    assert remote.bot_name == "dingtalk-bot"
+    assert remote.agent_name == "general-purpose"
+    assert remote.chat_id == "u1"
+    assert remote.sender_id == "u1"
+
+
+@pytest.mark.asyncio
+async def test_chat_send_message_returns_sse_error_when_provider_auth_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("openharness.config.load_settings", lambda: SimpleNamespace())
+
+    def missing_auth(settings):
+        del settings
+        raise SystemExit(1)
+
+    monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", missing_auth)
+
+    response = await send_message(
+        session_id="session-1",
+        body=MessageRequest(content="hello"),
+        auth=AuthContext(user={"sub": "u1"}, raw_token="token"),
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    chunks = [chunk async for chunk in response.body_iterator]
+    payload = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in chunks)
+
+    assert '"event":"error"' in payload
+    assert "Authentication is not configured" in payload
+    assert '"recoverable":false' in payload
+
+
 def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypatch, caplog):
     monkeypatch.setattr(
         "openharness.channels.impl.manager.ChannelManager._agent_exists",
@@ -127,6 +205,32 @@ def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypat
     assert channel.bot_name == "ops-bot"
     assert channel.default_agent == "worker"
     assert "DingTalk bot bad-bot skipped: default_agent missing-agent not found" in caplog.text
+
+
+def test_gateway_config_validates_dingtalk_bots_from_json_dicts():
+    config = GatewayConfig(
+        enabled_channels=["dingtalk"],
+        channel_configs={
+            "dingtalk": {
+                "bots": [
+                    {
+                        "name": "dingtalk-bot",
+                        "client_id": "client-id",
+                        "client_secret": "client-secret",
+                        "robot_code": "",
+                        "allow_from": ["*"],
+                        "default_agent": "general-purpose",
+                    }
+                ]
+            }
+        },
+    )
+
+    channel_config = build_channel_manager_config(config).channels.dingtalk
+
+    assert isinstance(channel_config.bots[0], DingTalkBotConfig)
+    assert channel_config.bots[0].name == "dingtalk-bot"
+    assert channel_config.bots[0].default_agent == "general-purpose"
 
 
 def test_channel_manager_keeps_legacy_single_dingtalk_config(monkeypatch):

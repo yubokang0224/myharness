@@ -97,6 +97,7 @@ class OhmoSessionRuntimePool:
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._bundles: dict[str, RuntimeBundle] = {}
         self._session_agents: dict[str, str] = {}
+        self._session_metadata: dict[str, dict[str, str | None]] = {}
 
     @property
     def active_sessions(self) -> int:
@@ -174,6 +175,7 @@ class OhmoSessionRuntimePool:
 
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
+        self._session_metadata[session_key] = self._session_metadata_for_message(message)
         user_message = _build_inbound_user_message(message)
         user_prompt = user_message.text
         bundle = await self.get_bundle(
@@ -529,6 +531,7 @@ class OhmoSessionRuntimePool:
 
     async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
         tool_metadata = getattr(bundle.engine, "tool_metadata", {}) or {}
+        session_metadata = self._session_metadata.get(session_key, {})
         self._session_backend.save_snapshot(
             cwd=self._cwd,
             model=bundle.current_settings().model,
@@ -537,6 +540,13 @@ class OhmoSessionRuntimePool:
             usage=bundle.engine.total_usage,
             session_id=bundle.session_id,
             session_key=session_key,
+            agent_name=session_metadata.get("agent_name") or self._session_agents.get(session_key),
+            channel=session_metadata.get("channel"),
+            platform=session_metadata.get("platform"),
+            bot_name=session_metadata.get("bot_name"),
+            chat_id=session_metadata.get("chat_id"),
+            sender_id=session_metadata.get("sender_id"),
+            sender_name=session_metadata.get("sender_name"),
             tool_metadata=tool_metadata,
         )
         logger.info(
@@ -595,6 +605,7 @@ class OhmoSessionRuntimePool:
         if self._session_backend.delete_latest_for_session_key(session_key):
             reset_any = True
         self._session_agents.pop(session_key, None)
+        self._session_metadata.pop(session_key, None)
         return reset_any
 
     def _runtime_system_prompt(self, bundle: RuntimeBundle, latest_user_prompt: str | None) -> str:
@@ -620,6 +631,18 @@ class OhmoSessionRuntimePool:
         if not isinstance(raw, str):
             return None
         return raw.strip() or None
+
+    def _session_metadata_for_message(self, message: InboundMessage) -> dict[str, str | None]:
+        agent_name = self._agent_name_for_message(message)
+        return {
+            "channel": message.channel.split(":", 1)[0],
+            "platform": str(message.metadata.get("platform") or message.channel.split(":", 1)[0]),
+            "bot_name": _optional_str(message.metadata.get("bot_name")),
+            "agent_name": agent_name,
+            "chat_id": message.chat_id,
+            "sender_id": message.sender_id,
+            "sender_name": _optional_str(message.metadata.get("sender_name")),
+        }
 
     @staticmethod
     def _resolve_agent_definition(agent_name: str | None) -> AgentDefinition | None:
@@ -991,6 +1014,13 @@ def _decode_text_preview(data: bytes) -> str | None:
     if len(normalized) > _TEXT_PREVIEW_CHARS:
         return normalized[: _TEXT_PREVIEW_CHARS - 3] + "..."
     return normalized
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _prefers_chinese_progress(content: str) -> bool:

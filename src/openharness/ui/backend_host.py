@@ -31,6 +31,7 @@ from openharness.engine.stream_events import (
     ToolExecutionStarted,
 )
 from openharness.output_styles import load_output_styles
+from openharness.permissions import PermissionChecker
 from openharness.tasks import get_task_manager
 from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.protocol import BackendEvent, FrontendRequest, TranscriptItem
@@ -68,6 +69,12 @@ class BackendHostConfig:
     include_project_memory: bool = True
 
 
+@dataclass(frozen=True)
+class PermissionPromptResponse:
+    allowed: bool
+    scope: str = "once"
+
+
 class ReactBackendHost:
     """Drive the OpenHarness runtime over a structured stdin/stdout protocol."""
 
@@ -76,9 +83,10 @@ class ReactBackendHost:
         self._bundle = None
         self._write_lock = asyncio.Lock()
         self._request_queue: asyncio.Queue[FrontendRequest] = asyncio.Queue()
-        self._permission_requests: dict[str, asyncio.Future[bool]] = {}
+        self._permission_requests: dict[str, asyncio.Future[PermissionPromptResponse]] = {}
         self._question_requests: dict[str, asyncio.Future[str]] = {}
         self._permission_lock = asyncio.Lock()
+        self._session_allowed_tools: set[str] = set()
         self._busy = False
         self._running = True
         self._active_request_task: asyncio.Task[bool] | None = None
@@ -196,7 +204,8 @@ class ReactBackendHost:
             if request.type == "permission_response" and request.request_id in self._permission_requests:
                 future = self._permission_requests[request.request_id]
                 if not future.done():
-                    future.set_result(bool(request.allowed))
+                    scope = request.permission_scope or "once"
+                    future.set_result(PermissionPromptResponse(bool(request.allowed), scope))
                 continue
             if request.type == "question_response" and request.request_id in self._question_requests:
                 future = self._question_requests[request.request_id]
@@ -481,27 +490,27 @@ class ReactBackendHost:
             options = [
                 {
                     "value": "default",
-                    "label": "Default",
-                    "description": "Ask before write/execute operations",
+                    "label": "默认",
+                    "description": "写入或执行前需要确认",
                     "active": settings.permission.mode.value == "default",
                 },
                 {
                     "value": "full_auto",
-                    "label": "Auto",
-                    "description": "Allow all tools automatically",
+                    "label": "自动",
+                    "description": "自动允许所有工具",
                     "active": settings.permission.mode.value == "full_auto",
                 },
                 {
                     "value": "plan",
-                    "label": "Plan Mode",
-                    "description": "Block all write operations",
+                    "label": "计划模式",
+                    "description": "阻止所有写入操作",
                     "active": settings.permission.mode.value == "plan",
                 },
             ]
             await self._emit(
                 BackendEvent(
                     type="select_request",
-                    modal={"kind": "select", "title": "Permission Mode", "command": "permissions"},
+                    modal={"kind": "select", "title": "权限模式", "command": "permissions"},
                     select_options=options,
                 )
             )
@@ -734,7 +743,7 @@ class ReactBackendHost:
     async def _ask_permission(self, tool_name: str, reason: str) -> bool:
         async with self._permission_lock:
             request_id = uuid4().hex
-            future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            future: asyncio.Future[PermissionPromptResponse] = asyncio.get_running_loop().create_future()
             self._permission_requests[request_id] = future
             await self._emit(
                 BackendEvent(
@@ -748,12 +757,26 @@ class ReactBackendHost:
                 )
             )
             try:
-                return await asyncio.wait_for(future, timeout=300)
+                response = await asyncio.wait_for(future, timeout=300)
+                if isinstance(response, bool):
+                    return response
+                if response.allowed and response.scope == "session":
+                    self._allow_tool_for_session(tool_name)
+                return response.allowed
             except asyncio.TimeoutError:
                 log.warning("Permission request %s timed out after 300s, denying", request_id)
                 return False
             finally:
                 self._permission_requests.pop(request_id, None)
+
+    def _allow_tool_for_session(self, tool_name: str) -> None:
+        if not tool_name or self._bundle is None:
+            return
+        self._session_allowed_tools.add(tool_name)
+        settings = self._bundle.current_settings()
+        merged_allowed_tools = list(dict.fromkeys([*settings.permission.allowed_tools, *self._session_allowed_tools]))
+        settings.permission.allowed_tools = merged_allowed_tools
+        self._bundle.engine.set_permission_checker(PermissionChecker(settings.permission))
 
     async def _ask_question(self, question: str) -> str:
         request_id = uuid4().hex

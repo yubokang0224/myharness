@@ -1012,8 +1012,8 @@ async def test_execute_tool_call_returns_actionable_reason_when_user_denies_conf
     )
 
     assert result.is_error is True
-    assert "Mutating tools require user confirmation" in result.content
-    assert "/permissions full_auto" in result.content
+    assert "需要你确认" in result.content
+    assert "/permissions full_auto" not in result.content
 
 
 @pytest.mark.asyncio

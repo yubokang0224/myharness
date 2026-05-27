@@ -6,13 +6,15 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from openharness.api.usage import UsageSnapshot
 from ohmo.gateway.dependencies import AuthContext, get_auth_context, get_current_user, get_runtime, _RuntimeState
 from ohmo.gateway.schemas.chat import (
     ApproveRequest,
@@ -39,6 +41,11 @@ from ohmo.session_storage import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["chat"])
 
+_AUTH_CONFIG_ERROR_MESSAGE = (
+    "Authentication is not configured for the current model provider. "
+    "Run `oh auth login` or set ANTHROPIC_API_KEY / OPENAI_API_KEY."
+)
+
 # ---------------------------------------------------------------------------
 # In-process abort registry
 # ---------------------------------------------------------------------------
@@ -47,7 +54,19 @@ _abort_events: dict[str, asyncio.Event] = {}
 # ---------------------------------------------------------------------------
 # In-process permission approval registry (keyed by request_id)
 # ---------------------------------------------------------------------------
-_pending_approvals: dict[str, "asyncio.Future[bool]"] = {}
+@dataclass(frozen=True)
+class PermissionApproval:
+    approved: bool
+    scope: str = "once"
+
+
+_pending_approvals: dict[str, "asyncio.Future[PermissionApproval]"] = {}
+_session_allowed_tools: dict[str, set[str]] = {}
+
+_EMPTY_ASSISTANT_MESSAGE = (
+    "Model returned an empty assistant message. "
+    "The turn was ignored to keep the session healthy."
+)
 
 
 def _sse_line(payload: Any) -> str:
@@ -122,6 +141,9 @@ def _build_attachment_notes(attachments: list[dict[str, Any]], cwd: Path) -> str
 async def list_sessions(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+    include_remote: bool = Query(False, description="Include sessions created by remote channels."),
+    channel: str | None = Query(None, description="Filter sessions by channel, e.g. web or dingtalk."),
+    agent_name: str | None = Query(None, description="Filter sessions by agent name."),
 ):
     """List all persisted sessions."""
     try:
@@ -130,11 +152,25 @@ async def list_sessions(
         snapshots = []
     result = []
     for snap in snapshots:
+        if snap.get("session_key") and not include_remote:
+            continue
+        if channel and snap.get("channel") != channel:
+            continue
+        if agent_name and (snap.get("agent_name") or "") != agent_name:
+            continue
         result.append(
             SessionInfo(
                 id=snap.get("session_id", ""),
                 title=snap.get("summary", snap.get("session_id", "Conversation")),
                 agent_name=snap.get("agent_name"),
+                conversation_id=snap.get("conversation_id"),
+                session_key=snap.get("session_key"),
+                channel=snap.get("channel") or "web",
+                platform=snap.get("platform") or snap.get("channel") or "web",
+                bot_name=snap.get("bot_name"),
+                chat_id=snap.get("chat_id"),
+                sender_id=snap.get("sender_id"),
+                sender_name=snap.get("sender_name"),
                 created_at=snap.get("created_at", 0.0),
                 updated_at=snap.get("updated_at", snap.get("created_at", 0.0)),
                 message_count=snap.get("message_count", 0),
@@ -152,10 +188,30 @@ async def create_session(
     """Create a new chat session."""
     session_id = uuid4().hex[:12]
     now = time.time()
+    try:
+        save_session_snapshot(
+            cwd=Path.cwd(),
+            workspace=runtime.workspace,
+            model="",
+            system_prompt="",
+            messages=[],
+            usage=UsageSnapshot(),
+            session_id=session_id,
+            title=body.title or "New Conversation",
+            agent_name=body.agent_name,
+            channel="web",
+            platform="web",
+        )
+    except Exception:
+        logger.exception("Failed to create initial session snapshot for %s", session_id)
     return SessionInfo(
         id=session_id,
         title=body.title or "New Conversation",
         agent_name=body.agent_name,
+        conversation_id=session_id,
+        session_key=None,
+        channel="web",
+        platform="web",
         created_at=now,
         updated_at=now,
     )
@@ -269,6 +325,8 @@ async def send_message(
 
     # SSE event queue: str items are serialised SSE lines, None signals end-of-stream
     sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    engine_holder: dict[str, Any] = {}
+    settings_holder: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # permission_prompt callback — called by the engine when a tool needs
@@ -278,13 +336,30 @@ async def send_message(
     async def permission_prompt(tool_name: str, reason: str) -> bool:
         req_id = uuid4().hex[:8]
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[bool] = loop.create_future()
+        future: asyncio.Future[PermissionApproval] = loop.create_future()
         _pending_approvals[req_id] = future
         await sse_queue.put(
             _sse_line(SSEPermissionRequest(tool_name=tool_name, reason=reason, request_id=req_id))
         )
         try:
-            return await asyncio.wait_for(asyncio.shield(future), timeout=300.0)
+            approval = await asyncio.wait_for(asyncio.shield(future), timeout=300.0)
+            if isinstance(approval, bool):
+                return approval
+            if approval.approved and approval.scope == "session":
+                _session_allowed_tools.setdefault(session_id, set()).add(tool_name)
+                settings_for_session = settings_holder.get("settings")
+                engine_for_session = engine_holder.get("engine")
+                if settings_for_session is not None and engine_for_session is not None:
+                    from openharness.permissions import PermissionChecker
+
+                    settings_for_session.permission.allowed_tools = list(
+                        dict.fromkeys([
+                            *settings_for_session.permission.allowed_tools,
+                            *_session_allowed_tools.get(session_id, set()),
+                        ])
+                    )
+                    engine_for_session.set_permission_checker(PermissionChecker(settings_for_session.permission))
+            return approval.approved
         except asyncio.TimeoutError:
             return False
         finally:
@@ -316,7 +391,37 @@ async def send_message(
             )
 
             settings = load_settings()
-            api_client = _resolve_api_client_from_settings(settings)
+            agent_def = None
+            agent_name: str | None = None
+            snap = None
+            try:
+                snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+                if snap:
+                    agent_name = snap.get("agent_name")
+            except Exception:
+                snap = None
+            if agent_name:
+                try:
+                    from openharness.coordinator.agent_definitions import get_agent_definition
+
+                    agent_def = get_agent_definition(agent_name)
+                    if agent_def is not None:
+                        settings = settings.merge_cli_overrides(
+                            model=agent_def.model if agent_def.model and agent_def.model != "inherit" else None,
+                            system_prompt=agent_def.system_prompt,
+                            permission_mode=agent_def.permission_mode,
+                            max_turns=agent_def.max_turns,
+                        )
+                except Exception:
+                    logger.exception("Failed to apply agent definition for %s", agent_name)
+            try:
+                api_client = _resolve_api_client_from_settings(settings)
+            except SystemExit:
+                logger.warning("Model provider authentication is not configured for session %s", session_id)
+                await sse_queue.put(
+                    _sse_line(SSEError(message=_AUTH_CONFIG_ERROR_MESSAGE, recoverable=False))
+                )
+                return
             hsjm_auth = make_hsjm_auth_metadata(auth.raw_token)
             tool_metadata = {"hsjm_auth": hsjm_auth} if hsjm_auth else {}
             mcp_manager = McpClientManager(
@@ -326,37 +431,26 @@ async def send_message(
             await mcp_manager.connect_all()
             tool_metadata["mcp_manager"] = mcp_manager
             tool_registry = create_default_tool_registry(mcp_manager)
+            if session_id in _session_allowed_tools:
+                settings.permission.allowed_tools = list(
+                    dict.fromkeys([
+                        *settings.permission.allowed_tools,
+                        *_session_allowed_tools.get(session_id, set()),
+                    ])
+                )
+            settings_holder["settings"] = settings
             permission_checker = PermissionChecker(settings.permission)
 
             # Resolve working directory: prefer agent-definition cwd, then session
             # snapshot cwd, then server process cwd.
             effective_cwd = Path.cwd()
-            agent_name: str | None = None
-            try:
-                snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-                if snap:
-                    agent_name = snap.get("agent_name")
-            except Exception:
-                snap = None
 
             if agent_name:
                 try:
-                    from openharness.coordinator.agent_definitions import (
-                        get_builtin_agent_definitions,
-                        load_agents_dir,
-                    )
-                    from openharness.config.paths import get_config_dir
-
-                    user_agents_dir = get_config_dir() / "agents"
-                    all_defs = list(get_builtin_agent_definitions())
-                    if user_agents_dir.exists():
-                        all_defs = list(load_agents_dir(user_agents_dir)) + all_defs
-                    for defn in all_defs:
-                        if defn.name == agent_name and defn.cwd:
-                            candidate = Path(defn.cwd).expanduser().resolve()
-                            if candidate.is_dir():
-                                effective_cwd = candidate
-                            break
+                    if agent_def is not None and agent_def.cwd:
+                        candidate = Path(agent_def.cwd).expanduser().resolve()
+                        if candidate.is_dir():
+                            effective_cwd = candidate
                 except Exception:
                     logger.exception("Failed to resolve agent cwd for %s", agent_name)
 
@@ -380,9 +474,10 @@ async def send_message(
                 model=settings.model,
                 system_prompt=system_prompt,
                 permission_prompt=permission_prompt,
-                max_turns=50,
+                max_turns=getattr(settings, "max_turns", None) or 50,
                 tool_metadata=tool_metadata,
             )
+            engine_holder["engine"] = engine
 
             # Load existing messages if session has history
             try:
@@ -447,12 +542,21 @@ async def send_message(
                             messages=engine.messages,
                             usage=usage_snap,
                             session_id=session_id,
+                            agent_name=agent_name,
+                            channel="web",
+                            platform="web",
                         )
                     except Exception:
                         logger.exception("Failed to save session snapshot for %s", session_id)
                     await sse_queue.put(_sse_line(SSEDone(usage=usage_dict)))
                 elif isinstance(event, ErrorEvent):
-                    await sse_queue.put(_sse_line(SSEError(message=event.message, recoverable=event.recoverable)))
+                    if event.message == _EMPTY_ASSISTANT_MESSAGE:
+                        await sse_queue.put(
+                            _sse_line(SSEStatus(message="模型返回了空回复，本轮已跳过，未写入会话。"))
+                        )
+                        await sse_queue.put(_sse_line(SSEDone(usage=None)))
+                    else:
+                        await sse_queue.put(_sse_line(SSEError(message=event.message, recoverable=event.recoverable)))
                 elif isinstance(event, StatusEvent):
                     await sse_queue.put(_sse_line(SSEStatus(message=event.message)))
 
@@ -497,7 +601,7 @@ async def approve_tool(
     """Resolve a pending permission confirmation request."""
     future = _pending_approvals.get(body.request_id)
     if future is not None and not future.done():
-        future.set_result(body.approved)
+        future.set_result(PermissionApproval(body.approved, body.scope))
 
 
 @router.post("/{session_id}/messages/abort", status_code=status.HTTP_204_NO_CONTENT)

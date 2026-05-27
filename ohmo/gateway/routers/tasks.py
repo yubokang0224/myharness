@@ -11,7 +11,7 @@ from typing import Annotated, AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
-from ohmo.gateway.dependencies import AuthContext, get_auth_context, get_current_user, get_runtime, _RuntimeState
+from ohmo.gateway.dependencies import get_current_user, get_runtime, _RuntimeState
 from ohmo.gateway.schemas.tasks import (
     AutopilotRepoTaskResponse,
     CreateTaskRequest,
@@ -59,7 +59,7 @@ async def list_tasks(
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def create_task(
     body: CreateTaskRequest,
-    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Create and start a new background task."""
@@ -90,7 +90,6 @@ async def create_task(
             prompt=body.prompt,
             description=body.description,
             cwd=cwd,
-            hsjm_user_token=auth.raw_token,
         )
     return _task_to_response(record)
 
@@ -129,7 +128,6 @@ async def cancel_task(
     except Exception as exc:
         logger.warning("Failed to stop task %s: %s", task_id, exc)
     runtime.task_manager._tasks.pop(task_id, None)
-    runtime.task_manager._process_envs.pop(task_id, None)
 
 
 @router.get("/{task_id}/logs")

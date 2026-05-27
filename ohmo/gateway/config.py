@@ -34,8 +34,9 @@ def build_channel_manager_config(config: GatewayConfig) -> Config:
     for name in config.enabled_channels:
         if not hasattr(root.channels, name):
             continue
-        channel_config = getattr(root.channels, name).model_copy(
-            update={"enabled": True, **config.channel_configs.get(name, {})}
-        )
+        base_config = getattr(root.channels, name)
+        channel_payload = base_config.model_dump()
+        channel_payload.update({"enabled": True, **config.channel_configs.get(name, {})})
+        channel_config = type(base_config).model_validate(channel_payload)
         setattr(root.channels, name, channel_config)
     return root

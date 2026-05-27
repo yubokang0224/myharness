@@ -32,6 +32,41 @@ def _session_key_token(session_key: str) -> str:
     return hashlib.sha1(session_key.encode("utf-8")).hexdigest()[:12]
 
 
+def _conversation_id(session_key: str | None, session_id: str) -> str:
+    if session_key:
+        return _session_key_token(session_key)
+    return session_id
+
+
+def _remote_metadata_from_session_key(session_key: str | None) -> dict[str, str | None]:
+    metadata: dict[str, str | None] = {
+        "channel": "web",
+        "platform": "web",
+        "bot_name": None,
+        "chat_id": None,
+        "sender_id": None,
+        "agent_name": None,
+    }
+    if not session_key:
+        return metadata
+
+    parts = session_key.split(":")
+    metadata["channel"] = parts[0] if parts else "remote"
+    metadata["platform"] = metadata["channel"]
+    if metadata["channel"] == "dingtalk" and len(parts) >= 5:
+        metadata.update(
+            {
+                "bot_name": parts[1],
+                "agent_name": None if parts[2] == "default" else parts[2],
+                "chat_id": parts[3],
+                "sender_id": parts[4],
+            }
+        )
+    elif len(parts) >= 3:
+        metadata.update({"chat_id": parts[1], "sender_id": parts[-1]})
+    return metadata
+
+
 def _session_key_latest_path(workspace: str | Path | None, session_key: str) -> Path:
     session_dir = get_session_dir(workspace)
     token = _session_key_token(session_key)
@@ -48,6 +83,14 @@ def save_session_snapshot(
     usage: UsageSnapshot,
     session_id: str | None = None,
     session_key: str | None = None,
+    title: str | None = None,
+    agent_name: str | None = None,
+    channel: str | None = None,
+    platform: str | None = None,
+    bot_name: str | None = None,
+    chat_id: str | None = None,
+    sender_id: str | None = None,
+    sender_name: str | None = None,
     tool_metadata: dict[str, object] | None = None,
 ) -> Path:
     """Persist the latest ohmo session snapshot."""
@@ -60,11 +103,23 @@ def save_session_snapshot(
         if msg.role == "user" and msg.text.strip():
             summary = msg.text.strip()[:80]
             break
+    if not summary and title:
+        summary = title.strip()[:80]
 
+    remote_metadata = _remote_metadata_from_session_key(session_key)
+    resolved_agent_name = agent_name or remote_metadata.get("agent_name")
     payload = {
         "app": "ohmo",
         "session_id": sid,
         "session_key": session_key,
+        "conversation_id": _conversation_id(session_key, sid),
+        "channel": channel or remote_metadata.get("channel") or "web",
+        "platform": platform or remote_metadata.get("platform") or channel or "web",
+        "bot_name": bot_name if bot_name is not None else remote_metadata.get("bot_name"),
+        "agent_name": resolved_agent_name,
+        "chat_id": chat_id if chat_id is not None else remote_metadata.get("chat_id"),
+        "sender_id": sender_id if sender_id is not None else remote_metadata.get("sender_id"),
+        "sender_name": sender_name,
         "cwd": str(Path(cwd).resolve()),
         "model": model,
         "system_prompt": system_prompt,
@@ -77,7 +132,8 @@ def save_session_snapshot(
     }
     data = json.dumps(payload, indent=2) + "\n"
     latest_path = session_dir / "latest.json"
-    atomic_write_text(latest_path, data)
+    if not session_key:
+        atomic_write_text(latest_path, data)
     if session_key:
         atomic_write_text(_session_key_latest_path(workspace, session_key), data)
     session_path = session_dir / f"session-{sid}.json"
@@ -118,6 +174,16 @@ def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list
         sessions.append(
             {
                 "session_id": data.get("session_id", path.stem.replace("session-", "")),
+                "session_key": data.get("session_key"),
+                "conversation_id": data.get("conversation_id")
+                or _conversation_id(data.get("session_key"), data.get("session_id", path.stem.replace("session-", ""))),
+                "channel": data.get("channel") or _remote_metadata_from_session_key(data.get("session_key")).get("channel"),
+                "platform": data.get("platform") or _remote_metadata_from_session_key(data.get("session_key")).get("platform"),
+                "bot_name": data.get("bot_name"),
+                "agent_name": data.get("agent_name"),
+                "chat_id": data.get("chat_id"),
+                "sender_id": data.get("sender_id"),
+                "sender_name": data.get("sender_name"),
                 "summary": data.get("summary", ""),
                 "message_count": data.get("message_count", len(data.get("messages", []))),
                 "model": data.get("model", ""),
@@ -175,6 +241,14 @@ class OhmoSessionBackend(SessionBackend):
         usage: UsageSnapshot,
         session_id: str | None = None,
         session_key: str | None = None,
+        title: str | None = None,
+        agent_name: str | None = None,
+        channel: str | None = None,
+        platform: str | None = None,
+        bot_name: str | None = None,
+        chat_id: str | None = None,
+        sender_id: str | None = None,
+        sender_name: str | None = None,
         tool_metadata: dict[str, object] | None = None,
     ) -> Path:
         return save_session_snapshot(
@@ -186,6 +260,14 @@ class OhmoSessionBackend(SessionBackend):
             usage=usage,
             session_id=session_id,
             session_key=session_key,
+            title=title,
+            agent_name=agent_name,
+            channel=channel,
+            platform=platform,
+            bot_name=bot_name,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
             tool_metadata=tool_metadata,
         )
 

@@ -31,20 +31,29 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 @dataclass(frozen=True)
 class AuthContext:
-    """Validated HSJM bearer auth for one gateway request."""
+    """Validated request auth plus the original bearer token for tool forwarding."""
 
-    claims: dict[str, Any]
+    user: dict[str, Any]
     raw_token: str
 
 
-def _decode_bearer_token(token: str) -> dict[str, Any]:
-    if jwt is None:
+def _decode_bearer_credentials(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> tuple[dict[str, Any], str]:
+    if credentials is None:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="python-jose not installed",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    token = credentials.credentials
     try:
-        return jwt.decode(
+        if jwt is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="python-jose not installed",
+            )
+        payload = jwt.decode(
             token,
             JWT_SECRET_KEY,
             algorithms=[JWT_ALGORITHM],
@@ -58,28 +67,23 @@ def _decode_bearer_token(token: str) -> dict[str, Any]:
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
-
-
-async def get_auth_context(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
-) -> AuthContext:
-    """Validate Bearer JWT token and keep both claims and raw token."""
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = credentials.credentials
-    return AuthContext(claims=_decode_bearer_token(token), raw_token=token)
+    return payload, token
 
 
 async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> dict[str, Any]:
     """Validate Bearer JWT token and return decoded claims."""
-    context = await get_auth_context(credentials)
-    return context.claims
+    payload, _token = _decode_bearer_credentials(credentials)
+    return payload
+
+
+async def get_auth_context(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> AuthContext:
+    """Validate Bearer JWT token and preserve the raw token for downstream tools."""
+    payload, token = _decode_bearer_credentials(credentials)
+    return AuthContext(user=payload, raw_token=token)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +97,7 @@ async def get_optional_user(
     if credentials is None:
         return None
     try:
-        return _decode_bearer_token(credentials.credentials)
+        return await get_current_user(credentials)
     except HTTPException:
         return None
 

@@ -101,9 +101,9 @@ function ModalHostInner({
 			<Box flexDirection="column" marginTop={1}>
 				<Text>
 					<Text color="yellow" bold>{'\u250C '}</Text>
-					<Text bold>Allow </Text>
+					<Text bold>是否允许执行 </Text>
 					<Text color="cyan" bold>{String(modal.tool_name ?? 'tool')}</Text>
-					<Text bold>?</Text>
+					<Text bold>？</Text>
 				</Text>
 				{modal.reason ? (
 					<Text>
@@ -113,9 +113,11 @@ function ModalHostInner({
 				) : null}
 				<Text>
 					<Text color="yellow">{'\u2514 '}</Text>
-					<Text color="green">[y] Allow</Text>
+					<Text color="red">[1] 拒绝</Text>
 					<Text>{'  '}</Text>
-					<Text color="red">[n] Deny</Text>
+					<Text color="green">[2] 仅本次允许</Text>
+					<Text>{'  '}</Text>
+					<Text color="green">[3] 此次会话允许</Text>
 				</Text>
 			</Box>
 		);

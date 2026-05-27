@@ -21,7 +21,8 @@ def test_default_mode_requires_confirmation_for_mutation():
     decision = checker.evaluate("write_file", is_read_only=False)
     assert decision.allowed is False
     assert decision.requires_confirmation is True
-    assert "/permissions full_auto" in decision.reason
+    assert "需要你确认" in decision.reason
+    assert "/permissions full_auto" not in decision.reason
 
 
 def test_default_mode_gives_package_install_hint_for_bash():
@@ -33,14 +34,14 @@ def test_default_mode_gives_package_install_hint_for_bash():
     )
     assert decision.allowed is False
     assert decision.requires_confirmation is True
-    assert "Package installation and scaffolding commands change the workspace" in decision.reason
+    assert "安装依赖或创建脚手架会修改工作区" in decision.reason
 
 
 def test_plan_mode_blocks_mutating_tools():
     checker = PermissionChecker(PermissionSettings(mode=PermissionMode.PLAN))
     decision = checker.evaluate("bash", is_read_only=False)
     assert decision.allowed is False
-    assert "plan mode" in decision.reason
+    assert "计划模式" in decision.reason
 
 
 def test_full_auto_allows_mutating_tools():

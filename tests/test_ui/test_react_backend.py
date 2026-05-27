@@ -13,7 +13,12 @@ from openharness.api.usage import UsageSnapshot
 from openharness.engine.stream_events import CompactProgressEvent
 from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.config.settings import Settings, save_settings
-from openharness.ui.backend_host import BackendHostConfig, ReactBackendHost, run_backend_host
+from openharness.ui.backend_host import (
+    BackendHostConfig,
+    PermissionPromptResponse,
+    ReactBackendHost,
+    run_backend_host,
+)
 from openharness.ui.protocol import BackendEvent
 from openharness.ui.runtime import build_runtime, close_runtime, start_runtime
 
@@ -101,7 +106,42 @@ async def test_read_requests_resolves_permission_response_without_queueing(monke
     await host._read_requests()
 
     assert fut.done()
-    assert fut.result() is True
+    assert fut.result() == PermissionPromptResponse(True, "once")
+    queued = await host._request_queue.get()
+    assert queued.type == "shutdown"
+    assert host._request_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_read_requests_preserves_permission_response_scope(monkeypatch):
+    host = ReactBackendHost(BackendHostConfig(api_client=StaticApiClient("unused")))
+    fut = asyncio.get_running_loop().create_future()
+    host._permission_requests["req-1"] = fut
+
+    payload = (
+        b'{"type":"permission_response","request_id":"req-1",'
+        b'"allowed":true,"permission_scope":"session"}\n'
+    )
+
+    class _FakeBuffer:
+        def __init__(self):
+            self._reads = 0
+
+        def readline(self):
+            self._reads += 1
+            if self._reads == 1:
+                return payload
+            return b""
+
+    class _FakeStdin:
+        buffer = _FakeBuffer()
+
+    monkeypatch.setattr("openharness.ui.backend_host.sys.stdin", _FakeStdin())
+
+    await host._read_requests()
+
+    assert fut.done()
+    assert fut.result() == PermissionPromptResponse(True, "session")
     queued = await host._request_queue.get()
     assert queued.type == "shutdown"
     assert host._request_queue.empty()
@@ -138,6 +178,23 @@ async def test_read_requests_interrupt_cancels_active_request(monkeypatch):
         await task
     queued = await host._request_queue.get()
     assert queued.type == "shutdown"
+
+
+@pytest.mark.asyncio
+async def test_session_scoped_permission_allows_tool_without_persisting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+
+    host = ReactBackendHost(BackendHostConfig(api_client=StaticApiClient("unused")))
+    host._bundle = await build_runtime(api_client=StaticApiClient("unused"))
+    try:
+        host._allow_tool_for_session("bash")
+        decision = host._bundle.engine._permission_checker.evaluate("bash", is_read_only=False)
+        assert decision.allowed is True
+        assert "bash" not in host._bundle.current_settings().permission.allowed_tools
+    finally:
+        await close_runtime(host._bundle)
 
 
 @pytest.mark.asyncio
@@ -647,7 +704,7 @@ async def test_concurrent_ask_permission_are_serialised():
                 await asyncio.sleep(0)
                 for rid, fut in list(host._permission_requests.items()):
                     if not fut.done():
-                        fut.set_result(True)
+                        fut.set_result(PermissionPromptResponse(True, "once"))
                         return
 
         asyncio.create_task(_resolver())

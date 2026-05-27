@@ -30,6 +30,7 @@ class FrontendRequest(BaseModel):
     value: str | None = None
     request_id: str | None = None
     allowed: bool | None = None
+    permission_scope: Literal["once", "session"] | None = None
     answer: str | None = None
 
 

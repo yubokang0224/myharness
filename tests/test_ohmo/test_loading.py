@@ -1,11 +1,13 @@
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from openharness.config.settings import load_settings
 from openharness.plugins import load_plugins
 from openharness.skills import load_skill_registry
 
+from ohmo.gateway.routers.skills import list_skills
 from ohmo.runtime import run_ohmo_backend
 from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
 
@@ -158,3 +160,27 @@ def test_plugin_loader_supports_directory_skill_layout(tmp_path, monkeypatch):
     plugin = next(p for p in plugins if p.manifest.name == "pika_plugin")
     names = {skill.name for skill in plugin.skills}
     assert "pikastream-video-meeting" in names
+
+
+def test_gateway_skills_endpoint_lists_workspace_and_plugin_skills(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".openharness"
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+    monkeypatch.chdir(tmp_path)
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    skill_dir = get_skills_dir(workspace) / "private_skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# private skill\n\nFrom ohmo workspace.\n", encoding="utf-8")
+    _write_plugin(get_plugins_dir(workspace), "private_plugin", "private_plugin_skill")
+
+    response = asyncio.run(
+        list_skills(
+            _user={"sub": "test"},
+            runtime=SimpleNamespace(workspace=workspace, disabled_skills=set()),
+        )
+    )
+    names = {skill.name for skill in response}
+
+    assert "private skill" in names
+    assert "private_plugin_skill" in names

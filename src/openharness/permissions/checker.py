@@ -137,15 +137,13 @@ class PermissionChecker:
         if self._settings.mode == PermissionMode.PLAN:
             return PermissionDecision(
                 allowed=False,
-                reason="Plan mode blocks mutating tools until the user exits plan mode",
+                reason="计划模式会阻止会修改环境的工具；退出计划模式后才能执行。",
             )
 
         # Default mode: require confirmation for mutating tools
         bash_hint = _bash_permission_hint(command)
         reason = (
-            "Mutating tools require user confirmation in default mode. "
-            "Approve the prompt when asked, or run /permissions full_auto "
-            "if you want to allow them for this session."
+            "当前权限模式下，可能修改环境的工具需要你确认后才能执行。"
         )
         if bash_hint:
             reason = f"{reason} {bash_hint}"
@@ -194,7 +192,6 @@ def _bash_permission_hint(command: str | None) -> str:
     )
     if any(marker in lowered for marker in install_markers):
         return (
-            "Package installation and scaffolding commands change the workspace, "
-            "so they will not run automatically in default mode."
+            "安装依赖或创建脚手架会修改工作区，因此不会自动执行。"
         )
     return ""
