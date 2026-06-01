@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/models", tags=["models"])
 
 
+def _positive_int_or_none(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return value if value > 0 else None
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -40,7 +45,7 @@ def _resolve_auth_status(settings, profile_name: str, profile) -> tuple[str, str
 
     auth_source = profile.auth_source
     if not auth_source_uses_api_key(auth_source):
-        # subscription / oauth â€?simplified check
+        # subscription / oauth éˆ¥?simplified check
         if auth_source in {"codex_subscription", "claude_subscription"}:
             from openharness.auth.storage import load_external_binding
             binding = load_external_binding(auth_source_provider_name(auth_source))
@@ -108,6 +113,9 @@ def _build_profile_out(
         default_model=profile.default_model,
         last_model=profile.last_model,
         base_url=profile.base_url,
+        max_tokens=profile.max_tokens,
+        context_window_tokens=profile.context_window_tokens,
+        auto_compact_threshold_tokens=profile.auto_compact_threshold_tokens,
         credential_slot=profile.credential_slot,
         is_builtin=profile_name in builtin_provider_profile_names(),
         resolved_model=resolved,
@@ -145,6 +153,9 @@ async def get_model_config(
         provider=settings.provider,
         api_format=settings.api_format,
         base_url=settings.base_url,
+        max_tokens=settings.max_tokens,
+        context_window_tokens=settings.context_window_tokens,
+        auto_compact_threshold_tokens=settings.auto_compact_threshold_tokens,
         profiles=profile_outs,
     )
 
@@ -240,6 +251,9 @@ async def create_profile(
         auth_source=body.auth_source,
         default_model=body.default_model,
         base_url=body.base_url,
+        max_tokens=_positive_int_or_none(body.max_tokens),
+        context_window_tokens=_positive_int_or_none(body.context_window_tokens),
+        auto_compact_threshold_tokens=_positive_int_or_none(body.auto_compact_threshold_tokens),
         credential_slot=body.credential_slot,
     )
     profiles[body.name] = new_profile
@@ -277,9 +291,17 @@ async def update_profile(
         patch["last_model"] = body.last_model
     if body.base_url is not None:
         patch["base_url"] = body.base_url
+    if "max_tokens" in body.model_fields_set:
+        patch["max_tokens"] = _positive_int_or_none(body.max_tokens)
+    if "context_window_tokens" in body.model_fields_set:
+        patch["context_window_tokens"] = _positive_int_or_none(body.context_window_tokens)
+    if "auto_compact_threshold_tokens" in body.model_fields_set:
+        patch["auto_compact_threshold_tokens"] = _positive_int_or_none(body.auto_compact_threshold_tokens)
 
     profiles[name] = profile.model_copy(update=patch)
     updated = settings.model_copy(update={"profiles": profiles})
+    if name == settings.active_profile:
+        updated = updated.materialize_active_profile()
     save_settings(updated)
 
     settings2 = load_settings()
@@ -423,3 +445,4 @@ async def delete_profile_api_key(
 
     storage_provider = credential_storage_provider_name(name, profile)
     clear_provider_credentials(storage_provider)
+

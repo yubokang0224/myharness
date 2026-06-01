@@ -269,8 +269,24 @@ async def get_messages(
                     )
                 elif block.get("type") == "tool_use":
                     tool_calls.append(
-                        {"tool_name": block.get("name", ""), "tool_input": block.get("input", {})}
+                        {
+                            "tool_use_id": block.get("id", ""),
+                            "tool_name": block.get("name", ""),
+                            "tool_input": block.get("input", {}),
+                        }
                     )
+                elif block.get("type") == "tool_result":
+                    target_id = block.get("tool_use_id", "")
+                    for existing in reversed(result):
+                        matched = False
+                        for call in existing.tool_calls:
+                            if call.get("tool_use_id") == target_id:
+                                call["output"] = block.get("content", "")
+                                call["is_error"] = bool(block.get("is_error", False))
+                                matched = True
+                                break
+                        if matched:
+                            break
             elif isinstance(block, str):
                 text += block
         result.append(

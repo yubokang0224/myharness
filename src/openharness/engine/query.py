@@ -719,6 +719,7 @@ async def run_query(
         # -----------------------------------------------------------------------------
 
         final_message: ConversationMessage | None = None
+        final_stop_reason: str | None = None
         usage = UsageSnapshot()
 
         try:
@@ -746,6 +747,7 @@ async def run_query(
                 if isinstance(event, ApiMessageCompleteEvent):
                     final_message = event.message
                     usage = event.usage
+                    final_stop_reason = event.stop_reason
         except Exception as exc:
             error_msg = str(exc)
             if _is_completion_token_limit_error(exc):
@@ -794,7 +796,19 @@ async def run_query(
             return
 
         messages.append(final_message)
-        yield AssistantTurnComplete(message=final_message, usage=usage), usage
+        yield AssistantTurnComplete(
+            message=final_message,
+            usage=usage,
+            stop_reason=final_stop_reason,
+        ), usage
+        if (final_stop_reason or "").lower() in {"length", "max_tokens", "max_completion_tokens"}:
+            yield StatusEvent(
+                message=(
+                    "Model stopped because it reached the configured output token limit "
+                    f"({effective_max_tokens}). Reply with 'continue' to keep going, "
+                    "or raise the profile max output tokens if this happens often."
+                )
+            ), None
 
         if coordinator_context_message is not None:
             messages.append(coordinator_context_message)

@@ -526,8 +526,22 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             return
-        if isinstance(event, AssistantTurnComplete) and not reply_parts:
-            reply_parts.append(event.message.text.strip())
+        if isinstance(event, AssistantTurnComplete):
+            if not reply_parts:
+                reply_parts.append(event.message.text.strip())
+            if self._is_output_limit_stop_reason(getattr(event, "stop_reason", None)):
+                reply_parts.append(
+                    "\n\n[System notice] The model reached the max output token limit for this turn. "
+                    "Reply with 'continue' to keep going, or raise max output tokens in model settings."
+                )
+
+    @staticmethod
+    def _is_output_limit_stop_reason(stop_reason: str | None) -> bool:
+        return (stop_reason or "").strip().lower() in {
+            "length",
+            "max_tokens",
+            "max_completion_tokens",
+        }
 
     async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
         tool_metadata = getattr(bundle.engine, "tool_metadata", {}) or {}

@@ -101,6 +101,11 @@ class ChannelBridge:
                 if isinstance(event, AssistantTextDelta):
                     reply_parts.append(event.text)
                 elif isinstance(event, AssistantTurnComplete):
+                    if (event.stop_reason or "").strip().lower() in {"length", "max_tokens", "max_completion_tokens"}:
+                        reply_parts.append(
+                            "\n\n[System notice] The model reached the max output token limit for this turn. "
+                            "Reply with 'continue' to keep going, or raise max output tokens in model settings."
+                        )
                     # Turn is done; we'll send the accumulated text below
                     pass
         except Exception:

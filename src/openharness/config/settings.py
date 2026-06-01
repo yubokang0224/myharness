@@ -118,6 +118,7 @@ class ProviderProfile(BaseModel):
     last_model: str | None = None
     credential_slot: str | None = None
     allowed_models: list[str] = Field(default_factory=list)
+    max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
 
@@ -328,6 +329,36 @@ def resolve_model_setting(
         return "gpt-5.4"
 
     return configured
+
+
+def normalize_permission_mode(value: str | None) -> PermissionMode | None:
+    """Map UI/CLI permission aliases onto runtime permission modes."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    aliases = {
+        "ask": PermissionMode.DEFAULT,
+        "default": PermissionMode.DEFAULT,
+        "acceptEdits": PermissionMode.DEFAULT,
+        "accept_edits": PermissionMode.DEFAULT,
+        "plan": PermissionMode.PLAN,
+        "dontAsk": PermissionMode.FULL_AUTO,
+        "dont_ask": PermissionMode.FULL_AUTO,
+        "bypassPermissions": PermissionMode.FULL_AUTO,
+        "bypass_permissions": PermissionMode.FULL_AUTO,
+        "full_auto": PermissionMode.FULL_AUTO,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    lowered = normalized.lower()
+    if lowered in aliases:
+        return aliases[lowered]
+    try:
+        return PermissionMode(normalized)
+    except ValueError:
+        return None
 
 
 def auth_source_provider_name(auth_source: str) -> str:
@@ -568,6 +599,7 @@ class Settings(BaseModel):
                 "provider": profile.provider,
                 "api_format": profile.api_format,
                 "base_url": profile.base_url,
+                "max_tokens": profile.max_tokens or self.max_tokens,
                 "context_window_tokens": profile.context_window_tokens,
                 "auto_compact_threshold_tokens": profile.auto_compact_threshold_tokens,
                 "model": resolve_model_setting(
@@ -590,6 +622,7 @@ class Settings(BaseModel):
         next_provider = (self.provider or "").strip() or profile.provider
         next_api_format = (self.api_format or "").strip() or profile.api_format
         next_base_url = self.base_url if self.base_url is not None else profile.base_url
+        next_max_tokens = self.max_tokens if self.max_tokens > 0 else profile.max_tokens
         next_context_window_tokens = (
             self.context_window_tokens
             if self.context_window_tokens is not None
@@ -623,6 +656,7 @@ class Settings(BaseModel):
                 "base_url": next_base_url,
                 "auth_source": next_auth_source,
                 "last_model": next_model,
+                "max_tokens": next_max_tokens,
                 "context_window_tokens": next_context_window_tokens,
                 "auto_compact_threshold_tokens": next_auto_compact_threshold_tokens,
             }
@@ -786,6 +820,9 @@ class Settings(BaseModel):
     def merge_cli_overrides(self, **overrides: Any) -> Settings:
         """Return a new Settings with CLI overrides applied (non-None values only)."""
         updates = {k: v for k, v in overrides.items() if v is not None}
+        permission_mode = normalize_permission_mode(updates.pop("permission_mode", None))
+        if permission_mode is not None:
+            updates["permission"] = self.permission.model_copy(update={"mode": permission_mode})
         # Strip ANSI escape sequences from model name if present
         if "model" in updates and isinstance(updates["model"], str):
             updates["model"] = strip_ansi_escape_sequences(updates["model"])
@@ -798,8 +835,10 @@ class Settings(BaseModel):
             "api_format",
             "provider",
             "api_key",
+            "permission",
             "active_profile",
             "profiles",
+            "max_tokens",
             "context_window_tokens",
             "auto_compact_threshold_tokens",
         }

@@ -354,6 +354,7 @@ class AuthManager:
         last_model: str | None = None,
         credential_slot: str | None = None,
         allowed_models: list[str] | None = None,
+        max_tokens: int | None = None,
         context_window_tokens: int | None = None,
         auto_compact_threshold_tokens: int | None = None,
     ) -> None:
@@ -374,6 +375,7 @@ class AuthManager:
             "last_model": last_model if last_model is not None else current.last_model,
             "credential_slot": credential_slot if credential_slot is not None else current.credential_slot,
             "allowed_models": allowed_models if allowed_models is not None else current.allowed_models,
+            "max_tokens": max_tokens if max_tokens is not None else current.max_tokens,
             "context_window_tokens": (
                 context_window_tokens
                 if context_window_tokens is not None

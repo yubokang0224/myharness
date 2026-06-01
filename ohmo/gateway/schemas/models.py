@@ -17,6 +17,9 @@ class ProviderProfileOut(BaseModel):
     default_model: str
     last_model: str | None = None
     base_url: str | None = None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
     credential_slot: str | None = None
     is_builtin: bool = True
     # resolved model actually in use
@@ -35,6 +38,9 @@ class ModelConfigOut(BaseModel):
     provider: str
     api_format: str
     base_url: str | None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
     profiles: list[ProviderProfileOut]
 
 
@@ -61,6 +67,9 @@ class CreateProfileIn(BaseModel):
     auth_source: str = "openai_api_key"
     default_model: str
     base_url: str | None = None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
     credential_slot: str | None = None
 
 
@@ -71,6 +80,9 @@ class UpdateProfileIn(BaseModel):
     default_model: str | None = None
     last_model: str | None = None
     base_url: str | None = None
+    max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    auto_compact_threshold_tokens: int | None = None
 
 
 class SetApiKeyIn(BaseModel):

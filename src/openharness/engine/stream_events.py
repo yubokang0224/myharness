@@ -22,6 +22,7 @@ class AssistantTurnComplete:
 
     message: ConversationMessage
     usage: UsageSnapshot
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
