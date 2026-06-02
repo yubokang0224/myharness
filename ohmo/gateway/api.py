@@ -75,12 +75,17 @@ def create_app(
     allowed_origins = cors_origins or [
         "http://localhost:5173",
         "http://localhost:3000",
+        "http://localhost:2415",
+        "http://localhost:2440",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
+        "http://127.0.0.1:2415",
+        "http://127.0.0.1:2440",
     ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
+        allow_origin_regex=None if cors_origins else r"https?://[^/]+:(2415|2440|5173|3000)",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
