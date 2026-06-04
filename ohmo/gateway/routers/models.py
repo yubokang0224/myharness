@@ -17,6 +17,8 @@ from ohmo.gateway.schemas.models import (
     SetModelIn,
     SwitchProfileIn,
     UpdateProfileIn,
+    UpdateVisionConfigIn,
+    VisionConfigOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,11 +118,41 @@ def _build_profile_out(
         max_tokens=profile.max_tokens,
         context_window_tokens=profile.context_window_tokens,
         auto_compact_threshold_tokens=profile.auto_compact_threshold_tokens,
+        supports_vision=profile.supports_vision,
         credential_slot=profile.credential_slot,
         is_builtin=profile_name in builtin_provider_profile_names(),
         resolved_model=resolved,
         auth_status=auth_st,
         is_active=is_active,
+    )
+
+
+def _build_vision_out(settings) -> VisionConfigOut:
+    """Return current vision config summary without exposing secrets."""
+    from openharness.config.settings import VisionModelConfig
+
+    if settings.vision.is_configured:
+        return VisionConfigOut(
+            model=settings.vision.model,
+            base_url=settings.vision.base_url,
+            configured=True,
+            source="settings",
+        )
+
+    env_cfg = VisionModelConfig.from_env()
+    if env_cfg.is_configured:
+        return VisionConfigOut(
+            model=env_cfg.model,
+            base_url=env_cfg.base_url,
+            configured=True,
+            source="env",
+        )
+
+    return VisionConfigOut(
+        model=settings.vision.model,
+        base_url=settings.vision.base_url,
+        configured=False,
+        source="missing",
     )
 
 
@@ -157,7 +189,47 @@ async def get_model_config(
         context_window_tokens=settings.context_window_tokens,
         auto_compact_threshold_tokens=settings.auto_compact_threshold_tokens,
         profiles=profile_outs,
+        vision=_build_vision_out(settings),
     )
+
+
+@router.put("/config/vision", response_model=ModelConfigOut)
+async def update_vision_config(
+    body: UpdateVisionConfigIn,
+    _user: Annotated[dict, Depends(get_current_user)],
+) -> ModelConfigOut:
+    """Update vision model settings used by image_to_text."""
+    from openharness.config import load_settings, save_settings
+    from openharness.config.settings import VisionModelConfig
+
+    settings = load_settings()
+    current = settings.vision
+    model = current.model if body.model is None else body.model.strip()
+    base_url = current.base_url if body.base_url is None else body.base_url.strip()
+    if body.clear_api_key:
+        api_key = ""
+    elif body.api_key is None:
+        api_key = current.api_key
+    else:
+        api_key = body.api_key.strip()
+
+    if (model and not api_key) or (api_key and not model):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="vision.model and vision.api_key must be configured together",
+        )
+
+    updated = settings.model_copy(
+        update={
+            "vision": VisionModelConfig(
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+            )
+        }
+    )
+    save_settings(updated)
+    return await get_model_config(_user)
 
 
 @router.put("/config/active-profile", response_model=ModelConfigOut)
@@ -254,6 +326,7 @@ async def create_profile(
         max_tokens=_positive_int_or_none(body.max_tokens),
         context_window_tokens=_positive_int_or_none(body.context_window_tokens),
         auto_compact_threshold_tokens=_positive_int_or_none(body.auto_compact_threshold_tokens),
+        supports_vision=body.supports_vision,
         credential_slot=body.credential_slot,
     )
     profiles[body.name] = new_profile
@@ -297,6 +370,8 @@ async def update_profile(
         patch["context_window_tokens"] = _positive_int_or_none(body.context_window_tokens)
     if "auto_compact_threshold_tokens" in body.model_fields_set:
         patch["auto_compact_threshold_tokens"] = _positive_int_or_none(body.auto_compact_threshold_tokens)
+    if "supports_vision" in body.model_fields_set:
+        patch["supports_vision"] = body.supports_vision
 
     profiles[name] = profile.model_copy(update=patch)
     updated = settings.model_copy(update={"profiles": profiles})

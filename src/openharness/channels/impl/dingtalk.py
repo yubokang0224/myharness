@@ -4,6 +4,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -14,10 +15,12 @@ import logging
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
-from openharness.channels.impl.base import BaseChannel
+from openharness.channels.impl.base import BaseChannel, resolve_channel_media_dir
 from openharness.config.schema import DingTalkBotConfig, DingTalkConfig
 
 logger = logging.getLogger(__name__)
+
+MAX_INBOUND_MEDIA_BYTES = 50 * 1024 * 1024
 
 try:
     from dingtalk_stream import (
@@ -52,32 +55,84 @@ class NanobotDingTalkHandler(CallbackHandler):
     async def process(self, message: CallbackMessage):
         """Process incoming stream message."""
         try:
+            raw_data = self.channel._normalized_payload(message.data)
+
             # Parse using SDK's ChatbotMessage for robust handling
-            chatbot_msg = ChatbotMessage.from_dict(message.data)
+            chatbot_msg = ChatbotMessage.from_dict(raw_data)
 
             # Extract text content; fall back to raw dict if SDK object is empty
-            content = ""
-            if chatbot_msg.text:
-                content = chatbot_msg.text.content.strip()
-            if not content:
-                content = message.data.get("text", {}).get("content", "").strip()
+            content_parts = []
+            try:
+                content_parts.extend(part.strip() for part in (chatbot_msg.get_text_list() or []) if part and part.strip())
+            except Exception:
+                pass
+            if not content_parts:
+                text_payload = raw_data.get("text", {})
+                if isinstance(text_payload, dict):
+                    raw_text = str(text_payload.get("content", "")).strip()
+                elif isinstance(text_payload, str):
+                    raw_text = text_payload.strip()
+                else:
+                    raw_text = ""
+                if raw_text:
+                    content_parts.append(raw_text)
 
-            if not content:
+            media_paths, media_notes = await self.channel._download_inbound_media(
+                chatbot_msg,
+                raw_data,
+            )
+            # Keep downloaded attachment paths out of the user-visible prompt.
+            # The runtime receives them through ``media`` and can attach image
+            # blocks directly without polluting the conversation text.
+            content_parts.extend(note for note in media_notes if "download failed" in note or "too large" in note)
+
+            if not content_parts and not media_paths:
                 logger.warning(
-                    "Received empty or unsupported message type: %s",
+                    "Received empty or unsupported DingTalk message type=%s overview=%s",
                     chatbot_msg.message_type,
+                    self.channel._payload_overview(raw_data),
                 )
                 return AckMessage.STATUS_OK, "OK"
 
-            sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
-            sender_name = chatbot_msg.sender_nick or "Unknown"
+            sender_id = (
+                chatbot_msg.sender_staff_id
+                or chatbot_msg.sender_id
+                or raw_data.get("senderStaffId")
+                or raw_data.get("senderId")
+            )
+            sender_name = chatbot_msg.sender_nick or raw_data.get("senderNick") or "Unknown"
+            if not sender_id:
+                logger.warning(
+                    "DingTalk message missing sender id type=%s overview=%s",
+                    chatbot_msg.message_type,
+                    self.channel._payload_overview(raw_data),
+                )
+                return AckMessage.STATUS_OK, "OK"
 
-            logger.info("Received DingTalk message from %s (%s): %s", sender_name, sender_id, content)
+            content = "\n".join(content_parts) if content_parts else "[attachment message]"
+
+            logger.info(
+                "Received DingTalk message from %s (%s): %s media=%s",
+                sender_name,
+                sender_id,
+                content,
+                len(media_paths),
+            )
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
-                self.channel._on_message(content, sender_id, sender_name)
+                self.channel._on_message(
+                    content,
+                    sender_id,
+                    sender_name,
+                    media=media_paths,
+                    metadata_extra={
+                        "msg_type": chatbot_msg.message_type,
+                        "message_id": chatbot_msg.message_id,
+                        "conversation_id": chatbot_msg.conversation_id,
+                    },
+                )
             )
             self.channel._background_tasks.add(task)
             task.add_done_callback(self.channel._background_tasks.discard)
@@ -229,6 +284,321 @@ class DingTalkChannel(BaseChannel):
     def _guess_filename(self, media_ref: str, upload_type: str) -> str:
         name = os.path.basename(urlparse(media_ref).path)
         return name or {"image": "image.jpg", "voice": "audio.amr", "video": "video.mp4"}.get(upload_type, "file.bin")
+
+    @staticmethod
+    def _safe_filename(filename: str | None) -> str:
+        name = Path(filename or "attachment.bin").name.strip() or "attachment.bin"
+        return re.sub(r"[^A-Za-z0-9._ -]+", "_", name)
+
+    @staticmethod
+    def _filename_from_content_disposition(value: str | None) -> str | None:
+        if not value:
+            return None
+        match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', value, flags=re.IGNORECASE)
+        if not match:
+            return None
+        return unquote(match.group(1).strip())
+
+    @staticmethod
+    def _parse_json_object(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            return value
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return parsed
+
+    @classmethod
+    def _normalized_payload(cls, data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        normalized = dict(data)
+        for key in ("content", "text", "atUsers", "hostingContext", "conversationMsgContext"):
+            if key in normalized:
+                normalized[key] = cls._parse_json_object(normalized[key])
+        if "msgtype" not in normalized:
+            msg_type = normalized.get("msgType") or normalized.get("messageType")
+            if msg_type:
+                normalized["msgtype"] = msg_type
+        return normalized
+
+    @classmethod
+    def _iter_download_code_items(cls, data: Any) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+
+        def walk(value: Any, inherited_name: str | None = None) -> None:
+            value = cls._parse_json_object(value)
+            if isinstance(value, dict):
+                filename = (
+                    value.get("fileName")
+                    or value.get("filename")
+                    or value.get("name")
+                    or inherited_name
+                )
+                download_code = value.get("downloadCode") or value.get("download_code")
+                if download_code:
+                    items.append(
+                        {
+                            "download_code": str(download_code),
+                            "filename": str(filename or ""),
+                        }
+                    )
+                for child in value.values():
+                    walk(child, str(filename) if filename else inherited_name)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child, inherited_name)
+
+        walk(data)
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in items:
+            code = item["download_code"]
+            if code in seen:
+                continue
+            seen.add(code)
+            deduped.append(item)
+        return deduped
+
+    @classmethod
+    def _iter_media_url_items(cls, data: Any) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        url_keys = {
+            "downloadUrl",
+            "downloadURL",
+            "url",
+            "picUrl",
+            "pictureUrl",
+            "imageUrl",
+            "imageURL",
+            "mediaUrl",
+            "mediaURL",
+        }
+
+        def walk(value: Any, inherited_name: str | None = None) -> None:
+            value = cls._parse_json_object(value)
+            if isinstance(value, dict):
+                filename = (
+                    value.get("fileName")
+                    or value.get("filename")
+                    or value.get("name")
+                    or inherited_name
+                )
+                for key, child in value.items():
+                    if key in url_keys and isinstance(child, str) and cls._is_http_url(child):
+                        items.append({"url": child, "filename": str(filename or "")})
+                    walk(child, str(filename) if filename else inherited_name)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child, inherited_name)
+
+        walk(data)
+        deduped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in items:
+            url = item["url"]
+            if url in seen:
+                continue
+            seen.add(url)
+            deduped.append(item)
+        return deduped
+
+    @classmethod
+    def _payload_overview(cls, data: dict[str, Any]) -> str:
+        def compact(value: Any, depth: int = 0) -> Any:
+            value = cls._parse_json_object(value)
+            if depth >= 3:
+                return "<nested>"
+            if isinstance(value, dict):
+                result: dict[str, Any] = {}
+                for key, child in list(value.items())[:30]:
+                    if key in {"downloadCode", "download_code"}:
+                        text = str(child)
+                        result[key] = f"{text[:6]}...{len(text)}"
+                    elif "token" in key.lower() or "secret" in key.lower():
+                        result[key] = "<redacted>"
+                    else:
+                        result[key] = compact(child, depth + 1)
+                return result
+            if isinstance(value, list):
+                return [compact(child, depth + 1) for child in value[:8]]
+            if isinstance(value, str):
+                return value if len(value) <= 160 else f"{value[:160]}...{len(value)}"
+            return value
+
+        try:
+            return json.dumps(compact(data), ensure_ascii=False)
+        except Exception:
+            return str(list(data.keys()))
+
+    async def _get_download_url(self, token: str, download_code: str) -> str | None:
+        if not self._http:
+            return None
+        url = "https://api.dingtalk.com/v1.0/robot/messageFiles/download"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "x-acs-dingtalk-access-token": token,
+        }
+        robot_codes = []
+        for candidate in (self.config.client_id, self.config.robot_code):
+            if candidate and candidate not in robot_codes:
+                robot_codes.append(candidate)
+        try:
+            last_error = ""
+            for robot_code in robot_codes:
+                payload = {
+                    "robotCode": robot_code,
+                    "downloadCode": download_code,
+                }
+                resp = await self._http.post(url, json=payload, headers=headers)
+                text = resp.text
+                if resp.status_code >= 400:
+                    last_error = f"status={resp.status_code} body={text[:500]}"
+                    logger.warning(
+                        "DingTalk download url failed robotCode=%s status=%s body=%s",
+                        robot_code,
+                        resp.status_code,
+                        text[:500],
+                    )
+                    continue
+                result = resp.json()
+                download_url = result.get("downloadUrl") or (result.get("result") or {}).get("downloadUrl")
+                if download_url:
+                    return str(download_url)
+                last_error = f"missing downloadUrl body={text[:500]}"
+                logger.warning("DingTalk download url missing robotCode=%s body=%s", robot_code, text[:500])
+            logger.error("DingTalk download url failed for all robotCode candidates: %s", last_error)
+            return None
+        except Exception as e:
+            logger.error("DingTalk download url error: %s", e)
+            return None
+
+    async def _download_inbound_media(
+        self,
+        chatbot_msg: Any,
+        raw_data: dict[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        media_paths: list[str] = []
+        notes: list[str] = []
+
+        raw_content = self._parse_json_object(raw_data.get("content") or {})
+        download_items = self._iter_download_code_items(raw_content)
+        download_items.extend(self._iter_download_code_items(raw_data))
+        try:
+            for code in chatbot_msg.get_image_list() or []:
+                download_items.append({"download_code": str(code), "filename": "image.png"})
+        except Exception:
+            pass
+
+        deduped_items: list[dict[str, str]] = []
+        seen_codes: set[str] = set()
+        for item in download_items:
+            code = item.get("download_code")
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            deduped_items.append(item)
+
+        direct_url_items = self._iter_media_url_items(raw_content)
+        direct_url_items.extend(self._iter_media_url_items(raw_data))
+        deduped_urls: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for item in direct_url_items:
+            media_url = item.get("url")
+            if not media_url or media_url in seen_urls:
+                continue
+            seen_urls.add(media_url)
+            deduped_urls.append(item)
+
+        if not deduped_items and not deduped_urls:
+            return media_paths, notes
+
+        token = await self._get_access_token() if deduped_items else None
+        if deduped_items and not token:
+            return media_paths, [f"[{chatbot_msg.message_type or 'attachment'}: download failed]"]
+
+        media_dir = resolve_channel_media_dir(self.name)
+        media_root = media_dir.resolve()
+        msg_type = str(
+            getattr(chatbot_msg, "message_type", None)
+            or raw_data.get("msgtype")
+            or raw_data.get("msgType")
+            or "attachment"
+        )
+        message_id = str(getattr(chatbot_msg, "message_id", None) or raw_data.get("msgId") or int(time.time()))
+
+        download_targets: list[dict[str, str]] = []
+        for item in deduped_items:
+            if not token:
+                continue
+            download_url = await self._get_download_url(token, item["download_code"])
+            if not download_url:
+                notes.append(f"[{msg_type}: download failed]")
+                continue
+            download_targets.append(
+                {
+                    "url": download_url,
+                    "filename": item.get("filename") or "image.png",
+                    "source": f"code:{item['download_code'][:8]}",
+                }
+            )
+        for item in deduped_urls:
+            download_targets.append(
+                {
+                    "url": item["url"],
+                    "filename": item.get("filename") or "",
+                    "source": "url",
+                }
+            )
+
+        if not self._http:
+            return media_paths, [f"[{msg_type}: download failed]"]
+
+        for index, item in enumerate(download_targets):
+            download_url = item["url"]
+            try:
+                resp = await self._http.get(download_url, follow_redirects=True)
+                if resp.status_code >= 400:
+                    logger.error(
+                        "DingTalk media download failed status=%s source=%s",
+                        resp.status_code,
+                        item.get("source"),
+                    )
+                    notes.append(f"[{msg_type}: download failed]")
+                    continue
+                if len(resp.content) > MAX_INBOUND_MEDIA_BYTES:
+                    notes.append(f"[{msg_type}: too large]")
+                    continue
+
+                content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                filename = (
+                    item.get("filename")
+                    or self._filename_from_content_disposition(resp.headers.get("content-disposition"))
+                    or f"{message_id}_{index}"
+                )
+                safe_name = self._safe_filename(filename)
+                if "." not in safe_name:
+                    ext = mimetypes.guess_extension(content_type) or (".png" if msg_type == "picture" else ".bin")
+                    safe_name = f"{safe_name}{ext}"
+                file_path = (media_root / f"{message_id}_{index}_{safe_name}").resolve()
+                if not file_path.is_relative_to(media_root):
+                    logger.warning("Rejected DingTalk download outside media directory: %r", filename)
+                    notes.append(f"[{msg_type}: download failed]")
+                    continue
+
+                file_path.write_bytes(resp.content)
+                media_paths.append(str(file_path))
+                logger.debug("Downloaded DingTalk %s to %s", msg_type, file_path)
+            except Exception as e:
+                logger.error("DingTalk media download error source=%s err=%s", item.get("source"), e)
+                notes.append(f"[{msg_type}: download failed]")
+
+        return media_paths, notes
 
     async def _read_media_bytes(
         self,
@@ -436,7 +806,15 @@ class DingTalkChannel(BaseChannel):
                 f"[Attachment send failed: {filename}]",
             )
 
-    async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
+    async def _on_message(
+        self,
+        content: str,
+        sender_id: str,
+        sender_name: str,
+        *,
+        media: list[str] | None = None,
+        metadata_extra: dict[str, Any] | None = None,
+    ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
@@ -444,16 +822,20 @@ class DingTalkChannel(BaseChannel):
         """
         try:
             logger.info("DingTalk inbound: %s from %s", content, sender_name)
+            metadata = {
+                "bot_name": self.bot_name,
+                "default_agent": self.default_agent,
+                "sender_name": sender_name,
+                "platform": "dingtalk",
+            }
+            if metadata_extra:
+                metadata.update({k: v for k, v in metadata_extra.items() if v is not None})
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=sender_id,  # For private chat, chat_id == sender_id
                 content=str(content),
-                metadata={
-                    "bot_name": self.bot_name,
-                    "default_agent": self.default_agent,
-                    "sender_name": sender_name,
-                    "platform": "dingtalk",
-                },
+                media=media or [],
+                metadata=metadata,
             )
         except Exception as e:
             logger.error("Error publishing DingTalk message: %s", e)

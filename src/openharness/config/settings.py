@@ -121,6 +121,7 @@ class ProviderProfile(BaseModel):
     max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    supports_vision: bool | None = None
 
     @property
     def resolved_model(self) -> str:

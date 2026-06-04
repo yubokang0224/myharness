@@ -20,6 +20,7 @@ class ProviderProfileOut(BaseModel):
     max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    supports_vision: bool | None = None
     credential_slot: str | None = None
     is_builtin: bool = True
     # resolved model actually in use
@@ -28,6 +29,18 @@ class ProviderProfileOut(BaseModel):
     auth_status: str = "unknown"
     # whether this profile is currently active
     is_active: bool = False
+
+
+class VisionConfigOut(BaseModel):
+    """Vision model configuration summary.
+
+    API keys are intentionally never returned to the browser.
+    """
+
+    model: str = ""
+    base_url: str = ""
+    configured: bool = False
+    source: str = "missing"
 
 
 class ModelConfigOut(BaseModel):
@@ -42,6 +55,16 @@ class ModelConfigOut(BaseModel):
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     profiles: list[ProviderProfileOut]
+    vision: VisionConfigOut
+
+
+class UpdateVisionConfigIn(BaseModel):
+    """Request body to update the image-to-text vision model config."""
+
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_api_key: bool = False
 
 
 class SwitchProfileIn(BaseModel):
@@ -70,6 +93,7 @@ class CreateProfileIn(BaseModel):
     max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    supports_vision: bool | None = None
     credential_slot: str | None = None
 
 
@@ -83,6 +107,7 @@ class UpdateProfileIn(BaseModel):
     max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
+    supports_vision: bool | None = None
 
 
 class SetApiKeyIn(BaseModel):

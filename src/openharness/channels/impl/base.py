@@ -1,6 +1,7 @@
 """Base channel interface for chat platforms."""
 
 import os
+import re
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -11,6 +12,11 @@ from openharness.channels.bus.queue import MessageBus
 from openharness.config.paths import get_data_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_media_dir_name(channel_name: str) -> str:
+    name = str(channel_name or "channel").strip() or "channel"
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name)
 
 
 def resolve_channel_media_dir(channel_name: str) -> Path:
@@ -26,7 +32,7 @@ def resolve_channel_media_dir(channel_name: str) -> Path:
             root = get_attachments_dir(ohmo_workspace)
         else:
             root = get_data_dir() / "media"
-    media_dir = root / channel_name
+    media_dir = root / _safe_media_dir_name(channel_name)
     media_dir.mkdir(parents=True, exist_ok=True)
     return media_dir
 

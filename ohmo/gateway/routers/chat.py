@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from openharness.api.usage import UsageSnapshot
@@ -37,6 +38,7 @@ from ohmo.session_storage import (
     load_by_id,
     save_session_snapshot,
 )
+from ohmo.workspace import get_attachments_dir
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["chat"])
@@ -67,6 +69,11 @@ _EMPTY_ASSISTANT_MESSAGE = (
     "Model returned an empty assistant message. "
     "The turn was ignored to keep the session healthy."
 )
+
+
+def _safe_attachment_filename(filename: str | None) -> str:
+    name = Path(filename or "attachment.bin").name.strip() or "attachment.bin"
+    return re.sub(r"[^A-Za-z0-9._ -]+", "_", name)
 
 
 def _sse_line(payload: Any) -> str:
@@ -322,6 +329,36 @@ async def get_memory(
         entries=[{"content": e} if isinstance(e, str) else e for e in entries],
         files=[str(f) for f in files],
     )
+
+
+@router.post("/attachments")
+async def upload_attachment(
+    file: Annotated[UploadFile, File(...)],
+    _user: Annotated[dict, Depends(get_current_user)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """Persist a browser-selected attachment so local tools can read it."""
+    safe_name = _safe_attachment_filename(file.filename)
+    target_dir = get_attachments_dir(runtime.workspace) / time.strftime("%Y%m%d")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = (target_dir / f"{uuid4().hex[:12]}-{safe_name}").resolve()
+
+    try:
+        size = 0
+        with target_path.open("wb") as stream:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                stream.write(chunk)
+    finally:
+        await file.close()
+
+    return {
+        "uid": uuid4().hex[:12],
+        "name": safe_name,
+        "path": str(target_path),
+        "fileSize": size,
+        "fileType": file.content_type,
+    }
 
 
 # ---------------------------------------------------------------------------

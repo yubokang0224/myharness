@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ohmo.gateway.dependencies import get_runtime
 from ohmo.gateway.routers import agents, chat, models, skills, tasks
+from ohmo.workspace import initialize_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def create_app(
 ) -> FastAPI:
     """Create and configure the FastAPI application."""
     runtime = get_runtime()
-    runtime.workspace = workspace
+    runtime.workspace = str(initialize_workspace(workspace))
 
     app = FastAPI(
         title="OpenHarness Agent API",

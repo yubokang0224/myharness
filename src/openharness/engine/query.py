@@ -568,7 +568,10 @@ async def _preprocess_images_in_messages(
 
     Yields status events during conversion so the UI stays responsive.
     """
-    if is_model_multimodal(context.model):
+    supports_vision_override = context.tool_metadata.get("supports_vision")
+    if supports_vision_override is True or (
+        supports_vision_override is not False and is_model_multimodal(context.model)
+    ):
         return
 
     vision_config = context.tool_metadata.get("vision_model_config")

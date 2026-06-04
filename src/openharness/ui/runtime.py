@@ -233,6 +233,7 @@ async def build_runtime(
         "permission_mode": permission_mode,
     }
     settings = load_settings().merge_cli_overrides(**settings_overrides)
+    _, active_provider_profile = settings.resolve_profile()
     from openharness.utils.internal_api_auth import (
         USER_BEARER_TOKEN_ENV,
         make_hsjm_auth_metadata,
@@ -355,6 +356,7 @@ async def build_runtime(
             "extra_plugin_roots": normalized_plugin_roots,
             "session_id": session_id,
             "vision_model_config": _resolve_vision_config(settings),
+            "supports_vision": active_provider_profile.supports_vision,
             **restored_metadata,
         },
     )

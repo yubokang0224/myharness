@@ -36,3 +36,4 @@ react_tui_smoke.txt
 Thumbs.db
 uv.lock
 match_delivery_to_purchase.py
+parse_pdf.py

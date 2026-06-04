@@ -62,7 +62,7 @@ _TEXT_PREVIEW_CHARS = 900
 _BINARY_HEAD_BYTES = 32
 _IMAGE_FALLBACK_NOTE = (
     "[Image attachment omitted because the active model does not support image input. "
-    "Use the attachment paths and summaries above if needed.]"
+    "Ask the user to resend the image as text or switch to a vision-capable model.]"
 )
 
 
@@ -944,14 +944,15 @@ def _build_speaker_context(message: InboundMessage) -> str:
 
 def _build_attachment_notes(media_paths: list[str]) -> str:
     """Build textual attachment notes for non-image context and persistence."""
-    if not media_paths:
+    non_image_paths = [media_path for media_path in media_paths if not _is_image_attachment(media_path)]
+    if not non_image_paths:
         return ""
     lines = [
         "[Channel attachments]",
         "The following attachments were downloaded locally for this message.",
         "Inspect them by path if needed.",
     ]
-    for media_path in media_paths:
+    for media_path in non_image_paths:
         lines.append(f"- {_describe_media_path(media_path)}")
         summary = _summarize_attachment(media_path)
         if summary:
