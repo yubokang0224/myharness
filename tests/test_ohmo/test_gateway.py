@@ -27,8 +27,8 @@ from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import build_channel_manager_config, save_gateway_config
 from ohmo.gateway.dependencies import AuthContext
 from ohmo.gateway.models import GatewayConfig, GatewayState
-from ohmo.gateway.routers.chat import list_sessions, send_message
-from ohmo.gateway.schemas.chat import MessageRequest
+from ohmo.gateway.routers.chat import create_session, list_sessions, send_message, send_message_sync
+from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
@@ -145,6 +145,19 @@ async def test_chat_session_list_hides_remote_channel_sessions_by_default(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_create_session_allows_anonymous_external_call(tmp_path):
+    session = await create_session(
+        body=CreateSessionRequest(title="External session"),
+        _user=None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    assert session.title == "External session"
+    assert session.channel == "web"
+    assert session.id
+
+
+@pytest.mark.asyncio
 async def test_chat_send_message_returns_sse_error_when_provider_auth_missing(tmp_path, monkeypatch):
     monkeypatch.setattr("openharness.config.load_settings", lambda: SimpleNamespace())
 
@@ -167,6 +180,31 @@ async def test_chat_send_message_returns_sse_error_when_provider_auth_missing(tm
     assert '"event":"error"' in payload
     assert "Authentication is not configured" in payload
     assert '"recoverable":false' in payload
+
+
+@pytest.mark.asyncio
+async def test_chat_send_message_sync_returns_json_error_when_provider_auth_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr("openharness.config.load_settings", lambda: SimpleNamespace())
+
+    def missing_auth(settings):
+        del settings
+        raise SystemExit(1)
+
+    monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", missing_auth)
+
+    response = await send_message_sync(
+        session_id="session-1",
+        body=MessageRequest(content="hello"),
+        auth=None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    assert response.session_id == "session-1"
+    assert response.status == "error"
+    assert response.text == ""
+    assert response.error is not None
+    assert "Authentication is not configured" in response.error
+    assert response.recoverable is False
 
 
 def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypatch, caplog):

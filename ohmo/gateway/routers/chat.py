@@ -16,13 +16,23 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from fastapi.responses import StreamingResponse
 
 from openharness.api.usage import UsageSnapshot
-from ohmo.gateway.dependencies import AuthContext, get_auth_context, get_current_user, get_runtime, _RuntimeState
+from ohmo.gateway.dependencies import (
+    AuthContext,
+    get_auth_context,
+    get_current_user,
+    get_optional_auth_context,
+    get_optional_user,
+    get_runtime,
+    _RuntimeState,
+)
 from ohmo.gateway.schemas.chat import (
     ApproveRequest,
     CreateSessionRequest,
     MemoryInfo,
     MessageInfo,
     MessageRequest,
+    MessageSyncResponse,
+    PermissionRequestInfo,
     SessionInfo,
     SSEDone,
     SSEError,
@@ -189,7 +199,7 @@ async def list_sessions(
 @router.post("", response_model=SessionInfo, status_code=status.HTTP_201_CREATED)
 async def create_session(
     body: CreateSessionRequest,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict | None, Depends(get_optional_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Create a new chat session."""
@@ -643,6 +653,263 @@ async def send_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/{session_id}/messages/sync", response_model=MessageSyncResponse)
+async def send_message_sync(
+    session_id: str,
+    body: MessageRequest,
+    auth: Annotated[AuthContext | None, Depends(get_optional_auth_context)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """Send a user message and return the final assistant text as JSON."""
+    permission_requests: list[PermissionRequestInfo] = []
+    tool_calls: list[dict[str, Any]] = []
+    status_messages: list[str] = []
+    text_parts: list[str] = []
+    usage_dict: dict[str, Any] | None = None
+
+    async def permission_prompt(tool_name: str, reason: str) -> bool:
+        req_id = uuid4().hex[:8]
+        permission_requests.append(
+            PermissionRequestInfo(tool_name=tool_name, reason=reason, request_id=req_id)
+        )
+        return False
+
+    mcp_manager = None
+    try:
+        from openharness.config import load_settings
+        from openharness.ui.runtime import _resolve_api_client_from_settings
+        from openharness.engine import QueryEngine
+        from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock
+        from openharness.tools import create_default_tool_registry
+        from openharness.mcp.client import McpClientManager
+        from openharness.mcp.config import load_mcp_server_configs
+        from openharness.permissions import PermissionChecker
+        from openharness.utils.internal_api_auth import make_hsjm_auth_metadata
+        from openharness.engine.stream_events import (
+            AssistantTextDelta,
+            AssistantTurnComplete,
+            ErrorEvent,
+            StatusEvent,
+            ToolExecutionCompleted,
+            ToolExecutionStarted,
+        )
+
+        settings = load_settings()
+        agent_def = None
+        agent_name: str | None = None
+        snap = None
+        try:
+            snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+            if snap:
+                agent_name = snap.get("agent_name")
+        except Exception:
+            snap = None
+        if agent_name:
+            try:
+                from openharness.coordinator.agent_definitions import get_agent_definition
+
+                agent_def = get_agent_definition(agent_name)
+                if agent_def is not None:
+                    settings = settings.merge_cli_overrides(
+                        model=agent_def.model if agent_def.model and agent_def.model != "inherit" else None,
+                        system_prompt=agent_def.system_prompt,
+                        permission_mode=agent_def.permission_mode,
+                        max_turns=agent_def.max_turns,
+                    )
+            except Exception:
+                logger.exception("Failed to apply agent definition for %s", agent_name)
+
+        try:
+            api_client = _resolve_api_client_from_settings(settings)
+        except SystemExit:
+            logger.warning("Model provider authentication is not configured for session %s", session_id)
+            return MessageSyncResponse(
+                session_id=session_id,
+                status="error",
+                text="",
+                tool_calls=tool_calls,
+                status_messages=status_messages,
+                permission_requests=permission_requests,
+                error=_AUTH_CONFIG_ERROR_MESSAGE,
+                recoverable=False,
+            )
+
+        hsjm_auth = make_hsjm_auth_metadata(auth.raw_token) if auth is not None else None
+        tool_metadata = {"hsjm_auth": hsjm_auth} if hsjm_auth else {}
+        mcp_manager = McpClientManager(
+            load_mcp_server_configs(settings, []),
+            auth_metadata=tool_metadata,
+        )
+        await mcp_manager.connect_all()
+        tool_metadata["mcp_manager"] = mcp_manager
+        tool_registry = create_default_tool_registry(mcp_manager)
+        if session_id in _session_allowed_tools:
+            settings.permission.allowed_tools = list(
+                dict.fromkeys([
+                    *settings.permission.allowed_tools,
+                    *_session_allowed_tools.get(session_id, set()),
+                ])
+            )
+        permission_checker = PermissionChecker(settings.permission)
+
+        effective_cwd = Path.cwd()
+        if agent_name:
+            try:
+                if agent_def is not None and agent_def.cwd:
+                    candidate = Path(agent_def.cwd).expanduser().resolve()
+                    if candidate.is_dir():
+                        effective_cwd = candidate
+            except Exception:
+                logger.exception("Failed to resolve agent cwd for %s", agent_name)
+
+        from openharness.prompts.context import build_runtime_system_prompt
+
+        attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
+        user_text = body.content
+        if attachment_notes:
+            user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
+
+        system_prompt = build_runtime_system_prompt(
+            settings,
+            cwd=effective_cwd,
+            latest_user_prompt=user_text,
+        )
+
+        engine = QueryEngine(
+            api_client=api_client,
+            tool_registry=tool_registry,
+            permission_checker=permission_checker,
+            cwd=effective_cwd,
+            model=settings.model,
+            system_prompt=system_prompt,
+            permission_prompt=permission_prompt,
+            max_turns=getattr(settings, "max_turns", None) or 50,
+            tool_metadata=tool_metadata,
+        )
+
+        try:
+            if snap and snap.get("messages"):
+                msgs = [ConversationMessage(**m) for m in snap["messages"] if isinstance(m, dict)]
+                engine.load_messages(msgs)
+        except Exception:
+            pass
+
+        user_blocks = [TextBlock(text=user_text)]
+        for attachment in body.attachments:
+            local_path = _attachment_path(attachment, effective_cwd)
+            if local_path and _is_image_path(local_path):
+                try:
+                    user_blocks.append(ImageBlock.from_path(local_path))
+                except Exception:
+                    logger.exception("Failed to attach image %s", local_path)
+
+        user_message = ConversationMessage(
+            role="user",
+            content=user_blocks,
+            attachments=body.attachments,
+        )
+
+        async for event in engine.submit_message(user_message):
+            if isinstance(event, AssistantTextDelta):
+                text_parts.append(event.text)
+            elif isinstance(event, ToolExecutionStarted):
+                tool_calls.append(
+                    {
+                        "tool_name": event.tool_name,
+                        "tool_input": event.tool_input,
+                        "output": None,
+                        "is_error": None,
+                    }
+                )
+            elif isinstance(event, ToolExecutionCompleted):
+                for call in reversed(tool_calls):
+                    if call.get("tool_name") == event.tool_name and call.get("output") is None:
+                        call["output"] = event.output
+                        call["is_error"] = event.is_error
+                        break
+                else:
+                    tool_calls.append(
+                        {
+                            "tool_name": event.tool_name,
+                            "tool_input": {},
+                            "output": event.output,
+                            "is_error": event.is_error,
+                        }
+                    )
+            elif isinstance(event, AssistantTurnComplete):
+                try:
+                    usage_dict = event.usage.__dict__ if event.usage else None
+                except Exception:
+                    usage_dict = None
+                try:
+                    usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+                    if not isinstance(usage_snap, UsageSnapshot):
+                        usage_snap = UsageSnapshot()
+                    save_session_snapshot(
+                        cwd=Path.cwd(),
+                        workspace=runtime.workspace,
+                        model=settings.model or "",
+                        system_prompt=system_prompt,
+                        messages=engine.messages,
+                        usage=usage_snap,
+                        session_id=session_id,
+                        agent_name=agent_name,
+                        channel="web",
+                        platform="web",
+                    )
+                except Exception:
+                    logger.exception("Failed to save session snapshot for %s", session_id)
+            elif isinstance(event, ErrorEvent):
+                if event.message == _EMPTY_ASSISTANT_MESSAGE:
+                    status_messages.append(
+                        "Model returned an empty assistant message; this turn was skipped."
+                    )
+                else:
+                    return MessageSyncResponse(
+                        session_id=session_id,
+                        status="error",
+                        text="".join(text_parts).strip(),
+                        tool_calls=tool_calls,
+                        status_messages=status_messages,
+                        permission_requests=permission_requests,
+                        usage=usage_dict,
+                        error=event.message,
+                        recoverable=event.recoverable,
+                    )
+            elif isinstance(event, StatusEvent):
+                status_messages.append(event.message)
+
+        return MessageSyncResponse(
+            session_id=session_id,
+            status="completed",
+            text="".join(text_parts).strip(),
+            tool_calls=tool_calls,
+            status_messages=status_messages,
+            permission_requests=permission_requests,
+            usage=usage_dict,
+        )
+
+    except Exception as exc:
+        logger.exception("Error in sync engine task for session %s", session_id)
+        return MessageSyncResponse(
+            session_id=session_id,
+            status="error",
+            text="".join(text_parts).strip(),
+            tool_calls=tool_calls,
+            status_messages=status_messages,
+            permission_requests=permission_requests,
+            usage=usage_dict,
+            error=str(exc),
+            recoverable=False,
+        )
+    finally:
+        if mcp_manager is not None:
+            try:
+                await mcp_manager.close()
+            except Exception:
+                pass
 
 
 @router.post("/{session_id}/messages/approve", status_code=status.HTTP_204_NO_CONTENT)

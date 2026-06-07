@@ -86,6 +86,16 @@ async def get_auth_context(
     return AuthContext(user=payload, raw_token=token)
 
 
+async def get_optional_auth_context(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> AuthContext | None:
+    """Return auth context when a Bearer token is present; allow anonymous requests."""
+    if credentials is None:
+        return None
+    payload, token = _decode_bearer_credentials(credentials)
+    return AuthContext(user=payload, raw_token=token)
+
+
 # ---------------------------------------------------------------------------
 # Optional auth (allows unauthenticated during development)
 # ---------------------------------------------------------------------------

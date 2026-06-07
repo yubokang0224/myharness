@@ -33,6 +33,24 @@ class MessageRequest(BaseModel):
     attachments: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class PermissionRequestInfo(BaseModel):
+    tool_name: str
+    reason: str
+    request_id: str
+
+
+class MessageSyncResponse(BaseModel):
+    session_id: str
+    status: Literal["completed", "error"]
+    text: str
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    status_messages: list[str] = Field(default_factory=list)
+    permission_requests: list[PermissionRequestInfo] = Field(default_factory=list)
+    usage: dict[str, Any] | None = None
+    error: str | None = None
+    recoverable: bool | None = None
+
+
 class MessageInfo(BaseModel):
     id: str
     role: Literal["user", "assistant"]
