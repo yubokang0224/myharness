@@ -79,6 +79,9 @@ _EMPTY_ASSISTANT_MESSAGE = (
     "Model returned an empty assistant message. "
     "The turn was ignored to keep the session healthy."
 )
+_EMPTY_ASSISTANT_SYNC_ERROR = (
+    "Model returned no visible content. Check server logs for empty-response diagnostics."
+)
 
 
 def _safe_attachment_filename(filename: str | None) -> str:
@@ -148,6 +151,14 @@ def _build_attachment_notes(attachments: list[dict[str, Any]], cwd: Path) -> str
             parts.append(f"bytes={file_size}")
         lines.append(f"{index + 1}. " + "; ".join(parts))
     return "\n".join(lines)
+
+
+def _prepare_user_text(body: MessageRequest, attachment_notes: str = "") -> str:
+    """Build model input with attachment notes."""
+    user_text = body.content
+    if attachment_notes:
+        user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
+    return user_text
 
 
 # ---------------------------------------------------------------------------
@@ -519,9 +530,7 @@ async def send_message(
 
             from openharness.prompts.context import build_runtime_system_prompt
             attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
-            user_text = body.content
-            if attachment_notes:
-                user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
+            user_text = _prepare_user_text(body, attachment_notes)
 
             system_prompt = build_runtime_system_prompt(
                 settings,
@@ -536,6 +545,12 @@ async def send_message(
                 cwd=effective_cwd,
                 model=settings.model,
                 system_prompt=system_prompt,
+                max_tokens=settings.max_tokens,
+                context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
+                auto_compact_threshold_tokens=(
+                    settings.auto_compact_threshold_tokens
+                    or settings.memory.auto_compact_threshold_tokens
+                ),
                 permission_prompt=permission_prompt,
                 max_turns=getattr(settings, "max_turns", None) or 50,
                 tool_metadata=tool_metadata,
@@ -767,9 +782,7 @@ async def send_message_sync(
         from openharness.prompts.context import build_runtime_system_prompt
 
         attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
-        user_text = body.content
-        if attachment_notes:
-            user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
+        user_text = _prepare_user_text(body, attachment_notes)
 
         system_prompt = build_runtime_system_prompt(
             settings,
@@ -784,6 +797,12 @@ async def send_message_sync(
             cwd=effective_cwd,
             model=settings.model,
             system_prompt=system_prompt,
+            max_tokens=settings.max_tokens,
+            context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
+            auto_compact_threshold_tokens=(
+                settings.auto_compact_threshold_tokens
+                or settings.memory.auto_compact_threshold_tokens
+            ),
             permission_prompt=permission_prompt,
             max_turns=getattr(settings, "max_turns", None) or 50,
             tool_metadata=tool_metadata,
@@ -865,6 +884,17 @@ async def send_message_sync(
                 if event.message == _EMPTY_ASSISTANT_MESSAGE:
                     status_messages.append(
                         "Model returned an empty assistant message; this turn was skipped."
+                    )
+                    return MessageSyncResponse(
+                        session_id=session_id,
+                        status="error",
+                        text="".join(text_parts).strip(),
+                        tool_calls=tool_calls,
+                        status_messages=status_messages,
+                        permission_requests=permission_requests,
+                        usage=usage_dict,
+                        error=_EMPTY_ASSISTANT_SYNC_ERROR,
+                        recoverable=True,
                     )
                 else:
                     return MessageSyncResponse(

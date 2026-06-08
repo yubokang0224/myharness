@@ -301,9 +301,23 @@ class OpenAICompatibleClient:
         usage_data: dict[str, int] = {}
         # Buffer to strip inline <think>…</think> blocks across streaming chunks.
         _think_buf = ""
+        no_think_requested = re.search(
+            r"(^|\n)\s*/no_think(?:\s|$)",
+            (request.system_prompt or "")
+            + "\n"
+            + "\n".join(message.text for message in request.messages),
+            flags=re.IGNORECASE,
+        ) is not None
+        chunk_count = 0
+        choice_chunk_count = 0
+        content_delta_chunks = 0
+        visible_delta_chunks = 0
+        reasoning_delta_chunks = 0
+        tool_delta_chunks = 0
 
         stream = await self._client.chat.completions.create(**params)
         async for chunk in stream:
+            chunk_count += 1
             if not chunk.choices:
                 # Usage-only chunk (some providers send this at the end)
                 if chunk.usage:
@@ -313,6 +327,7 @@ class OpenAICompatibleClient:
                     }
                 continue
 
+            choice_chunk_count += 1
             delta = chunk.choices[0].delta
             chunk_finish = chunk.choices[0].finish_reason
 
@@ -322,18 +337,22 @@ class OpenAICompatibleClient:
             # Accumulate reasoning_content from thinking models (not shown to user)
             reasoning_piece = getattr(delta, "reasoning_content", None) or ""
             if reasoning_piece:
+                reasoning_delta_chunks += 1
                 collected_reasoning += reasoning_piece
 
             # Stream text content to user, stripping inline <think> blocks
             if delta.content:
+                content_delta_chunks += 1
                 _think_buf += delta.content
                 visible, _think_buf = _strip_think_blocks(_think_buf)
                 if visible:
+                    visible_delta_chunks += 1
                     collected_content += visible
                     yield ApiTextDeltaEvent(text=visible)
 
             # Accumulate tool calls
             if delta.tool_calls:
+                tool_delta_chunks += 1
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
                     if idx not in collected_tool_calls:
@@ -384,6 +403,38 @@ class OpenAICompatibleClient:
         # can replay it when the message is sent back to the API
         if collected_reasoning:
             final_message._reasoning = collected_reasoning  # type: ignore[attr-defined]
+
+        if final_message.is_effectively_empty():
+            named_tool_call_count = sum(1 for tc in collected_tool_calls.values() if tc.get("name"))
+            log.warning(
+                "OpenAI-compatible provider returned empty visible assistant message: %s",
+                json.dumps(
+                    {
+                        "model": request.model,
+                        "finish_reason": finish_reason,
+                        "input_tokens": usage_data.get("input_tokens", 0),
+                        "output_tokens": usage_data.get("output_tokens", 0),
+                        "chunk_count": chunk_count,
+                        "choice_chunk_count": choice_chunk_count,
+                        "content_delta_chunks": content_delta_chunks,
+                        "visible_delta_chunks": visible_delta_chunks,
+                        "reasoning_delta_chunks": reasoning_delta_chunks,
+                        "tool_delta_chunks": tool_delta_chunks,
+                        "reasoning_chars": len(collected_reasoning),
+                        "hidden_think_leftover_chars": len(_think_buf),
+                        "collected_content_chars": len(collected_content),
+                        "tool_call_count": named_tool_call_count,
+                        "message_count": len(request.messages),
+                        "max_tokens": request.max_tokens,
+                        "has_tools": bool(request.tools),
+                        "no_think_requested": no_think_requested,
+                        "qwen_thinking_disabled": False,
+                        "stream_options_requested": "stream_options" in params,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
 
         yield ApiMessageCompleteEvent(
             message=final_message,

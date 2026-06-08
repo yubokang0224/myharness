@@ -31,6 +31,7 @@ class SessionInfo(BaseModel):
 class MessageRequest(BaseModel):
     content: str
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    response_format: Literal["text", "json"] = "text"
 
 
 class PermissionRequestInfo(BaseModel):

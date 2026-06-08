@@ -27,7 +27,13 @@ from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
 from ohmo.gateway.config import build_channel_manager_config, save_gateway_config
 from ohmo.gateway.dependencies import AuthContext
 from ohmo.gateway.models import GatewayConfig, GatewayState
-from ohmo.gateway.routers.chat import create_session, list_sessions, send_message, send_message_sync
+from ohmo.gateway.routers.chat import (
+    _prepare_user_text,
+    create_session,
+    list_sessions,
+    send_message,
+    send_message_sync,
+)
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
@@ -205,6 +211,77 @@ async def test_chat_send_message_sync_returns_json_error_when_provider_auth_miss
     assert response.error is not None
     assert "Authentication is not configured" in response.error
     assert response.recoverable is False
+
+
+def test_message_request_json_response_format_does_not_add_no_think_prefix():
+    body = MessageRequest(content="Return JSON only", response_format="json")
+
+    assert _prepare_user_text(body) == "Return JSON only"
+
+
+def test_message_request_json_response_format_preserves_existing_content():
+    body = MessageRequest(content="/no_think\nReturn JSON only", response_format="json")
+
+    assert _prepare_user_text(body) == "/no_think\nReturn JSON only"
+
+
+def test_message_request_text_response_format_does_not_add_no_think_prefix():
+    body = MessageRequest(content="normal chat", response_format="text")
+
+    assert _prepare_user_text(body) == "normal chat"
+
+
+@pytest.mark.asyncio
+async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path, monkeypatch):
+    settings = Settings(
+        model="Qwen36_30b",
+        max_tokens=40000,
+        context_window_tokens=220000,
+        auto_compact_threshold_tokens=180000,
+    )
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda _: object())
+    monkeypatch.setattr("openharness.mcp.config.load_mcp_server_configs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("openharness.utils.internal_api_auth.make_hsjm_auth_metadata", lambda token: None)
+
+    class FakeMcpManager:
+        async def connect_all(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeToolRegistry:
+        def to_api_schema(self):
+            return []
+
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        messages = []
+        total_usage = UsageSnapshot()
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def submit_message(self, _message):
+            yield AssistantTextDelta(text="{}")
+
+    monkeypatch.setattr("openharness.mcp.client.McpClientManager", lambda *args, **kwargs: FakeMcpManager())
+    monkeypatch.setattr("openharness.tools.create_default_tool_registry", lambda _manager: FakeToolRegistry())
+    monkeypatch.setattr("openharness.engine.QueryEngine", FakeEngine)
+
+    response = await send_message_sync(
+        session_id="session-1",
+        body=MessageRequest(content="Return JSON", response_format="json"),
+        auth=None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    assert response.text == "{}"
+    assert captured["max_tokens"] == 40000
+    assert captured["context_window_tokens"] == 220000
+    assert captured["auto_compact_threshold_tokens"] == 180000
 
 
 def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypatch, caplog):

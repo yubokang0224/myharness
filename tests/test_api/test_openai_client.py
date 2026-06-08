@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from types import SimpleNamespace
 
 import httpx
 
@@ -251,6 +253,40 @@ class _FakeOpenAIClient:
         self.chat = _FakeChat()
 
 
+class _ReasoningOnlyCompletions:
+    async def create(self, **kwargs):
+        async def _stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            reasoning_content="hidden reasoning",
+                            tool_calls=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=13, completion_tokens=17),
+            )
+
+        return _stream()
+
+
+class _ReasoningOnlyClient:
+    def __init__(self) -> None:
+        self.chat = SimpleNamespace(completions=_ReasoningOnlyCompletions())
+
+
 @pytest.mark.asyncio
 async def test_openai_client_uses_full_base_url_path_for_requests():
     seen_urls: list[str] = []
@@ -357,6 +393,59 @@ class TestStreamMessageTokenParams:
         assert fake_sdk.chat.completions.last_kwargs is not None
         assert "max_tokens" in fake_sdk.chat.completions.last_kwargs
         assert "max_completion_tokens" not in fake_sdk.chat.completions.last_kwargs
+
+    @pytest.mark.asyncio
+    async def test_qwen_no_think_stream_does_not_disable_thinking_template(self):
+        client = OpenAICompatibleClient(api_key="test-key")
+        fake_sdk = _FakeOpenAIClient()
+        client._client = fake_sdk
+
+        request = ApiMessageRequest(
+            model="Qwen36_30b",
+            messages=[ConversationMessage.from_user_text("/no_think\nReturn JSON only")],
+        )
+
+        events = [event async for event in client.stream_message(request)]
+
+        assert events
+        assert fake_sdk.chat.completions.last_kwargs is not None
+        assert "extra_body" not in fake_sdk.chat.completions.last_kwargs
+
+    @pytest.mark.asyncio
+    async def test_gpt_no_think_stream_does_not_add_qwen_thinking_template(self):
+        client = OpenAICompatibleClient(api_key="test-key")
+        fake_sdk = _FakeOpenAIClient()
+        client._client = fake_sdk
+
+        request = ApiMessageRequest(
+            model="gpt-4o",
+            messages=[ConversationMessage.from_user_text("/no_think\nReturn JSON only")],
+        )
+
+        events = [event async for event in client.stream_message(request)]
+
+        assert events
+        assert fake_sdk.chat.completions.last_kwargs is not None
+        assert "extra_body" not in fake_sdk.chat.completions.last_kwargs
+
+    @pytest.mark.asyncio
+    async def test_reasoning_only_empty_response_logs_diagnostics(self, caplog):
+        client = OpenAICompatibleClient(api_key="test-key")
+        client._client = _ReasoningOnlyClient()
+        caplog.set_level(logging.WARNING, logger="openharness.api.openai_client")
+
+        request = ApiMessageRequest(
+            model="Qwen36_30b",
+            messages=[ConversationMessage.from_user_text("/no_think\nReturn JSON only")],
+        )
+
+        events = [event async for event in client.stream_message(request)]
+
+        assert events[-1].message.is_effectively_empty()
+        assert "empty visible assistant message" in caplog.text
+        assert '"reasoning_delta_chunks": 1' in caplog.text
+        assert '"qwen_thinking_disabled": false' in caplog.text
+        assert "hidden reasoning" not in caplog.text
 
 
 class TestStripThinkBlocks:
