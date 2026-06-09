@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -647,16 +648,23 @@ async def run_query(
     from openharness.services.compact import (
         AutoCompactState,
         auto_compact_if_needed,
+        estimate_message_tokens,
     )
+    from openharness.services.token_estimation import estimate_tokens
 
     compact_state = AutoCompactState()
     reactive_compact_attempted = False
+    empty_response_compact_attempted = False
     last_compaction_result: tuple[list[ConversationMessage], bool] = (messages, False)
     effective_max_tokens = _bounded_completion_tokens(
         context.max_tokens,
         context.context_window_tokens,
     )
     reported_token_clamp = False
+    tool_schemas = context.tool_registry.to_api_schema()
+    fixed_input_tokens = estimate_tokens(context.system_prompt or "") + estimate_tokens(
+        json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True)
+    )
 
     async def _stream_compaction(
         *,
@@ -683,6 +691,8 @@ async def run_query(
                 carryover_metadata=context.tool_metadata,
                 context_window_tokens=context.context_window_tokens,
                 auto_compact_threshold_tokens=context.auto_compact_threshold_tokens,
+                additional_input_tokens=fixed_input_tokens,
+                reserved_output_tokens=effective_max_tokens,
             )
         )
         while True:
@@ -721,6 +731,22 @@ async def run_query(
             yield event, None
         # -----------------------------------------------------------------------------
 
+        request_max_tokens = effective_max_tokens
+        if context.context_window_tokens is not None and context.context_window_tokens > 0:
+            estimated_input_tokens = estimate_message_tokens(messages) + fixed_input_tokens
+            available_output_tokens = max(
+                1,
+                int(context.context_window_tokens) - estimated_input_tokens,
+            )
+            if request_max_tokens > available_output_tokens:
+                request_max_tokens = available_output_tokens
+                yield StatusEvent(
+                    message=(
+                        "Adjusted this turn's output budget to fit the configured context "
+                        f"window ({request_max_tokens} tokens available after estimated input)."
+                    )
+                ), None
+
         final_message: ConversationMessage | None = None
         final_stop_reason: str | None = None
         usage = UsageSnapshot()
@@ -731,8 +757,8 @@ async def run_query(
                     model=context.model,
                     messages=messages,
                     system_prompt=context.system_prompt,
-                    max_tokens=effective_max_tokens,
-                    tools=context.tool_registry.to_api_schema(),
+                    max_tokens=request_max_tokens,
+                    tools=tool_schemas,
                 )
             ):
                 if isinstance(event, ApiTextDeltaEvent):
@@ -789,6 +815,36 @@ async def run_query(
                 coordinator_context_message = messages.pop()
 
         if final_message.role == "assistant" and final_message.is_effectively_empty():
+            estimated_input_tokens = estimate_message_tokens(messages) + fixed_input_tokens
+            log.warning(
+                "empty assistant response context budget: model=%s messages=%d "
+                "estimated_input_tokens=%d fixed_input_tokens=%d context_window_tokens=%s "
+                "configured_max_tokens=%d request_max_tokens=%d",
+                context.model,
+                len(messages),
+                estimated_input_tokens,
+                fixed_input_tokens,
+                context.context_window_tokens,
+                context.max_tokens,
+                request_max_tokens,
+            )
+            if not empty_response_compact_attempted and len(messages) > 1:
+                empty_response_compact_attempted = True
+                yield StatusEvent(
+                    message=(
+                        "Model returned an empty response; compacting the current context "
+                        "and retrying once."
+                    )
+                ), usage
+                async for event, compact_usage in _stream_compaction(
+                    trigger="reactive",
+                    force=True,
+                ):
+                    yield event, compact_usage
+                messages, was_compacted = last_compaction_result
+                if was_compacted:
+                    turn_count = max(0, turn_count - 1)
+                    continue
             log.warning("dropping empty assistant message from provider response")
             yield ErrorEvent(
                 message=(

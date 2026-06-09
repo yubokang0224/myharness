@@ -211,6 +211,18 @@ def test_load_agents_dir_with_model_and_permissions(tmp_path):
     assert "deny:write" in agents[0].permissions
 
 
+def test_load_agents_dir_accepts_canonical_full_auto_permission_mode(tmp_path):
+    md = tmp_path / "auto.md"
+    md.write_text(
+        "---\nname: auto\ndescription: automatic\npermission_mode: full_auto\n---\nRun automatically.",
+        encoding="utf-8",
+    )
+
+    agents = load_agents_dir(tmp_path)
+
+    assert agents[0].permission_mode == "full_auto"
+
+
 def test_load_agents_dir_skips_unreadable_files(tmp_path):
     good = tmp_path / "good.md"
     good.write_text("---\nname: good\ndescription: fine\n---\nbody", encoding="utf-8")

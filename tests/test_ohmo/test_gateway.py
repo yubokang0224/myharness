@@ -34,9 +34,12 @@ from ohmo.gateway.routers.chat import (
     send_message,
     send_message_sync,
 )
+from ohmo.gateway.routers.agents import list_agent_tools, update_agent
+from ohmo.gateway.schemas.agents import UpdateAgentRequest
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
+from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
 from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
@@ -231,6 +234,62 @@ def test_message_request_text_response_format_does_not_add_no_think_prefix():
     assert _prepare_user_text(body) == "normal chat"
 
 
+def test_agent_tool_policy_supports_aliases_blacklist_and_empty_whitelist():
+    registry = SimpleNamespace(
+        _tools={"read_file": object(), "bash": object(), "web_search": object()}
+    )
+    agent = AgentDefinition(
+        name="limited",
+        description="Limited tools",
+        tools=["Read", "Bash"],
+        disallowed_tools=["Bash"],
+    )
+
+    apply_agent_tool_policy(registry, agent)
+
+    assert set(registry._tools) == {"read_file"}
+
+    no_tools_registry = SimpleNamespace(_tools={"read_file": object(), "bash": object()})
+    no_tools_agent = AgentDefinition(name="none", description="No tools", tools=[])
+    apply_agent_tool_policy(no_tools_registry, no_tools_agent)
+    assert no_tools_registry._tools == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_update_can_clear_tool_whitelist(tmp_path, monkeypatch):
+    agent_file = tmp_path / "limited-agent.md"
+    agent_file.write_text("---\nname: limited-agent\ntools:\n- file_read\n---\n\nPrompt", encoding="utf-8")
+    existing = AgentDefinition(
+        name="limited-agent",
+        description="Limited agent",
+        system_prompt="Prompt",
+        tools=["file_read"],
+    )
+    monkeypatch.setattr("ohmo.gateway.routers.agents._agent_file", lambda _name: agent_file)
+    monkeypatch.setattr("ohmo.gateway.routers.agents._agents_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "openharness.coordinator.agent_definitions.load_agents_dir",
+        lambda _path: [existing],
+    )
+
+    response = await update_agent(
+        name="limited-agent",
+        body=UpdateAgentRequest(tools=None),
+        _user={},
+    )
+
+    assert response.tools is None
+    assert "\ntools:" not in agent_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_catalog_lists_builtin_tools():
+    tools = await list_agent_tools(_user={}, runtime=SimpleNamespace(mcp_manager=None))
+
+    names = {tool.name for tool in tools}
+    assert {"bash", "read_file", "write_file", "web_search"}.issubset(names)
+
+
 @pytest.mark.asyncio
 async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path, monkeypatch):
     settings = Settings(
@@ -243,6 +302,19 @@ async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path
     monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda _: object())
     monkeypatch.setattr("openharness.mcp.config.load_mcp_server_configs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("openharness.utils.internal_api_auth.make_hsjm_auth_metadata", lambda token: None)
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.chat.load_by_id",
+        lambda **_kwargs: {"agent_name": "limited-agent"},
+    )
+    monkeypatch.setattr(
+        "openharness.coordinator.agent_definitions.get_agent_definition",
+        lambda name: AgentDefinition(
+            name=name,
+            description="Limited agent",
+            tools=["Read", "Bash"],
+            disallowed_tools=["Bash"],
+        ),
+    )
 
     class FakeMcpManager:
         async def connect_all(self):
@@ -252,6 +324,9 @@ async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path
             return None
 
     class FakeToolRegistry:
+        def __init__(self):
+            self._tools = {"read_file": object(), "bash": object(), "write_file": object()}
+
         def to_api_schema(self):
             return []
 
@@ -282,6 +357,7 @@ async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path
     assert captured["max_tokens"] == 40000
     assert captured["context_window_tokens"] == 220000
     assert captured["auto_compact_threshold_tokens"] == 180000
+    assert set(captured["tool_registry"]._tools) == {"read_file"}
 
 
 def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypatch, caplog):

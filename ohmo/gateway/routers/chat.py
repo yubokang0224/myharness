@@ -42,6 +42,7 @@ from ohmo.gateway.schemas.chat import (
     SSEToolCall,
     SSEToolResult,
 )
+from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.session_storage import (
     get_session_dir,
     list_snapshots,
@@ -505,6 +506,7 @@ async def send_message(
             await mcp_manager.connect_all()
             tool_metadata["mcp_manager"] = mcp_manager
             tool_registry = create_default_tool_registry(mcp_manager)
+            apply_agent_tool_policy(tool_registry, agent_def)
             if session_id in _session_allowed_tools:
                 settings.permission.allowed_tools = list(
                     dict.fromkeys([
@@ -760,6 +762,7 @@ async def send_message_sync(
         await mcp_manager.connect_all()
         tool_metadata["mcp_manager"] = mcp_manager
         tool_registry = create_default_tool_registry(mcp_manager)
+        apply_agent_tool_policy(tool_registry, agent_def)
         if session_id in _session_allowed_tools:
             settings.permission.allowed_tools = list(
                 dict.fromkeys([

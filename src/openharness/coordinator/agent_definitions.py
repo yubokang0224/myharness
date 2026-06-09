@@ -39,9 +39,11 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high")
 #: Valid permission mode strings (maps to PERMISSION_MODES in TS).
 PERMISSION_MODES: tuple[str, ...] = (
     "default",
+    "full_auto",
+    "plan",
+    # Legacy Claude-compatible aliases kept for existing agent files.
     "acceptEdits",
     "bypassPermissions",
-    "plan",
     "dontAsk",
 )
 

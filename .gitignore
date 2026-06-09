@@ -37,3 +37,5 @@ Thumbs.db
 uv.lock
 match_delivery_to_purchase.py
 parse_pdf.py
+DOCS.md
+仓库入库准则.md

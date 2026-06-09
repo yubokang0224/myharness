@@ -635,3 +635,33 @@ def test_should_autocompact_uses_custom_context_window():
         AutoCompactState(),
         context_window_tokens=4000,
     ) is True
+
+
+def test_should_autocompact_counts_fixed_prompt_and_tool_overhead():
+    messages = [
+        ConversationMessage(role="user", content=[TextBlock(text="small request")]),
+    ]
+
+    assert should_autocompact(
+        messages,
+        "Qwen36_30b",
+        AutoCompactState(),
+        context_window_tokens=10000,
+        additional_input_tokens=9000,
+        reserved_output_tokens=1000,
+    ) is True
+
+
+def test_autocompact_threshold_reserves_configured_output_budget():
+    conservative = get_autocompact_threshold(
+        "Qwen36_30b",
+        context_window_tokens=100000,
+        reserved_output_tokens=40000,
+    )
+    previous_default = get_autocompact_threshold(
+        "Qwen36_30b",
+        context_window_tokens=100000,
+    )
+
+    assert conservative == 47000
+    assert conservative < previous_default

@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from ohmo.gateway.dependencies import get_current_user, get_runtime, _RuntimeState
 from ohmo.gateway.schemas.agents import (
     AgentResponse,
+    AgentToolInfo,
     CreateAgentRequest,
     RunningAgentInfo,
     UpdateAgentRequest,
@@ -107,6 +108,27 @@ async def list_running_agents(
                 )
             )
     return result
+
+
+@router.get("/tools", response_model=list[AgentToolInfo])
+async def list_agent_tools(
+    _user: Annotated[dict, Depends(get_current_user)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """List tools that can be selected in an agent definition."""
+    from openharness.tools import create_default_tool_registry
+
+    registry = create_default_tool_registry(runtime.mcp_manager)
+    return sorted(
+        [
+            AgentToolInfo(
+                name=tool.name,
+                description=getattr(tool, "description", "") or "",
+            )
+            for tool in registry.list_tools()
+        ],
+        key=lambda tool: tool.name,
+    )
 
 
 @router.get("/{name}", response_model=AgentResponse)
@@ -236,9 +258,10 @@ async def update_agent(
         ("color", "color"),
         ("max_turns", "max_turns"),
     ]:
-        new_val = getattr(body, field)
-        old_val = getattr(existing, attr, None)
-        val = new_val if new_val is not None else old_val
+        if field in body.model_fields_set:
+            val = getattr(body, field)
+        else:
+            val = getattr(existing, attr, None)
         if val is not None:
             frontmatter[field] = val
 

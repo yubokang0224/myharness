@@ -153,6 +153,22 @@ class EmptyAssistantApiClient:
         )
 
 
+class EmptyThenSuccessApiClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_message(self, request):
+        del request
+        self.calls += 1
+        text = "" if self.calls == 1 else "after empty-response compact"
+        content = [] if not text else [TextBlock(text=text)]
+        yield ApiMessageCompleteEvent(
+            message=ConversationMessage(role="assistant", content=content),
+            usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            stop_reason="stop",
+        )
+
+
 class CoordinatorLoopApiClient:
     def __init__(self) -> None:
         self.requests = []
@@ -1354,3 +1370,64 @@ async def test_query_engine_drops_empty_assistant_messages(tmp_path: Path):
     assert not any(isinstance(event, AssistantTurnComplete) for event in events)
     assert len(engine.messages) == 1
     assert engine.messages[0].role == "user"
+
+
+@pytest.mark.asyncio
+async def test_query_engine_caps_output_to_remaining_context_budget(tmp_path: Path):
+    client = RecordingApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="Qwen36_30b",
+        system_prompt="system instruction " * 120,
+        max_tokens=800,
+        context_window_tokens=1000,
+        auto_compact_threshold_tokens=999999,
+    )
+
+    events = [event async for event in engine.submit_message("hello")]
+
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert client.requests[0].max_tokens < 800
+    assert client.requests[0].max_tokens > 0
+    assert any(
+        isinstance(event, StatusEvent) and "Adjusted this turn's output budget" in event.message
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_engine_compacts_and_retries_empty_response_once(tmp_path: Path, monkeypatch):
+    compact_calls: list[bool] = []
+
+    async def fake_auto_compact(messages, *, force=False, **_kwargs):
+        compact_calls.append(force)
+        if force:
+            return messages[-1:], True
+        return messages, False
+
+    monkeypatch.setattr("openharness.services.compact.auto_compact_if_needed", fake_auto_compact)
+    client = EmptyThenSuccessApiClient()
+    engine = QueryEngine(
+        api_client=client,
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="Qwen36_30b",
+        system_prompt="system",
+    )
+    engine.load_messages(
+        [
+            ConversationMessage.from_user_text("earlier"),
+            ConversationMessage(role="assistant", content=[TextBlock(text="earlier answer")]),
+        ]
+    )
+
+    events = [event async for event in engine.submit_message("latest")]
+
+    assert True in compact_calls
+    assert client.calls == 2
+    assert isinstance(events[-1], AssistantTurnComplete)
+    assert events[-1].message.text == "after empty-response compact"

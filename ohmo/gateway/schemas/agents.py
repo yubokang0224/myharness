@@ -56,3 +56,8 @@ class RunningAgentInfo(BaseModel):
     agent_name: str
     status: Literal["active", "idle", "error"] = "active"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentToolInfo(BaseModel):
+    name: str
+    description: str = ""

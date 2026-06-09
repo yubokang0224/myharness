@@ -34,6 +34,7 @@ from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
 
 from ohmo.gateway.config import load_gateway_config
+from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
 from ohmo.session_storage import OhmoSessionBackend
@@ -676,56 +677,8 @@ class OhmoSessionRuntimePool:
 
     @staticmethod
     def _apply_agent_tool_policy(bundle: RuntimeBundle, agent_def: AgentDefinition | None) -> None:
-        if agent_def is None or not hasattr(bundle, "tool_registry"):
-            return
-        registry = bundle.tool_registry
-        tools = getattr(registry, "_tools", None)
-        if not isinstance(tools, dict):
-            return
-        allowed = _expand_tool_names(agent_def.tools)
-        if allowed is not None:
-            for name in list(tools):
-                if name not in allowed:
-                    tools.pop(name, None)
-        for name in _expand_tool_names(agent_def.disallowed_tools) or set():
-            tools.pop(name, None)
-
-
-_TOOL_NAME_ALIASES = {
-    "bash": {"bash"},
-    "read": {"file_read"},
-    "write": {"file_write"},
-    "edit": {"file_edit"},
-    "multiedit": {"file_edit"},
-    "glob": {"glob"},
-    "grep": {"grep"},
-    "webfetch": {"web_fetch"},
-    "websearch": {"web_search"},
-    "agent": {"agent"},
-    "sendmessage": {"send_message"},
-    "todowrite": {"todo_write"},
-    "task": {"task_create", "task_get", "task_list", "task_stop", "task_output", "task_update"},
-}
-
-
-def _normalize_tool_name(name: str) -> str:
-    return name.replace("-", "_").strip().lower()
-
-
-def _expand_tool_names(names: list[str] | None) -> set[str] | None:
-    if names is None:
-        return None
-    expanded: set[str] = set()
-    for raw in names:
-        value = str(raw).strip()
-        if not value:
-            continue
-        if value == "*":
-            return None
-        normalized = _normalize_tool_name(value)
-        expanded.add(normalized)
-        expanded.update(_TOOL_NAME_ALIASES.get(normalized.replace("_", ""), set()))
-    return expanded
+        if hasattr(bundle, "tool_registry"):
+            apply_agent_tool_policy(bundle.tool_registry, agent_def)
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:

@@ -314,6 +314,7 @@ class OpenAICompatibleClient:
         visible_delta_chunks = 0
         reasoning_delta_chunks = 0
         tool_delta_chunks = 0
+        delta_field_counts: dict[str, int] = {}
 
         stream = await self._client.chat.completions.create(**params)
         async for chunk in stream:
@@ -330,6 +331,9 @@ class OpenAICompatibleClient:
             choice_chunk_count += 1
             delta = chunk.choices[0].delta
             chunk_finish = chunk.choices[0].finish_reason
+            if hasattr(delta, "model_dump"):
+                for field_name in delta.model_dump(exclude_none=True):
+                    delta_field_counts[field_name] = delta_field_counts.get(field_name, 0) + 1
 
             if chunk_finish:
                 finish_reason = chunk_finish
@@ -420,6 +424,7 @@ class OpenAICompatibleClient:
                         "visible_delta_chunks": visible_delta_chunks,
                         "reasoning_delta_chunks": reasoning_delta_chunks,
                         "tool_delta_chunks": tool_delta_chunks,
+                        "delta_field_counts": delta_field_counts,
                         "reasoning_chars": len(collected_reasoning),
                         "hidden_think_leftover_chars": len(_think_buf),
                         "collected_content_chars": len(collected_content),
