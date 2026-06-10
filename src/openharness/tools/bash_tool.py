@@ -9,6 +9,7 @@ from typing import Iterable
 from pydantic import BaseModel, Field
 
 from openharness.sandbox import SandboxUnavailableError
+from openharness.tools.artifacts import changed_artifacts, snapshot_artifact_candidates
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.utils.shell import create_shell_subprocess
 
@@ -33,6 +34,7 @@ class BashTool(BaseTool):
 
     async def execute(self, arguments: BashToolInput, context: ToolExecutionContext) -> ToolResult:
         cwd = Path(arguments.cwd).expanduser() if arguments.cwd else context.cwd
+        cwd = cwd.resolve()
         preflight_error = _preflight_interactive_command(arguments.command)
         if preflight_error is not None:
             return ToolResult(
@@ -40,6 +42,7 @@ class BashTool(BaseTool):
                 is_error=True,
                 metadata={"interactive_required": True},
             )
+        before_snapshot = snapshot_artifact_candidates(cwd) if cwd.exists() else {}
         process: asyncio.subprocess.Process | None = None
         try:
             process = await create_shell_subprocess(
@@ -78,10 +81,16 @@ class BashTool(BaseTool):
 
         output_buffer = await _read_remaining_output(process)
         text = _format_output(output_buffer)
+        metadata: dict[str, object] = {"returncode": process.returncode}
+        if process.returncode == 0 and cwd.exists():
+            after_snapshot = snapshot_artifact_candidates(cwd)
+            artifacts = changed_artifacts(before_snapshot, after_snapshot, cwd=cwd)
+            if artifacts:
+                metadata["artifacts"] = artifacts
         return ToolResult(
             output=text,
             is_error=process.returncode != 0,
-            metadata={"returncode": process.returncode},
+            metadata=metadata,
         )
 
 

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 from openharness.api.usage import UsageSnapshot
 from openharness.bridge import get_bridge_manager
@@ -17,7 +18,7 @@ from openharness.commands.registry import SlashCommand, create_default_command_r
 from openharness.config.schema import Config, DingTalkBotConfig, DingTalkConfig
 from openharness.config.settings import Settings
 from openharness.coordinator.agent_definitions import AgentDefinition
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolUseBlock
+from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 from openharness.engine.stream_events import AssistantTextDelta, CompactProgressEvent, ErrorEvent, ToolExecutionStarted
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
@@ -30,6 +31,8 @@ from ohmo.gateway.models import GatewayConfig, GatewayState
 from ohmo.gateway.routers.chat import (
     _prepare_user_text,
     create_session,
+    get_artifact_content,
+    list_artifacts,
     list_sessions,
     send_message,
     send_message_sync,
@@ -164,6 +167,177 @@ async def test_create_session_allows_anonymous_external_call(tmp_path):
     assert session.title == "External session"
     assert session.channel == "web"
     assert session.id
+
+
+@pytest.mark.asyncio
+async def test_chat_artifacts_list_generated_files_from_tool_metadata(tmp_path):
+    generated = tmp_path / "report.md"
+    generated.write_text("# Report\n", encoding="utf-8")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[
+            ConversationMessage(
+                role="assistant",
+                content=[ToolUseBlock(id="toolu_write", name="write_file", input={"path": "report.md"})],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="toolu_write",
+                        content=f"Wrote {generated}",
+                        metadata={
+                            "artifacts": [
+                                {
+                                    "path": str(generated),
+                                    "name": "report.md",
+                                    "preview_kind": "markdown",
+                                }
+                            ]
+                        },
+                    )
+                ],
+            ),
+        ],
+        usage=UsageSnapshot(),
+        session_id="artifact-session",
+    )
+
+    artifacts = await list_artifacts(
+        "artifact-session",
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+    )
+
+    assert len(artifacts) == 1
+    assert artifacts[0].name == "report.md"
+    assert artifacts[0].tool_name == "write_file"
+    assert artifacts[0].preview_kind == "markdown"
+
+
+@pytest.mark.asyncio
+async def test_chat_artifacts_list_legacy_generated_files_from_tool_input(tmp_path):
+    generated = tmp_path / "legacy.txt"
+    generated.write_text("legacy output", encoding="utf-8")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[
+            ConversationMessage(
+                role="assistant",
+                content=[ToolUseBlock(id="toolu_write", name="write_file", input={"path": "legacy.txt"})],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[ToolResultBlock(tool_use_id="toolu_write", content=f"Wrote {generated}")],
+            ),
+        ],
+        usage=UsageSnapshot(),
+        session_id="legacy-artifact-session",
+    )
+
+    artifacts = await list_artifacts(
+        "legacy-artifact-session",
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+    )
+
+    assert len(artifacts) == 1
+    assert artifacts[0].name == "legacy.txt"
+    assert artifacts[0].tool_name == "write_file"
+    assert artifacts[0].preview_kind == "text"
+
+
+@pytest.mark.asyncio
+async def test_chat_artifacts_ignore_user_upload_attachments(tmp_path):
+    uploaded = tmp_path / "uploaded.txt"
+    uploaded.write_text("user file", encoding="utf-8")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[
+            ConversationMessage.from_user_content([TextBlock(text="see attachment")]).model_copy(
+                update={"attachments": [{"name": "uploaded.txt", "path": str(uploaded)}]}
+            )
+        ],
+        usage=UsageSnapshot(),
+        session_id="attachment-session",
+    )
+
+    artifacts = await list_artifacts(
+        "attachment-session",
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+    )
+
+    assert artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_chat_artifact_content_rejects_unregistered_path(tmp_path):
+    generated = tmp_path / "inside.txt"
+    generated.write_text("inside", encoding="utf-8")
+    outside = tmp_path.parent / "outside-artifact.txt"
+    outside.write_text("outside", encoding="utf-8")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[
+            ConversationMessage(
+                role="assistant",
+                content=[ToolUseBlock(id="toolu_write", name="write_file", input={"path": "inside.txt"})],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="toolu_write",
+                        content=f"Wrote {outside}",
+                        metadata={"artifacts": [{"path": str(outside), "name": outside.name}]},
+                    )
+                ],
+            ),
+        ],
+        usage=UsageSnapshot(),
+        session_id="unsafe-artifact-session",
+    )
+
+    artifacts = await list_artifacts(
+        "unsafe-artifact-session",
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+    )
+    assert artifacts == []
+
+    with pytest.raises(HTTPException) as exc:
+        await get_artifact_content(
+            "unsafe-artifact-session",
+            "missing",
+            _user={"sub": "u1"},
+            runtime=SimpleNamespace(workspace=workspace),
+        )
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio

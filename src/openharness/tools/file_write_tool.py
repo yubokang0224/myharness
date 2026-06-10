@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from openharness.tools.artifacts import build_artifact_list
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
@@ -43,7 +44,10 @@ class FileWriteTool(BaseTool):
         if arguments.create_directories:
             path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(arguments.content, encoding="utf-8")
-        return ToolResult(output=f"Wrote {path}")
+        return ToolResult(
+            output=f"Wrote {path}",
+            metadata={"artifacts": build_artifact_list([path], cwd=context.cwd)},
+        )
 
 
 def _resolve_path(base: Path, candidate: str) -> Path:

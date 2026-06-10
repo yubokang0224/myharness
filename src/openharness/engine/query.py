@@ -41,6 +41,7 @@ from openharness.engine.stream_events import (
 from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
 from openharness.services.tool_outputs import tool_output_inline_chars, tool_output_preview_chars
+from openharness.tools.artifacts import artifact_metadata
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.base import ToolRegistry
 
@@ -894,6 +895,7 @@ async def run_query(
                 tool_name=tc.name,
                 output=result.content,
                 is_error=result.is_error,
+                metadata=result.metadata,
             ), None
             tool_results = [result]
         else:
@@ -932,6 +934,7 @@ async def run_query(
                     tool_name=tc.name,
                     output=result.content,
                     is_error=result.is_error,
+                    metadata=result.metadata,
                 ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
@@ -1044,19 +1047,24 @@ async def _execute_tool_call(
         tool_use_id=tool_use_id,
         output=result.output,
     )
+    result_metadata: dict[str, Any] = dict(result.metadata or {})
     if artifact_path is not None:
         _remember_active_artifact(context.tool_metadata, str(artifact_path))
+        artifacts = list(result_metadata.get("artifacts") or [])
+        artifacts.append(artifact_metadata(artifact_path, cwd=context.cwd))
+        result_metadata["artifacts"] = artifacts
     tool_result = ToolResultBlock(
         tool_use_id=tool_use_id,
         content=inline_output,
         is_error=result.is_error,
+        metadata=result_metadata,
     )
     _record_tool_carryover(
         context,
         tool_name=tool_name,
         tool_input=tool_input,
         tool_output=tool_result.content,
-        tool_result_metadata=result.metadata,
+        tool_result_metadata=result_metadata,
         is_error=tool_result.is_error,
         resolved_file_path=_file_path,
     )

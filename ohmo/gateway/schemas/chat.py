@@ -66,6 +66,20 @@ class MemoryInfo(BaseModel):
     files: list[str]
 
 
+class ArtifactInfo(BaseModel):
+    id: str
+    name: str
+    path: str
+    relative_path: str = ""
+    extension: str = ""
+    mime_type: str = "application/octet-stream"
+    size: int = 0
+    updated_at: float = 0.0
+    tool_name: str | None = None
+    tool_use_id: str | None = None
+    preview_kind: Literal["code", "text", "markdown", "html", "pdf", "word", "image", "binary"] = "binary"
+
+
 # SSE event payloads (serialized to JSON in the `data:` field)
 class SSETextDelta(BaseModel):
     event: Literal["text_delta"] = "text_delta"
@@ -83,6 +97,7 @@ class SSEToolResult(BaseModel):
     tool_name: str
     output: str
     is_error: bool = False
+    metadata: dict[str, Any] | None = None
 
 
 class SSEDone(BaseModel):

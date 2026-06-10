@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from openharness.tools.artifacts import build_artifact_list
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
@@ -54,7 +55,10 @@ class FileEditTool(BaseTool):
             updated = original.replace(arguments.old_str, arguments.new_str, 1)
 
         path.write_text(updated, encoding="utf-8")
-        return ToolResult(output=f"Updated {path}")
+        return ToolResult(
+            output=f"Updated {path}",
+            metadata={"artifacts": build_artifact_list([path], cwd=context.cwd)},
+        )
 
 
 def _resolve_path(base: Path, candidate: str) -> Path:

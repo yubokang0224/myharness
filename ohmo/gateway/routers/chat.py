@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import mimetypes
 import re
 import time
 from dataclasses import dataclass
@@ -13,9 +15,11 @@ from typing import Annotated, Any, AsyncIterator
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from openharness.api.usage import UsageSnapshot
+from openharness.config.paths import get_data_dir
+from openharness.tools.artifacts import preview_kind_for_path
 from ohmo.gateway.dependencies import (
     AuthContext,
     get_auth_context,
@@ -27,6 +31,7 @@ from ohmo.gateway.dependencies import (
 )
 from ohmo.gateway.schemas.chat import (
     ApproveRequest,
+    ArtifactInfo,
     CreateSessionRequest,
     MemoryInfo,
     MessageInfo,
@@ -82,6 +87,17 @@ _EMPTY_ASSISTANT_MESSAGE = (
 )
 _EMPTY_ASSISTANT_SYNC_ERROR = (
     "Model returned no visible content. Check server logs for empty-response diagnostics."
+)
+
+_ARTIFACT_PREVIEW_KINDS = {"code", "text", "markdown", "html", "pdf", "word", "image", "binary"}
+_LEGACY_PATH_TOOLS = {"write_file", "file_write", "edit_file", "file_edit", "todo_write", "notebook_edit"}
+_LEGACY_OUTPUT_PREFIXES = (
+    "Updated notebook cell ",
+    "Wrote ",
+    "Updated ",
+    "Created ",
+    "Saved ",
+    "Generated ",
 )
 
 
@@ -160,6 +176,192 @@ def _prepare_user_text(body: MessageRequest, attachment_notes: str = "") -> str:
     if attachment_notes:
         user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
     return user_text
+
+
+def _artifact_id(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_artifact_roots(snap: dict[str, Any], runtime: _RuntimeState) -> list[Path]:
+    roots: list[Path] = []
+    for raw in (snap.get("cwd"), runtime.workspace, get_data_dir() / "tool_artifacts"):
+        if not raw:
+            continue
+        try:
+            root = Path(raw).expanduser().resolve()
+        except Exception:
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _is_under_any_root(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _artifact_from_metadata(
+    raw_artifact: dict[str, Any],
+    *,
+    tool_name: str | None,
+    tool_use_id: str | None,
+    roots: list[Path],
+) -> ArtifactInfo | None:
+    raw_path = raw_artifact.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    try:
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file() or not _is_under_any_root(path, roots):
+            return None
+        stat = path.stat()
+    except OSError:
+        return None
+
+    mime_type = raw_artifact.get("mime_type")
+    if not isinstance(mime_type, str) or not mime_type:
+        mime_type, _ = mimetypes.guess_type(str(path))
+
+    relative_path = ""
+    for root in roots:
+        try:
+            relative_path = str(path.relative_to(root))
+            break
+        except ValueError:
+            continue
+
+    preview_kind = raw_artifact.get("preview_kind")
+    if preview_kind not in _ARTIFACT_PREVIEW_KINDS:
+        preview_kind = preview_kind_for_path(path)
+
+    return ArtifactInfo(
+        id=_artifact_id(path),
+        name=str(raw_artifact.get("name") or path.name),
+        path=str(path),
+        relative_path=str(raw_artifact.get("relative_path") or relative_path),
+        extension=str(raw_artifact.get("extension") or path.suffix.lower()),
+        mime_type=mime_type or "application/octet-stream",
+        size=int(raw_artifact.get("size") or stat.st_size),
+        updated_at=float(raw_artifact.get("updated_at") or stat.st_mtime),
+        tool_name=tool_name,
+        tool_use_id=tool_use_id,
+        preview_kind=preview_kind,
+    )
+
+
+def _legacy_path_from_output_line(line: str) -> str | None:
+    stripped = line.strip()
+    for prefix in _LEGACY_OUTPUT_PREFIXES:
+        if not stripped.startswith(prefix):
+            continue
+        raw = stripped[len(prefix):]
+        if prefix == "Updated notebook cell ":
+            _, _, raw = stripped.partition(" in ")
+        return raw.strip().strip("'\"`")
+    return None
+
+
+def _legacy_artifacts_from_tool(
+    *,
+    tool_name: str | None,
+    tool_input: dict[str, Any],
+    output: str,
+    cwd: Path,
+    roots: list[Path],
+) -> list[dict[str, Any]]:
+    raw_paths: list[str] = []
+
+    if tool_name in _LEGACY_PATH_TOOLS:
+        raw_path = tool_input.get("path")
+        if isinstance(raw_path, str) and raw_path.strip():
+            raw_paths.append(raw_path)
+        elif tool_name == "todo_write":
+            raw_paths.append("TODO.md")
+
+    for line in output.splitlines():
+        raw_path = _legacy_path_from_output_line(line)
+        if raw_path:
+            raw_paths.append(raw_path)
+
+    artifacts: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_path in raw_paths:
+        try:
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = cwd / path
+            path = path.resolve()
+        except Exception:
+            continue
+        if str(path) in seen or not path.is_file() or not _is_under_any_root(path, roots):
+            continue
+        seen.add(str(path))
+        artifacts.append({"path": str(path)})
+    return artifacts
+
+
+def _collect_artifacts_from_snapshot(snap: dict[str, Any], runtime: _RuntimeState) -> list[ArtifactInfo]:
+    roots = _safe_artifact_roots(snap, runtime)
+    try:
+        cwd = Path(snap.get("cwd") or runtime.workspace or Path.cwd()).expanduser().resolve()
+    except Exception:
+        cwd = Path.cwd()
+    tool_uses: dict[str, dict[str, Any]] = {}
+    artifacts_by_path: dict[str, ArtifactInfo] = {}
+
+    for msg in snap.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        for block in msg.get("content", []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                tool_use_id = str(block.get("id") or "")
+                if tool_use_id:
+                    tool_uses[tool_use_id] = {
+                        "tool_name": block.get("name"),
+                        "tool_input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                    }
+            elif block.get("type") == "tool_result" and not block.get("is_error"):
+                metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+                raw_artifacts = metadata.get("artifacts") if isinstance(metadata.get("artifacts"), list) else []
+                tool_use_id = str(block.get("tool_use_id") or "")
+                tool_info = tool_uses.get(tool_use_id, {})
+                tool_name = tool_info.get("tool_name")
+                if not raw_artifacts:
+                    raw_artifacts = _legacy_artifacts_from_tool(
+                        tool_name=str(tool_name) if tool_name else None,
+                        tool_input=tool_info.get("tool_input") if isinstance(tool_info.get("tool_input"), dict) else {},
+                        output=str(block.get("content") or ""),
+                        cwd=cwd,
+                        roots=roots,
+                    )
+                for raw_artifact in raw_artifacts:
+                    if not isinstance(raw_artifact, dict):
+                        continue
+                    artifact = _artifact_from_metadata(
+                        raw_artifact,
+                        tool_name=str(tool_name) if tool_name else None,
+                        tool_use_id=tool_use_id or None,
+                        roots=roots,
+                    )
+                    if artifact is None:
+                        continue
+                    existing = artifacts_by_path.get(artifact.path)
+                    if existing is None or artifact.updated_at >= existing.updated_at:
+                        artifacts_by_path[artifact.path] = artifact
+
+    return sorted(artifacts_by_path.values(), key=lambda item: item.updated_at, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +504,7 @@ async def get_messages(
                             "tool_use_id": block.get("id", ""),
                             "tool_name": block.get("name", ""),
                             "tool_input": block.get("input", {}),
+                            "metadata": {},
                         }
                     )
                 elif block.get("type") == "tool_result":
@@ -312,6 +515,7 @@ async def get_messages(
                             if call.get("tool_use_id") == target_id:
                                 call["output"] = block.get("content", "")
                                 call["is_error"] = bool(block.get("is_error", False))
+                                call["metadata"] = block.get("metadata", {}) if isinstance(block.get("metadata"), dict) else {}
                                 matched = True
                                 break
                         if matched:
@@ -350,6 +554,60 @@ async def get_memory(
     return MemoryInfo(
         entries=[{"content": e} if isinstance(e, str) else e for e in entries],
         files=[str(f) for f in files],
+    )
+
+
+@router.get("/{session_id}/artifacts", response_model=list[ArtifactInfo])
+async def list_artifacts(
+    session_id: str,
+    _user: Annotated[dict, Depends(get_current_user)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """Return files generated by AI tool execution in a session."""
+    try:
+        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+    except Exception:
+        return []
+    if snap is None:
+        return []
+    return _collect_artifacts_from_snapshot(snap, runtime)
+
+
+@router.get("/{session_id}/artifacts/{artifact_id}/content")
+async def get_artifact_content(
+    session_id: str,
+    artifact_id: str,
+    _user: Annotated[dict, Depends(get_current_user)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """Return a generated artifact's content after session-scoped validation."""
+    try:
+        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+    except Exception:
+        snap = None
+    if snap is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    artifact = next(
+        (item for item in _collect_artifacts_from_snapshot(snap, runtime) if item.id == artifact_id),
+        None,
+    )
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    path = Path(artifact.path).expanduser().resolve()
+    if artifact.preview_kind in {"code", "text", "markdown", "html"}:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            raise HTTPException(status_code=404, detail="Artifact not found") from None
+        media_type = "text/html; charset=utf-8" if artifact.preview_kind == "html" else "text/plain; charset=utf-8"
+        return PlainTextResponse(text, media_type=media_type)
+
+    return FileResponse(
+        path,
+        media_type=artifact.mime_type,
+        filename=artifact.name,
     )
 
 
@@ -599,6 +857,7 @@ async def send_message(
                                 tool_name=event.tool_name,
                                 output=event.output,
                                 is_error=event.is_error,
+                                metadata=event.metadata,
                             )
                         )
                     )
@@ -843,6 +1102,7 @@ async def send_message_sync(
                         "tool_input": event.tool_input,
                         "output": None,
                         "is_error": None,
+                        "metadata": None,
                     }
                 )
             elif isinstance(event, ToolExecutionCompleted):
@@ -850,6 +1110,7 @@ async def send_message_sync(
                     if call.get("tool_name") == event.tool_name and call.get("output") is None:
                         call["output"] = event.output
                         call["is_error"] = event.is_error
+                        call["metadata"] = event.metadata
                         break
                 else:
                     tool_calls.append(
@@ -858,6 +1119,7 @@ async def send_message_sync(
                             "tool_input": {},
                             "output": event.output,
                             "is_error": event.is_error,
+                            "metadata": event.metadata,
                         }
                     )
             elif isinstance(event, AssistantTurnComplete):

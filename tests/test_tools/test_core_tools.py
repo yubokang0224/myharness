@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,7 @@ async def test_file_write_read_and_edit(tmp_path: Path):
     )
     assert write_result.is_error is False
     assert (tmp_path / "notes.txt").exists()
+    assert write_result.metadata["artifacts"][0]["name"] == "notes.txt"
 
     read_result = await FileReadTool().execute(
         FileReadToolInput(path="notes.txt", offset=1, limit=2),
@@ -54,6 +56,7 @@ async def test_file_write_read_and_edit(tmp_path: Path):
     )
     assert edit_result.is_error is False
     assert "TWO" in (tmp_path / "notes.txt").read_text(encoding="utf-8")
+    assert edit_result.metadata["artifacts"][0]["preview_kind"] == "text"
 
 
 @pytest.mark.asyncio
@@ -111,6 +114,24 @@ async def test_bash_tool_runs_command(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_bash_tool_tracks_generated_artifacts(tmp_path: Path):
+    script = "from pathlib import Path; Path('generated.md').write_text('# ok\\n', encoding='utf-8')"
+    if sys.platform == "win32":
+        command = f"& '{sys.executable}' -c \"{script}\""
+    else:
+        command = f"'{sys.executable}' -c \"{script}\""
+
+    result = await BashTool().execute(
+        BashToolInput(command=command),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert result.is_error is False
+    assert result.metadata["artifacts"][0]["name"] == "generated.md"
+    assert result.metadata["artifacts"][0]["preview_kind"] == "markdown"
+
+
+@pytest.mark.asyncio
 async def test_tool_search_and_brief_tools(tmp_path: Path):
     registry = create_default_tool_registry()
     context = ToolExecutionContext(cwd=tmp_path, metadata={"tool_registry": registry})
@@ -148,6 +169,7 @@ async def test_skill_todo_and_config_tools(tmp_path: Path, monkeypatch):
         ToolExecutionContext(cwd=tmp_path),
     )
     assert todo_result.is_error is False
+    assert todo_result.metadata["artifacts"][0]["name"] == "TODO.md"
     assert "wire commands" in (tmp_path / "TODO.md").read_text(encoding="utf-8")
 
     config_result = await ConfigTool().execute(
@@ -189,6 +211,7 @@ async def test_notebook_edit_tool(tmp_path: Path):
     )
     assert result.is_error is False
     assert "demo.ipynb" in result.output
+    assert result.metadata["artifacts"][0]["name"] == "demo.ipynb"
     assert "nb ok" in (tmp_path / "demo.ipynb").read_text(encoding="utf-8")
 
 
