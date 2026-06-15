@@ -10,13 +10,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from openharness.mcp.client import McpClientManager, McpServerNotConnectedError
-from openharness.mcp.types import McpConnectionStatus, McpStdioServerConfig, McpToolInfo
+from openharness.mcp.types import McpConnectionStatus, McpSseServerConfig, McpStdioServerConfig, McpToolInfo
 from openharness.tools.base import ToolExecutionContext
 from openharness.tools.mcp_tool import McpToolAdapter
 from openharness.tools.read_mcp_resource_tool import ReadMcpResourceTool
 
 
 # --- McpClientManager.call_tool ---
+
+
+class FakeAsyncContext:
+    def __init__(self, value):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 @pytest.mark.asyncio
@@ -99,6 +110,45 @@ async def test_register_connected_session_tolerates_missing_resources_list():
 
     assert manager._statuses["context7"].state == "connected"
     assert manager._statuses["context7"].resources == []
+
+
+@pytest.mark.asyncio
+async def test_connect_sse_uses_sse_client_and_registers_session(monkeypatch):
+    import openharness.mcp.client as client_module
+
+    calls = []
+
+    def fake_sse_client(url, headers=None):
+        calls.append((url, headers))
+        return FakeAsyncContext(("read-stream", "write-stream"))
+
+    async def fake_register(**kwargs):
+        manager._statuses[kwargs["name"]] = McpConnectionStatus(
+            name=kwargs["name"],
+            state="connected",
+            transport=kwargs["config"].type,
+            auth_configured=kwargs["auth_configured"],
+            tools=[McpToolInfo(server_name=kwargs["name"], name="query_metric_nl", description="", input_schema={})],
+        )
+
+    monkeypatch.setattr(client_module, "sse_client", fake_sse_client)
+    manager = McpClientManager(
+        {
+            "metrics": McpSseServerConfig(
+                url="http://192.168.6.131:8100/sse",
+                headers={"Authorization": "Bearer token"},
+            )
+        }
+    )
+    monkeypatch.setattr(manager, "_register_connected_session", fake_register)
+
+    await manager.connect_all()
+
+    assert calls == [("http://192.168.6.131:8100/sse", {"Authorization": "Bearer token"})]
+    status = manager.list_statuses()[0]
+    assert status.state == "connected"
+    assert status.transport == "sse"
+    assert status.tools[0].name == "query_metric_nl"
 
 
 @pytest.mark.asyncio

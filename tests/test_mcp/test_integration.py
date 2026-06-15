@@ -7,7 +7,7 @@ from pathlib import Path
 
 from openharness.config.settings import Settings
 from openharness.mcp.config import load_mcp_server_configs
-from openharness.mcp.types import McpResourceInfo, McpStdioServerConfig, McpToolInfo
+from openharness.mcp.types import McpResourceInfo, McpSseServerConfig, McpStdioServerConfig, McpToolInfo
 from openharness.plugins.types import LoadedPlugin
 from openharness.plugins.schemas import PluginManifest
 from openharness.tools import create_default_tool_registry
@@ -47,6 +47,17 @@ def test_load_mcp_server_configs_merges_plugins():
 
     assert "local" in servers
     assert "demo:remote" in servers
+
+
+def test_sse_mcp_config_validates():
+    settings = Settings(
+        mcp_servers={"metrics": McpSseServerConfig(url="http://192.168.6.131:8100/sse")}
+    )
+
+    servers = load_mcp_server_configs(settings, [])
+
+    assert servers["metrics"].type == "sse"
+    assert servers["metrics"].url == "http://192.168.6.131:8100/sse"
 
 
 async def test_mcp_tools_are_registered():

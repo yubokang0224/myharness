@@ -5,7 +5,12 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from openharness.config.settings import load_settings, save_settings
-from openharness.mcp.types import McpHttpServerConfig, McpStdioServerConfig, McpWebSocketServerConfig
+from openharness.mcp.types import (
+    McpHttpServerConfig,
+    McpSseServerConfig,
+    McpStdioServerConfig,
+    McpWebSocketServerConfig,
+)
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 
 
@@ -43,9 +48,9 @@ class McpAuthTool(BaseTool):
             env = dict(config.env or {})
             env[env_key] = f"Bearer {arguments.value}" if arguments.mode == "bearer" else arguments.value
             updated = config.model_copy(update={"env": env})
-        elif isinstance(config, (McpHttpServerConfig, McpWebSocketServerConfig)):
+        elif isinstance(config, (McpHttpServerConfig, McpSseServerConfig, McpWebSocketServerConfig)):
             if arguments.mode not in {"header", "bearer"}:
-                return ToolResult(output="http/ws MCP auth supports header or bearer modes", is_error=True)
+                return ToolResult(output="http/sse/ws MCP auth supports header or bearer modes", is_error=True)
             header_key = arguments.key or "Authorization"
             headers = dict(config.headers)
             headers[header_key] = (

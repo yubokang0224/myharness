@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
+from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import CallToolResult, ReadResourceResult
@@ -17,6 +18,7 @@ from openharness.mcp.types import (
     McpConnectionStatus,
     McpHttpServerConfig,
     McpResourceInfo,
+    McpSseServerConfig,
     McpStdioServerConfig,
     McpToolInfo,
 )
@@ -55,6 +57,8 @@ class McpClientManager:
                 await self._connect_stdio(name, config)
             elif isinstance(config, McpHttpServerConfig):
                 await self._connect_http(name, config)
+            elif isinstance(config, McpSseServerConfig):
+                await self._connect_sse(name, config)
             else:
                 self._statuses[name] = McpConnectionStatus(
                     name=name,
@@ -202,6 +206,35 @@ class McpClientManager:
             )
             read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                 streamable_http_client(url, http_client=http_client)
+            )
+            await self._register_connected_session(
+                name=name,
+                config=config,
+                stack=stack,
+                read_stream=read_stream,
+                write_stream=write_stream,
+                auth_configured=bool(headers) or attached,
+            )
+        except Exception as exc:
+            await stack.aclose()
+            self._statuses[name] = McpConnectionStatus(
+                name=name,
+                state="failed",
+                transport=config.type,
+                auth_configured=bool(config.headers),
+                detail=str(exc),
+            )
+
+    async def _connect_sse(self, name: str, config: McpSseServerConfig) -> None:
+        stack = AsyncExitStack()
+        try:
+            url, headers, attached = apply_internal_api_auth(
+                config.url,
+                config.headers,
+                metadata=self._auth_metadata,
+            )
+            read_stream, write_stream = await stack.enter_async_context(
+                sse_client(url, headers=headers or None)
             )
             await self._register_connected_session(
                 name=name,

@@ -80,7 +80,7 @@ def _mcp_transport_preview(config: object) -> dict[str, str]:
         rendered_args = " ".join(str(item) for item in args) if isinstance(args, list) and args else ""
         target = " ".join(part for part in (str(command or "").strip(), rendered_args.strip()) if part).strip()
         return {"transport": "stdio", "target": target or "configured"}
-    if transport in {"http", "ws"}:
+    if transport in {"http", "sse", "ws"}:
         url = getattr(config, "url", None) if not isinstance(config, dict) else config.get("url")
         return {"transport": transport, "target": str(url or "").strip() or "configured"}
     return {"transport": transport, "target": "configured"}
@@ -104,10 +104,10 @@ def _validate_mcp_server(name: str, config: object) -> dict[str, object]:
             resolved_cwd = Path(str(raw_cwd)).expanduser()
             if not resolved_cwd.exists():
                 issues.append(f"cwd does not exist: {resolved_cwd}")
-    elif transport in {"http", "ws"}:
+    elif transport in {"http", "sse", "ws"}:
         raw_url = getattr(config, "url", None) if not isinstance(config, dict) else config.get("url")
         parsed = urlparse(str(raw_url or "").strip())
-        expected = {"http", "https"} if transport == "http" else {"ws", "wss"}
+        expected = {"ws", "wss"} if transport == "ws" else {"http", "https"}
         if parsed.scheme not in expected or not parsed.netloc:
             issues.append(f"invalid {transport} url: {raw_url}")
 

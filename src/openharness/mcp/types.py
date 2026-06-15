@@ -26,6 +26,14 @@ class McpHttpServerConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
 
+class McpSseServerConfig(BaseModel):
+    """SSE MCP server configuration."""
+
+    type: Literal["sse"] = "sse"
+    url: str
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
 class McpWebSocketServerConfig(BaseModel):
     """WebSocket MCP server configuration."""
 
@@ -34,7 +42,12 @@ class McpWebSocketServerConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
 
-McpServerConfig = McpStdioServerConfig | McpHttpServerConfig | McpWebSocketServerConfig
+McpServerConfig = (
+    McpStdioServerConfig
+    | McpHttpServerConfig
+    | McpSseServerConfig
+    | McpWebSocketServerConfig
+)
 
 
 class McpJsonConfig(BaseModel):
