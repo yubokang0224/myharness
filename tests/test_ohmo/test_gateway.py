@@ -260,6 +260,44 @@ async def test_chat_artifacts_list_legacy_generated_files_from_tool_input(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_chat_artifacts_list_legacy_pptx_from_output_path_label(tmp_path):
+    generated = tmp_path / "deck.pptx"
+    generated.write_bytes(b"pptx")
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[
+            ConversationMessage(
+                role="assistant",
+                content=[ToolUseBlock(id="toolu_bash", name="bash", input={"command": "make deck"})],
+            ),
+            ConversationMessage(
+                role="user",
+                content=[ToolResultBlock(tool_use_id="toolu_bash", content=f"路径: {generated}")],
+            ),
+        ],
+        usage=UsageSnapshot(),
+        session_id="legacy-pptx-artifact-session",
+    )
+
+    artifacts = await list_artifacts(
+        "legacy-pptx-artifact-session",
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=workspace),
+    )
+
+    assert len(artifacts) == 1
+    assert artifacts[0].name == "deck.pptx"
+    assert artifacts[0].tool_name == "bash"
+    assert artifacts[0].preview_kind == "binary"
+
+
+@pytest.mark.asyncio
 async def test_chat_artifacts_ignore_user_upload_attachments(tmp_path):
     uploaded = tmp_path / "uploaded.txt"
     uploaded.write_text("user file", encoding="utf-8")

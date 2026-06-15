@@ -99,6 +99,7 @@ _LEGACY_OUTPUT_PREFIXES = (
     "Saved ",
     "Generated ",
 )
+_LEGACY_PATH_LABEL_RE = re.compile(r"^\s*(?:路径|path|file|output)\s*[:：]\s*(?P<path>.+?)\s*$", re.IGNORECASE)
 
 
 def _safe_attachment_filename(filename: str | None) -> str:
@@ -261,6 +262,9 @@ def _artifact_from_metadata(
 
 def _legacy_path_from_output_line(line: str) -> str | None:
     stripped = line.strip()
+    label_match = _LEGACY_PATH_LABEL_RE.match(stripped)
+    if label_match:
+        return label_match.group("path").strip().strip("'\"`")
     for prefix in _LEGACY_OUTPUT_PREFIXES:
         if not stripped.startswith(prefix):
             continue

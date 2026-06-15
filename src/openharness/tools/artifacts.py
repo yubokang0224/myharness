@@ -96,6 +96,8 @@ TRACKED_ARTIFACT_EXTENSIONS = TEXT_EXTENSIONS | {
     ".jpg",
     ".pdf",
     ".png",
+    ".ppt",
+    ".pptx",
     ".webp",
 }
 

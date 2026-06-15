@@ -130,6 +130,21 @@ async def test_bash_tool_tracks_generated_artifacts(tmp_path: Path):
     assert result.metadata["artifacts"][0]["name"] == "generated.md"
     assert result.metadata["artifacts"][0]["preview_kind"] == "markdown"
 
+    ppt_script = "from pathlib import Path; Path('deck.pptx').write_bytes(b'pptx')"
+    if sys.platform == "win32":
+        ppt_command = f"& '{sys.executable}' -c \"{ppt_script}\""
+    else:
+        ppt_command = f"'{sys.executable}' -c \"{ppt_script}\""
+
+    ppt_result = await BashTool().execute(
+        BashToolInput(command=ppt_command),
+        ToolExecutionContext(cwd=tmp_path),
+    )
+
+    assert ppt_result.is_error is False
+    assert ppt_result.metadata["artifacts"][0]["name"] == "deck.pptx"
+    assert ppt_result.metadata["artifacts"][0]["preview_kind"] == "binary"
+
 
 @pytest.mark.asyncio
 async def test_tool_search_and_brief_tools(tmp_path: Path):
