@@ -16,6 +16,32 @@ def test_load_skill_registry_includes_bundled(tmp_path: Path, monkeypatch):
     names = [skill.name for skill in registry.list_skills()]
     assert "simplify" in names
     assert "review" in names
+    assert "skill-creator" in names
+
+    skill_creator = registry.get("skill-creator")
+    assert skill_creator is not None
+    assert skill_creator.source == "bundled"
+    assert ".openharness/skills" in skill_creator.content
+    assert ".agents/skills" not in skill_creator.content
+    assert "Agent Skills" in skill_creator.description
+    assert skill_creator.path is not None
+    assert skill_creator.path.replace("\\", "/").endswith("skill-creator/SKILL.md")
+    skill_creator_dir = Path(skill_creator.path).parent
+    assert (skill_creator_dir / "scripts" / "quick_validate.py").exists()
+    assert (skill_creator_dir / "references" / "skill-schema.md").exists()
+    assert (skill_creator_dir / "agents" / "grader.md").exists()
+
+
+def test_bundled_directory_skill_layout_is_loaded(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    from openharness.skills.bundled import get_bundled_skills
+
+    skills = get_bundled_skills()
+    skill_creator = next(skill for skill in skills if skill.name == "skill-creator")
+
+    assert skill_creator.path is not None
+    assert Path(skill_creator.path).name == "SKILL.md"
+    assert "scripts/quick_validate.py" in skill_creator.content
 
 
 def test_load_skill_registry_includes_user_skills(tmp_path: Path, monkeypatch):
@@ -49,6 +75,28 @@ def test_parse_frontmatter_inline_description():
     name, desc = parse_skill_markdown("fallback", content)
     assert name == "my-skill"
     assert desc == "A short inline description"
+
+
+def test_bundled_parse_frontmatter_uses_yaml_parser():
+    from openharness.skills.bundled import _parse_frontmatter as parse_bundled_frontmatter
+
+    content = textwrap.dedent("""\
+        ---
+        name: bundled-yaml
+        description: >
+          Create skills with descriptions that can contain:
+          colons, quotes, and folded lines.
+        ---
+
+        # Body
+    """)
+
+    name, desc = parse_bundled_frontmatter("fallback", content)
+
+    assert name == "bundled-yaml"
+    assert "descriptions that can contain:" in desc
+    assert "folded lines" in desc
+    assert "\n" not in desc
 
 
 def test_parse_frontmatter_folded_block_scalar():
