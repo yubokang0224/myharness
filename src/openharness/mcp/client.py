@@ -53,20 +53,7 @@ class McpClientManager:
     async def connect_all(self) -> None:
         """Connect all configured MCP servers supported by the current build."""
         for name, config in self._server_configs.items():
-            if isinstance(config, McpStdioServerConfig):
-                await self._connect_stdio(name, config)
-            elif isinstance(config, McpHttpServerConfig):
-                await self._connect_http(name, config)
-            elif isinstance(config, McpSseServerConfig):
-                await self._connect_sse(name, config)
-            else:
-                self._statuses[name] = McpConnectionStatus(
-                    name=name,
-                    state="failed",
-                    transport=config.type,
-                    auth_configured=bool(getattr(config, "headers", None)),
-                    detail=f"Unsupported MCP transport in current build: {config.type}",
-                )
+            await self.connect(name)
 
     async def reconnect_all(self) -> None:
         """Reconnect all configured servers."""
@@ -80,6 +67,11 @@ class McpClientManager:
     def update_server_config(self, name: str, config: object) -> None:
         """Replace one server config in memory."""
         self._server_configs[name] = config
+        self._statuses[name] = McpConnectionStatus(
+            name=name,
+            state="pending",
+            transport=getattr(config, "type", "unknown"),
+        )
 
     def get_server_config(self, name: str) -> object | None:
         """Return one configured server object if present."""
@@ -97,17 +89,91 @@ class McpClientManager:
         """Return statuses for all configured servers."""
         return [self._statuses[name] for name in sorted(self._statuses)]
 
-    def list_tools(self) -> list[McpToolInfo]:
+    async def get_all_statuses(self) -> list[McpConnectionStatus]:
+        """Async-compatible status API used by gateway routers."""
+        return self.list_statuses()
+
+    async def sync_server_configs(self, server_configs: dict[str, object]) -> None:
+        """Synchronize in-memory servers with config loaded from disk."""
+        for name in list(self._server_configs):
+            if name not in server_configs:
+                await self.remove_server(name)
+
+        for name, config in server_configs.items():
+            current = self._server_configs.get(name)
+            if current == config and name in self._statuses:
+                continue
+            if current is not None:
+                await self.disconnect(name)
+            await self.add_server(name, config)
+
+    async def add_server(self, name: str, config: object) -> None:
+        """Add a server config and attempt to connect it."""
+        self.update_server_config(name, config)
+        await self.connect(name)
+
+    async def remove_server(self, name: str) -> None:
+        """Remove one server config and close any active connection."""
+        await self.disconnect(name)
+        self._server_configs.pop(name, None)
+        self._statuses.pop(name, None)
+
+    async def connect(self, name: str) -> None:
+        """Connect one configured MCP server."""
+        config = self._server_configs.get(name)
+        if config is None:
+            self._statuses[name] = McpConnectionStatus(
+                name=name,
+                state="failed",
+                detail="MCP server config not found",
+            )
+            return
+        await self.disconnect(name, disabled=False)
+        if isinstance(config, McpStdioServerConfig):
+            await self._connect_stdio(name, config)
+        elif isinstance(config, McpHttpServerConfig):
+            await self._connect_http(name, config)
+        elif isinstance(config, McpSseServerConfig):
+            await self._connect_sse(name, config)
+        else:
+            self._statuses[name] = McpConnectionStatus(
+                name=name,
+                state="failed",
+                transport=getattr(config, "type", "unknown"),
+                auth_configured=bool(getattr(config, "headers", None)),
+                detail=f"Unsupported MCP transport in current build: {getattr(config, 'type', 'unknown')}",
+            )
+
+    async def disconnect(self, name: str, *, disabled: bool = True) -> None:
+        """Disconnect one server without removing its config."""
+        stack = self._stacks.pop(name, None)
+        if stack is not None:
+            with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+                await stack.aclose()
+        self._sessions.pop(name, None)
+        config = self._server_configs.get(name)
+        if config is not None and disabled:
+            self._statuses[name] = McpConnectionStatus(
+                name=name,
+                state="disabled",
+                transport=getattr(config, "type", "unknown"),
+            )
+
+    def list_tools(self, server_name: str | None = None) -> list[McpToolInfo]:
         """Return all connected MCP tools."""
         tools: list[McpToolInfo] = []
         for status in self.list_statuses():
+            if server_name is not None and status.name != server_name:
+                continue
             tools.extend(status.tools)
         return tools
 
-    def list_resources(self) -> list[McpResourceInfo]:
+    def list_resources(self, server_name: str | None = None) -> list[McpResourceInfo]:
         """Return all connected MCP resources."""
         resources: list[McpResourceInfo] = []
         for status in self.list_statuses():
+            if server_name is not None and status.name != server_name:
+                continue
             resources.extend(status.resources)
         return resources
 

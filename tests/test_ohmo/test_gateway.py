@@ -39,6 +39,7 @@ from ohmo.gateway.routers.chat import (
     send_message_sync,
 )
 from ohmo.gateway.routers.agents import list_agent_tools, update_agent
+from ohmo.gateway.routers.skills import list_mcp_servers
 from ohmo.gateway.schemas.agents import UpdateAgentRequest
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
 from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
@@ -49,7 +50,7 @@ from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
 from ohmo.session_storage import load_latest_for_session_key, save_session_snapshot
 from ohmo.workspace import get_gateway_restart_notice_path, initialize_workspace
-from openharness.mcp.types import McpConnectionStatus, McpSseServerConfig
+from openharness.mcp.types import McpConnectionStatus, McpSseServerConfig, McpToolInfo
 
 
 def test_gateway_router_uses_thread_and_sender_when_present():
@@ -208,6 +209,48 @@ async def test_gateway_startup_connects_shared_mcp_manager(tmp_path, monkeypatch
 
     assert connected and "metrics" in connected[0]
     assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_list_mcp_servers_syncs_settings_and_returns_sse(tmp_path, monkeypatch):
+    settings = Settings(
+        mcp_servers={"metrics": McpSseServerConfig(url="http://192.168.6.131:8100/sse")},
+    )
+    synced = []
+
+    class FakeMcpManager:
+        async def sync_server_configs(self, configs):
+            synced.append(configs)
+
+        def list_statuses(self):
+            return [
+                McpConnectionStatus(
+                    name="metrics",
+                    state="connected",
+                    transport="sse",
+                    tools=[
+                        McpToolInfo(
+                            server_name="metrics",
+                            name="query_metric_nl",
+                            description="Query metrics with natural language",
+                            input_schema={"type": "object"},
+                        )
+                    ],
+                )
+            ]
+
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+
+    servers = await list_mcp_servers(
+        _user={},
+        runtime=SimpleNamespace(workspace=tmp_path, mcp_manager=FakeMcpManager()),
+    )
+
+    assert synced == [settings.mcp_servers]
+    assert servers[0].name == "metrics"
+    assert servers[0].type == "sse"
+    assert servers[0].transport == "sse"
+    assert servers[0].tools[0]["name"] == "query_metric_nl"
 
 
 @pytest.mark.asyncio

@@ -57,6 +57,36 @@ def _load_skill_registry_for_runtime(runtime: _RuntimeState):
     )
 
 
+async def _sync_mcp_manager_from_settings(runtime: _RuntimeState) -> None:
+    """Keep gateway MCP manager aligned with the persisted settings file."""
+    from openharness.config import load_settings
+    from openharness.mcp.client import McpClientManager
+    from openharness.mcp.config import load_mcp_server_configs
+
+    server_configs = load_mcp_server_configs(load_settings(), [])
+    if runtime.mcp_manager is None:
+        runtime.mcp_manager = McpClientManager(server_configs)
+        await runtime.mcp_manager.connect_all()
+        return
+    if hasattr(runtime.mcp_manager, "sync_server_configs"):
+        await runtime.mcp_manager.sync_server_configs(server_configs)
+
+
+def _mcp_status_to_response(status) -> McpServerResponse:
+    transport = status.transport if status.transport in ("stdio", "http", "sse", "ws") else "stdio"
+    return McpServerResponse(
+        name=status.name,
+        type=transport,
+        state=status.state,
+        detail=status.detail,
+        transport=status.transport,
+        tools=[
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+            for t in status.tools
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Skill endpoints
 # ---------------------------------------------------------------------------
@@ -199,28 +229,18 @@ async def list_mcp_servers(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """List all MCP servers and their connection status."""
+    await _sync_mcp_manager_from_settings(runtime)
     if runtime.mcp_manager is None:
         return []
     try:
-        statuses = await runtime.mcp_manager.get_all_statuses()
+        if hasattr(runtime.mcp_manager, "get_all_statuses"):
+            statuses = await runtime.mcp_manager.get_all_statuses()
+        else:
+            statuses = runtime.mcp_manager.list_statuses()
     except Exception:
+        logger.exception("failed to list MCP server statuses")
         statuses = []
-    result = []
-    for s in statuses:
-        result.append(
-            McpServerResponse(
-                name=s.name,
-                type=s.transport if s.transport in ("stdio", "http", "ws") else "stdio",
-                state=s.state,
-                detail=s.detail,
-                transport=s.transport,
-                tools=[
-                    {"name": t.name, "description": t.description, "input_schema": t.input_schema}
-                    for t in s.tools
-                ],
-            )
-        )
-    return result
+    return [_mcp_status_to_response(s) for s in statuses]
 
 
 @router.post("/mcp/servers", response_model=McpServerResponse, status_code=status.HTTP_201_CREATED)
@@ -230,26 +250,36 @@ async def add_mcp_server(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Add and connect a new MCP server."""
-    from openharness.mcp.types import McpStdioServerConfig, McpHttpServerConfig, McpWebSocketServerConfig
+    from openharness.config import load_settings, save_settings
+    from openharness.mcp.types import (
+        McpHttpServerConfig,
+        McpSseServerConfig,
+        McpStdioServerConfig,
+        McpWebSocketServerConfig,
+    )
 
-    cfg_type = body.config.get("type", "stdio")
+    cfg_type = str(body.config.get("type", "stdio"))
     if cfg_type == "http":
         config = McpHttpServerConfig(**body.config)
+    elif cfg_type == "sse":
+        config = McpSseServerConfig(**body.config)
     elif cfg_type == "ws":
         config = McpWebSocketServerConfig(**body.config)
     else:
         config = McpStdioServerConfig(**{k: v for k, v in body.config.items() if k != "type"})
 
+    settings = load_settings()
+    settings.mcp_servers[body.name] = config
+    save_settings(settings)
+    await _sync_mcp_manager_from_settings(runtime)
+
     if runtime.mcp_manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP manager not initialized")
 
-    await runtime.mcp_manager.add_server(body.name, config)
-    return McpServerResponse(
-        name=body.name,
-        type=cfg_type,
-        state="pending",
-        transport=cfg_type,
-    )
+    for server_status in runtime.mcp_manager.list_statuses():
+        if server_status.name == body.name:
+            return _mcp_status_to_response(server_status)
+    return McpServerResponse(name=body.name, type=cfg_type, state="pending", transport=cfg_type)
 
 
 @router.delete("/mcp/servers/{name}", status_code=status.HTTP_204_NO_CONTENT)
@@ -258,6 +288,13 @@ async def remove_mcp_server(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
+    from openharness.config import load_settings, save_settings
+
+    settings = load_settings()
+    settings.mcp_servers.pop(name, None)
+    save_settings(settings)
+    await _sync_mcp_manager_from_settings(runtime)
+
     if runtime.mcp_manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP manager not initialized")
     await runtime.mcp_manager.remove_server(name)
@@ -269,6 +306,7 @@ async def connect_mcp_server(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
+    await _sync_mcp_manager_from_settings(runtime)
     if runtime.mcp_manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP manager not initialized")
     await runtime.mcp_manager.connect(name)
@@ -280,6 +318,7 @@ async def disconnect_mcp_server(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
+    await _sync_mcp_manager_from_settings(runtime)
     if runtime.mcp_manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP manager not initialized")
     await runtime.mcp_manager.disconnect(name)
@@ -291,6 +330,7 @@ async def get_mcp_server_tools(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
+    await _sync_mcp_manager_from_settings(runtime)
     if runtime.mcp_manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="MCP manager not initialized")
     try:

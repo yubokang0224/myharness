@@ -28,7 +28,7 @@ class UpdateSkillRequest(BaseModel):
 
 class McpServerResponse(BaseModel):
     name: str
-    type: Literal["stdio", "http", "ws"]
+    type: Literal["stdio", "http", "sse", "ws"]
     state: Literal["connected", "failed", "pending", "disabled"]
     detail: str = ""
     transport: str = "unknown"
