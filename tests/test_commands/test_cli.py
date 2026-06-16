@@ -1,7 +1,9 @@
 """CLI smoke tests."""
 
 import json
+import os
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -327,6 +329,47 @@ def test_mcp_list_prints_sse_server(monkeypatch):
 
     assert result.exit_code == 0
     assert "metrics: sse -> http://192.168.6.131:8100/sse" in result.output
+
+
+def test_mcp_add_persists_sse_server(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+
+    result = runner.invoke(
+        app,
+        [
+            "mcp",
+            "add",
+            "metrics",
+            '{"type":"sse","url":"http://192.168.6.131:8100/sse","headers":{}}',
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Added MCP server: metrics" in result.output
+    saved = load_settings()
+    assert saved.mcp_servers["metrics"] == McpSseServerConfig(
+        url="http://192.168.6.131:8100/sse",
+        headers={},
+    )
+
+
+def test_python_module_invocation_runs_cli(tmp_path: Path):
+    env = os.environ.copy()
+    env["OPENHARNESS_CONFIG_DIR"] = str(tmp_path / "config")
+    env["OPENHARNESS_DATA_DIR"] = str(tmp_path / "data")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "openharness.cli", "mcp", "list"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "No MCP servers configured." in result.stdout
 
 
 def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeypatch, tmp_path: Path):

@@ -803,7 +803,10 @@ def mcp_add(
     config_json: str = typer.Argument(..., help="Server config as JSON string"),
 ) -> None:
     """Add an MCP server configuration."""
+    from pydantic import ValidationError
+
     from openharness.config import load_settings, save_settings
+    from openharness.mcp.types import McpJsonConfig
 
     settings = load_settings()
     try:
@@ -811,9 +814,14 @@ def mcp_add(
     except json.JSONDecodeError as exc:
         print(f"Invalid JSON: {exc}", file=sys.stderr)
         raise typer.Exit(1)
+    try:
+        parsed_cfg = McpJsonConfig.model_validate({"mcpServers": {name: cfg}}).mcpServers[name]
+    except ValidationError as exc:
+        print(f"Invalid MCP server config: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
     if not isinstance(settings.mcp_servers, dict):
         settings.mcp_servers = {}
-    settings.mcp_servers[name] = cfg
+    settings.mcp_servers[name] = parsed_cfg
     save_settings(settings)
     print(f"Added MCP server: {name}")
 
@@ -2421,3 +2429,7 @@ def main(
             permission_mode=permission_mode,
         )
     )
+
+
+if __name__ == "__main__":
+    app()
