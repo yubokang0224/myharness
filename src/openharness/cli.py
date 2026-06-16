@@ -793,8 +793,8 @@ def mcp_list() -> None:
         print("No MCP servers configured.")
         return
     for name, cfg in configs.items():
-        transport = cfg.get("transport", cfg.get("command", "unknown"))
-        print(f"  {name}: {transport}")
+        preview = _mcp_transport_preview(cfg)
+        print(f"  {name}: {preview['transport']} -> {preview['target']}")
 
 
 @mcp_app.command("add")

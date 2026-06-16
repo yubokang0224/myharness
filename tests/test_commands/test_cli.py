@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 import openharness.cli as cli
 from openharness.config import load_settings
 from openharness.config.settings import Settings
-from openharness.mcp.types import McpStdioServerConfig
+from openharness.mcp.types import McpSseServerConfig, McpStdioServerConfig
 
 
 app = cli.app
@@ -310,6 +310,23 @@ def test_build_dry_run_preview_classifies_slash_command_and_flags_bad_mcp(monkey
     assert preview["validation"]["mcp_errors"] == 1
     assert preview["mcp_servers"][0]["status"] == "error"
     assert "command not found in PATH" in preview["mcp_servers"][0]["issues"][0]
+
+
+def test_mcp_list_prints_sse_server(monkeypatch):
+    runner = CliRunner()
+    settings = Settings(
+        mcp_servers={
+            "metrics": McpSseServerConfig(url="http://192.168.6.131:8100/sse"),
+        },
+    )
+
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
+
+    result = runner.invoke(app, ["mcp", "list"])
+
+    assert result.exit_code == 0
+    assert "metrics: sse -> http://192.168.6.131:8100/sse" in result.output
 
 
 def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeypatch, tmp_path: Path):

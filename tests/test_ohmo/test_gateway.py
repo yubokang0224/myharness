@@ -25,6 +25,7 @@ from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.channels.impl.manager import ChannelManager
 
 from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
+from ohmo.gateway.api import create_app
 from ohmo.gateway.config import build_channel_manager_config, save_gateway_config
 from ohmo.gateway.dependencies import AuthContext
 from ohmo.gateway.models import GatewayConfig, GatewayState
@@ -48,6 +49,7 @@ from ohmo.memory import list_memory_files as list_ohmo_memory_files
 from ohmo.gateway.router import session_key_for_message
 from ohmo.session_storage import load_latest_for_session_key, save_session_snapshot
 from ohmo.workspace import get_gateway_restart_notice_path, initialize_workspace
+from openharness.mcp.types import McpConnectionStatus, McpSseServerConfig
 
 
 def test_gateway_router_uses_thread_and_sender_when_present():
@@ -167,6 +169,45 @@ async def test_create_session_allows_anonymous_external_call(tmp_path):
     assert session.title == "External session"
     assert session.channel == "web"
     assert session.id
+
+
+@pytest.mark.asyncio
+async def test_gateway_startup_connects_shared_mcp_manager(tmp_path, monkeypatch):
+    settings = Settings(
+        mcp_servers={"metrics": McpSseServerConfig(url="http://192.168.6.131:8100/sse")},
+    )
+    connected = []
+    closed = []
+
+    class FakeMcpManager:
+        def __init__(self, configs):
+            self.configs = configs
+
+        async def connect_all(self):
+            connected.append(self.configs)
+
+        def list_statuses(self):
+            return [
+                McpConnectionStatus(
+                    name="metrics",
+                    state="connected",
+                    transport="sse",
+                )
+            ]
+
+        async def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.mcp.config.load_mcp_server_configs", lambda settings, plugins: settings.mcp_servers)
+    monkeypatch.setattr("openharness.mcp.client.McpClientManager", FakeMcpManager)
+
+    app = create_app(workspace=str(tmp_path))
+    async with app.router.lifespan_context(app):
+        pass
+
+    assert connected and "metrics" in connected[0]
+    assert closed == [True]
 
 
 @pytest.mark.asyncio

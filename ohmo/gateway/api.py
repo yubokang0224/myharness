@@ -39,7 +39,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings = load_settings()
         server_configs = load_mcp_server_configs(settings, [])
         runtime.mcp_manager = McpClientManager(server_configs)
-        logger.info("McpClientManager initialized")
+        await runtime.mcp_manager.connect_all()
+        connected = sum(1 for status in runtime.mcp_manager.list_statuses() if status.state == "connected")
+        failed = sum(1 for status in runtime.mcp_manager.list_statuses() if status.state == "failed")
+        logger.info("McpClientManager initialized connected=%s failed=%s", connected, failed)
     except Exception as exc:
         logger.warning("Could not initialize McpClientManager: %s", exc)
 
