@@ -200,6 +200,33 @@ async def test_mcp_tool_adapter_returns_error_result_on_disconnected_server():
     assert "not connected" in result.output
 
 
+@pytest.mark.asyncio
+async def test_mcp_tool_adapter_returns_error_result_on_timeout(monkeypatch):
+    class SlowManager:
+        async def call_tool(self, server_name, tool_name, arguments):
+            await asyncio.sleep(1)
+            return "late"
+
+    import openharness.tools.mcp_tool as mcp_tool_module
+
+    monkeypatch.setattr(mcp_tool_module, "_MCP_TOOL_TIMEOUT_SECONDS", 0.01)
+    tool_info = McpToolInfo(
+        server_name="metrics",
+        name="query_metric_nl",
+        description="test",
+        input_schema={"type": "object", "properties": {"user_query": {"type": "string"}}},
+    )
+    adapter = McpToolAdapter(SlowManager(), tool_info)
+    result = await adapter.execute(
+        adapter.input_model.model_validate({"user_query": "OEE"}),
+        ToolExecutionContext(cwd=Path(".")),
+    )
+
+    assert result.is_error is True
+    assert "timed out" in result.output
+    assert "metrics.query_metric_nl" in result.output
+
+
 # --- ReadMcpResourceTool catches error and returns ToolResult(is_error=True) ---
 
 

@@ -185,6 +185,10 @@ def _record_id_from_path(path: Path) -> str:
     return stem.removeprefix("invocation-")
 
 
+def _resolve_persist_mode(body: MessageRequest, default: str) -> str:
+    return body.persist_mode or default
+
+
 def _artifact_id(path: Path) -> str:
     return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
 
@@ -668,6 +672,7 @@ async def send_message(
 
     # SSE event queue: str items are serialised SSE lines, None signals end-of-stream
     sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    persist_mode = _resolve_persist_mode(body, "session")
     engine_holder: dict[str, Any] = {}
     settings_holder: dict[str, Any] = {}
 
@@ -901,7 +906,7 @@ async def send_message(
                         usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
                         if not isinstance(usage_snap, UsageSnapshot):
                             usage_snap = UsageSnapshot()
-                        if body.persist_mode == "session":
+                        if persist_mode == "session":
                             save_session_snapshot(
                                 cwd=Path.cwd(),
                                 workspace=runtime.workspace,
@@ -914,7 +919,7 @@ async def send_message(
                                 channel="web",
                                 platform="web",
                             )
-                        elif body.persist_mode == "log":
+                        elif persist_mode == "log":
                             save_invocation_record(
                                 cwd=Path.cwd(),
                                 workspace=runtime.workspace,
@@ -992,6 +997,7 @@ async def send_message_sync(
     text_parts: list[str] = []
     usage_dict: dict[str, Any] | None = None
     invocation_id: str | None = None
+    persist_mode = _resolve_persist_mode(body, "log")
 
     async def permission_prompt(tool_name: str, reason: str) -> bool:
         req_id = uuid4().hex[:8]
@@ -1180,7 +1186,7 @@ async def send_message_sync(
                     if not isinstance(usage_snap, UsageSnapshot):
                         usage_snap = UsageSnapshot()
                     response_text = "".join(text_parts).strip()
-                    if body.persist_mode == "session":
+                    if persist_mode == "session":
                         save_session_snapshot(
                             cwd=Path.cwd(),
                             workspace=runtime.workspace,
@@ -1193,7 +1199,7 @@ async def send_message_sync(
                             channel="web",
                             platform="web",
                         )
-                    elif body.persist_mode == "log":
+                    elif persist_mode == "log":
                         path = save_invocation_record(
                             cwd=Path.cwd(),
                             workspace=runtime.workspace,

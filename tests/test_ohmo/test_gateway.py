@@ -699,7 +699,7 @@ async def test_sync_message_log_persist_mode_writes_invocation_not_session(tmp_p
 
     response = await send_message_sync(
         session_id="api-call-1",
-        body=MessageRequest(content="run this", persist_mode="log"),
+        body=MessageRequest(content="run this"),
         auth=None,
         runtime=SimpleNamespace(workspace=tmp_path),
     )
@@ -1135,6 +1135,61 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
     assert "web_fetch" in updates[1].text
     assert updates[-1].kind == "final"
     assert updates[-1].text == "done"
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_checkpoints_user_message_before_tool_results(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                self.messages.append(content)
+                assistant = ConversationMessage(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(
+                            id="toolu_metrics",
+                            name="mcp__metrics__query_metric_nl",
+                            input={"user_query": "OP020 OEE"},
+                        )
+                    ],
+                )
+                self.messages.append(assistant)
+                yield AssistantTurnComplete(message=assistant, usage=UsageSnapshot())
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="dingtalk:dingtalk-bot", sender_id="u1", chat_id="c1", content="OP020 OEE")
+    updates = [u async for u in pool.stream_message(message, "dingtalk:dingtalk-bot:生产助手:c1:u1")]
+
+    snapshot = load_latest_for_session_key(workspace, "dingtalk:dingtalk-bot:生产助手:c1:u1")
+    assert updates[0].kind == "progress"
+    assert snapshot is not None
+    assert snapshot["message_count"] == 1
+    assert snapshot["messages"][0]["role"] == "user"
+    assert snapshot["messages"][0]["content"][0]["text"] == "OP020 OEE"
 
 
 @pytest.mark.asyncio

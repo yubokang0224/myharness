@@ -528,6 +528,7 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, AssistantTurnComplete):
+            await self._save_snapshot(bundle, session_key, content)
             if not reply_parts:
                 reply_parts.append(event.message.text.strip())
             if self._is_output_limit_stop_reason(getattr(event, "stop_reason", None)):
