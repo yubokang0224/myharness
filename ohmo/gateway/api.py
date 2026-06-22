@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ohmo.gateway.dependencies import get_runtime
-from ohmo.gateway.routers import agents, chat, models, skills, tasks
+from ohmo.gateway.routers import agents, chat, invocations, models, skills, tasks
 from ohmo.workspace import initialize_workspace
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,7 @@ def create_app(
     # Mount routers under /agent/api/v1
     prefix = "/agent/api/v1"
     app.include_router(chat.router, prefix=prefix)
+    app.include_router(invocations.router, prefix=prefix)
     app.include_router(agents.router, prefix=prefix)
     app.include_router(skills.router, prefix=prefix)
     app.include_router(tasks.router, prefix=prefix)

@@ -4,7 +4,15 @@ from pathlib import Path
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage
 
-from ohmo.session_storage import OhmoSessionBackend, get_session_dir, list_snapshots
+from ohmo.session_storage import (
+    OhmoSessionBackend,
+    get_invocation_dir,
+    get_session_dir,
+    list_invocation_records,
+    list_snapshots,
+    load_invocation_record,
+    save_invocation_record,
+)
 from ohmo.workspace import initialize_workspace
 
 
@@ -55,6 +63,39 @@ def test_ohmo_session_backend_loads_latest_for_session_key(tmp_path: Path):
     assert loaded["session_id"] == "abc123"
     assert loaded["session_key"] == "feishu:chat-1"
     assert loaded["tool_metadata"]["task_focus_state"]["goal"] == "Continue the same Feishu task"
+
+
+def test_ohmo_invocation_records_can_be_listed_and_loaded(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    path = save_invocation_record(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("invoke me")],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=2),
+        session_id="api-call-1",
+        agent_name="production-agent",
+        request_content="invoke me",
+        response_text="done",
+        tool_calls=[{"tool_name": "read_file"}],
+    )
+
+    invocation_dir = get_invocation_dir(workspace)
+    assert invocation_dir == workspace / "invocations"
+    assert path.exists()
+
+    records = list_invocation_records(workspace, agent_name="production-agent")
+    assert len(records) == 1
+    assert records[0]["invocation_id"]
+    assert records[0]["session_id"] == "api-call-1"
+    assert records[0]["tool_call_count"] == 1
+
+    loaded = load_invocation_record(workspace, records[0]["invocation_id"])
+    assert loaded is not None
+    assert loaded["agent_name"] == "production-agent"
+    assert loaded["response_text"] == "done"
 
 
 def test_ohmo_session_backend_records_remote_session_metadata(tmp_path: Path):

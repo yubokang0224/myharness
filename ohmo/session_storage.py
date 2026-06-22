@@ -202,6 +202,59 @@ def save_invocation_record(
     return path
 
 
+def list_invocation_records(
+    workspace: str | Path | None = None,
+    *,
+    limit: int = 50,
+    agent_name: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """List non-conversation invocation records, newest first."""
+    invocation_dir = get_invocation_dir(workspace)
+    records: list[dict[str, Any]] = []
+    for path in sorted(invocation_dir.glob("invocation-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if agent_name and (data.get("agent_name") or "") != agent_name:
+            continue
+        if status and (data.get("status") or "") != status:
+            continue
+        records.append(
+            {
+                "invocation_id": data.get("invocation_id") or path.stem.removeprefix("invocation-"),
+                "session_id": data.get("session_id"),
+                "agent_name": data.get("agent_name"),
+                "channel": data.get("channel") or "api",
+                "platform": data.get("platform") or data.get("channel") or "api",
+                "model": data.get("model") or "",
+                "status": data.get("status") or "completed",
+                "request_content": data.get("request_content"),
+                "response_text": data.get("response_text"),
+                "error": data.get("error"),
+                "created_at": data.get("created_at", path.stat().st_mtime),
+                "message_count": data.get("message_count", len(data.get("messages", []))),
+                "tool_call_count": len(data.get("tool_calls", [])) if isinstance(data.get("tool_calls"), list) else 0,
+            }
+        )
+        if len(records) >= limit:
+            break
+    return records
+
+
+def load_invocation_record(workspace: str | Path | None, invocation_id: str) -> dict[str, Any] | None:
+    """Load one invocation record by id."""
+    safe_id = Path(invocation_id).name.removeprefix("invocation-").removesuffix(".json")
+    path = get_invocation_dir(workspace) / f"invocation-{safe_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def load_latest(workspace: str | Path | None = None) -> dict[str, Any] | None:
     path = get_session_dir(workspace) / "latest.json"
     if not path.exists():

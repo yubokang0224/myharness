@@ -851,16 +851,35 @@ async def send_message(
                 attachments=body.attachments,
             )
 
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            status_messages: list[str] = []
             async for event in engine.submit_message(user_message):
                 if abort_event.is_set():
                     await sse_queue.put(_sse_line(SSEError(message="Generation aborted", recoverable=True)))
                     break
 
                 if isinstance(event, AssistantTextDelta):
+                    text_parts.append(event.text)
                     await sse_queue.put(_sse_line(SSETextDelta(text=event.text)))
                 elif isinstance(event, ToolExecutionStarted):
+                    tool_calls.append(
+                        {
+                            "tool_name": event.tool_name,
+                            "tool_input": event.tool_input,
+                            "output": None,
+                            "is_error": None,
+                            "metadata": None,
+                        }
+                    )
                     await sse_queue.put(_sse_line(SSEToolCall(tool_name=event.tool_name, tool_input=event.tool_input)))
                 elif isinstance(event, ToolExecutionCompleted):
+                    for call in reversed(tool_calls):
+                        if call.get("tool_name") == event.tool_name and call.get("output") is None:
+                            call["output"] = event.output
+                            call["is_error"] = event.is_error
+                            call["metadata"] = event.metadata
+                            break
                     await sse_queue.put(
                         _sse_line(
                             SSEToolResult(
@@ -906,7 +925,10 @@ async def send_message(
                                 session_id=session_id,
                                 agent_name=agent_name,
                                 request_content=body.content,
+                                response_text="".join(text_parts).strip(),
                                 status="completed",
+                                tool_calls=tool_calls,
+                                status_messages=status_messages,
                                 tool_metadata=tool_metadata,
                             )
                     except Exception:
@@ -921,6 +943,7 @@ async def send_message(
                     else:
                         await sse_queue.put(_sse_line(SSEError(message=event.message, recoverable=event.recoverable)))
                 elif isinstance(event, StatusEvent):
+                    status_messages.append(event.message)
                     await sse_queue.put(_sse_line(SSEStatus(message=event.message)))
 
         except Exception as exc:
