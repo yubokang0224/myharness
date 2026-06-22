@@ -23,6 +23,13 @@ class InvocationSummary(BaseModel):
     tool_call_count: int = 0
 
 
+class InvocationPage(BaseModel):
+    items: list[InvocationSummary]
+    total: int
+    page: int
+    page_size: int
+
+
 class InvocationDetail(InvocationSummary):
     cwd: str = ""
     system_prompt: str = ""

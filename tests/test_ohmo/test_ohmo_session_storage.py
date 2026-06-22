@@ -6,6 +6,7 @@ from openharness.engine.messages import ConversationMessage
 
 from ohmo.session_storage import (
     OhmoSessionBackend,
+    count_invocation_records,
     get_invocation_dir,
     get_session_dir,
     list_invocation_records,
@@ -96,6 +97,32 @@ def test_ohmo_invocation_records_can_be_listed_and_loaded(tmp_path: Path):
     assert loaded is not None
     assert loaded["agent_name"] == "production-agent"
     assert loaded["response_text"] == "done"
+
+
+def test_ohmo_invocation_records_support_offset_pagination(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    for index in range(3):
+        save_invocation_record(
+            cwd=tmp_path,
+            workspace=workspace,
+            model="test-model",
+            system_prompt="system",
+            messages=[ConversationMessage.from_user_text(f"invoke {index}")],
+            usage=UsageSnapshot(),
+            session_id=f"api-call-{index}",
+            agent_name="production-agent",
+            request_content=f"invoke {index}",
+            response_text=f"done {index}",
+        )
+
+    first_page = list_invocation_records(workspace, limit=2, offset=0)
+    second_page = list_invocation_records(workspace, limit=2, offset=2)
+
+    assert count_invocation_records(workspace, agent_name="production-agent") == 3
+    assert len(first_page) == 2
+    assert len(second_page) == 1
+    assert {item["session_id"] for item in first_page}.isdisjoint({item["session_id"] for item in second_page})
 
 
 def test_ohmo_invocation_list_falls_back_to_api_session_snapshots(tmp_path: Path):

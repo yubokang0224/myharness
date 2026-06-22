@@ -206,13 +206,16 @@ def list_invocation_records(
     workspace: str | Path | None = None,
     *,
     limit: int = 50,
+    offset: int = 0,
     agent_name: str | None = None,
     status: str | None = None,
 ) -> list[dict[str, Any]]:
     """List non-conversation invocation records, newest first."""
+    offset = max(0, offset)
     invocation_dir = get_invocation_dir(workspace)
     records: list[dict[str, Any]] = []
     seen_session_ids: set[str] = set()
+    max_needed = max(0, offset) + max(1, limit)
     for path in sorted(invocation_dir.glob("invocation-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -242,9 +245,9 @@ def list_invocation_records(
                 "tool_call_count": len(data.get("tool_calls", [])) if isinstance(data.get("tool_calls"), list) else 0,
             }
         )
-        if len(records) >= limit:
+        if len(records) >= max_needed:
             break
-    if len(records) < limit:
+    if len(records) < max_needed:
         session_dir = get_session_dir(workspace)
         for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
@@ -288,10 +291,28 @@ def list_invocation_records(
                     "tool_call_count": 0,
                 }
             )
-            if len(records) >= limit:
+            if len(records) >= max_needed:
                 break
     records.sort(key=lambda item: float(item.get("created_at") or 0.0), reverse=True)
-    return records
+    return records[offset : offset + limit]
+
+
+def count_invocation_records(
+    workspace: str | Path | None = None,
+    *,
+    agent_name: str | None = None,
+    status: str | None = None,
+) -> int:
+    """Count invocation records after applying filters."""
+    return len(
+        list_invocation_records(
+            workspace=workspace,
+            limit=1_000_000,
+            offset=0,
+            agent_name=agent_name,
+            status=status,
+        )
+    )
 
 
 def load_invocation_record(workspace: str | Path | None, invocation_id: str) -> dict[str, Any] | None:

@@ -7,8 +7,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ohmo.gateway.dependencies import _RuntimeState, get_current_user, get_runtime
-from ohmo.gateway.schemas.invocations import InvocationDetail, InvocationSummary
-from ohmo.session_storage import list_invocation_records, load_invocation_record
+from ohmo.gateway.schemas.invocations import InvocationDetail, InvocationPage, InvocationSummary
+from ohmo.session_storage import count_invocation_records, list_invocation_records, load_invocation_record
 
 router = APIRouter(prefix="/invocations", tags=["invocations"])
 
@@ -31,24 +31,35 @@ def _summary_from_record(record: dict) -> InvocationSummary:
     )
 
 
-@router.get("", response_model=list[InvocationSummary])
+@router.get("", response_model=InvocationPage)
 async def list_invocations(
     _user: Annotated[dict, Depends(get_current_user)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
-    limit: int = Query(50, ge=1, le=200),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    limit: int | None = Query(None, ge=1, le=200),
     agent_name: str | None = Query(None),
     status_filter: str | None = Query(None, alias="status"),
 ):
     """List invocation logs that were persisted outside chat sessions."""
-    return [
+    resolved_page_size = limit or page_size
+    offset = (page - 1) * resolved_page_size
+    items = [
         _summary_from_record(record)
         for record in list_invocation_records(
             workspace=runtime.workspace,
-            limit=limit,
+            limit=resolved_page_size,
+            offset=offset,
             agent_name=agent_name,
             status=status_filter,
         )
     ]
+    total = count_invocation_records(
+        workspace=runtime.workspace,
+        agent_name=agent_name,
+        status=status_filter,
+    )
+    return InvocationPage(items=items, total=total, page=page, page_size=resolved_page_size)
 
 
 @router.get("/{invocation_id}", response_model=InvocationDetail)
