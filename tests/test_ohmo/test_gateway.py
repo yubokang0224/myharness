@@ -36,6 +36,7 @@ from ohmo.gateway.config import build_channel_manager_config, save_gateway_confi
 from ohmo.gateway.dependencies import AuthContext
 from ohmo.gateway.models import GatewayConfig, GatewayState
 from ohmo.gateway.routers.chat import (
+    _default_persist_mode_for_session,
     _prepare_user_text,
     create_session,
     get_artifact_content,
@@ -168,14 +169,70 @@ async def test_chat_session_list_hides_remote_channel_sessions_by_default(tmp_pa
 @pytest.mark.asyncio
 async def test_create_session_allows_anonymous_external_call(tmp_path):
     session = await create_session(
-        body=CreateSessionRequest(title="External session"),
+        body=CreateSessionRequest(title="External session", agent_name="api-agent"),
         _user=None,
         runtime=SimpleNamespace(workspace=tmp_path),
     )
 
     assert session.title == "External session"
-    assert session.channel == "web"
+    assert session.channel == "api"
     assert session.id
+
+    sessions = await list_sessions(
+        _user={},
+        runtime=SimpleNamespace(workspace=tmp_path),
+        include_remote=True,
+        channel=None,
+        agent_name=None,
+    )
+    assert sessions == []
+
+    api_sessions = await list_sessions(
+        _user={},
+        runtime=SimpleNamespace(workspace=tmp_path),
+        include_remote=True,
+        channel="api",
+        agent_name=None,
+    )
+    assert len(api_sessions) == 1
+    assert api_sessions[0].agent_name == "api-agent"
+
+
+@pytest.mark.asyncio
+async def test_create_session_page_mode_is_visible_in_chat_list(tmp_path):
+    session = await create_session(
+        body=CreateSessionRequest(title="Page session", persist_mode="session"),
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    sessions = await list_sessions(
+        _user={},
+        runtime=SimpleNamespace(workspace=tmp_path),
+        include_remote=False,
+        channel=None,
+        agent_name=None,
+    )
+
+    assert session.channel == "web"
+    assert [item.id for item in sessions] == [session.id]
+
+
+@pytest.mark.asyncio
+async def test_api_session_defaults_to_log_persist_mode_for_streaming(tmp_path):
+    api_session = await create_session(
+        body=CreateSessionRequest(title="API session", agent_name="api-agent"),
+        _user=None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+    web_session = await create_session(
+        body=CreateSessionRequest(title="Page session", persist_mode="session"),
+        _user={"sub": "u1"},
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    assert _default_persist_mode_for_session(str(tmp_path), api_session.id) == "log"
+    assert _default_persist_mode_for_session(str(tmp_path), web_session.id) == "session"
 
 
 @pytest.mark.asyncio

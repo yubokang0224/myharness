@@ -98,6 +98,33 @@ def test_ohmo_invocation_records_can_be_listed_and_loaded(tmp_path: Path):
     assert loaded["response_text"] == "done"
 
 
+def test_ohmo_invocation_list_falls_back_to_api_session_snapshots(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    backend = OhmoSessionBackend(workspace)
+    backend.save_snapshot(
+        cwd=tmp_path,
+        model="test-model",
+        system_prompt="system",
+        messages=[],
+        usage=UsageSnapshot(),
+        session_id="api-session-1",
+        title="api call",
+        agent_name="production-agent",
+        channel="api",
+        platform="api",
+    )
+
+    records = list_invocation_records(workspace)
+
+    assert len(records) == 1
+    assert records[0]["invocation_id"] == "session-api-session-1"
+    assert records[0]["status"] == "created"
+    loaded = load_invocation_record(workspace, records[0]["invocation_id"])
+    assert loaded is not None
+    assert loaded["agent_name"] == "production-agent"
+
+
 def test_ohmo_session_backend_records_remote_session_metadata(tmp_path: Path):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)

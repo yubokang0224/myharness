@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class CreateSessionRequest(BaseModel):
     agent_name: str | None = None
     title: str | None = None
+    persist_mode: Literal["session", "log", "none"] | None = None
 
 
 class SessionInfo(BaseModel):

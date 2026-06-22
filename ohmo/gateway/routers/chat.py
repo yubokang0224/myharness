@@ -189,6 +189,16 @@ def _resolve_persist_mode(body: MessageRequest, default: str) -> str:
     return body.persist_mode or default
 
 
+def _default_persist_mode_for_session(workspace: str | None, session_id: str) -> str:
+    try:
+        snap = load_by_id(workspace=workspace, session_id=session_id)
+    except Exception:
+        snap = None
+    if snap and (snap.get("channel") or "web") == "api":
+        return "log"
+    return "session"
+
+
 def _artifact_id(path: Path) -> str:
     return hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
 
@@ -399,6 +409,8 @@ async def list_sessions(
     for snap in snapshots:
         if snap.get("session_key") and not include_remote:
             continue
+        if (snap.get("channel") or "web") == "api" and channel != "api":
+            continue
         if channel and snap.get("channel") != channel:
             continue
         if agent_name and (snap.get("agent_name") or "") != agent_name:
@@ -433,30 +445,33 @@ async def create_session(
     """Create a new chat session."""
     session_id = uuid4().hex[:12]
     now = time.time()
-    try:
-        save_session_snapshot(
-            cwd=Path.cwd(),
-            workspace=runtime.workspace,
-            model="",
-            system_prompt="",
-            messages=[],
-            usage=UsageSnapshot(),
-            session_id=session_id,
-            title=body.title or "New Conversation",
-            agent_name=body.agent_name,
-            channel="web",
-            platform="web",
-        )
-    except Exception:
-        logger.exception("Failed to create initial session snapshot for %s", session_id)
+    persist_mode = body.persist_mode or "log"
+    channel = "web" if persist_mode == "session" else "api"
+    if persist_mode != "none":
+        try:
+            save_session_snapshot(
+                cwd=Path.cwd(),
+                workspace=runtime.workspace,
+                model="",
+                system_prompt="",
+                messages=[],
+                usage=UsageSnapshot(),
+                session_id=session_id,
+                title=body.title or "New Conversation",
+                agent_name=body.agent_name,
+                channel=channel,
+                platform=channel,
+            )
+        except Exception:
+            logger.exception("Failed to create initial session snapshot for %s", session_id)
     return SessionInfo(
         id=session_id,
         title=body.title or "New Conversation",
         agent_name=body.agent_name,
         conversation_id=session_id,
         session_key=None,
-        channel="web",
-        platform="web",
+        channel=channel,
+        platform=channel,
         created_at=now,
         updated_at=now,
     )
@@ -672,7 +687,7 @@ async def send_message(
 
     # SSE event queue: str items are serialised SSE lines, None signals end-of-stream
     sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    persist_mode = _resolve_persist_mode(body, "session")
+    persist_mode = _resolve_persist_mode(body, _default_persist_mode_for_session(runtime.workspace, session_id))
     engine_holder: dict[str, Any] = {}
     settings_holder: dict[str, Any] = {}
 

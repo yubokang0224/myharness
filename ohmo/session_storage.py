@@ -212,6 +212,7 @@ def list_invocation_records(
     """List non-conversation invocation records, newest first."""
     invocation_dir = get_invocation_dir(workspace)
     records: list[dict[str, Any]] = []
+    seen_session_ids: set[str] = set()
     for path in sorted(invocation_dir.glob("invocation-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -221,10 +222,13 @@ def list_invocation_records(
             continue
         if status and (data.get("status") or "") != status:
             continue
+        session_id = data.get("session_id")
+        if session_id:
+            seen_session_ids.add(str(session_id))
         records.append(
             {
                 "invocation_id": data.get("invocation_id") or path.stem.removeprefix("invocation-"),
-                "session_id": data.get("session_id"),
+                "session_id": session_id,
                 "agent_name": data.get("agent_name"),
                 "channel": data.get("channel") or "api",
                 "platform": data.get("platform") or data.get("channel") or "api",
@@ -240,12 +244,81 @@ def list_invocation_records(
         )
         if len(records) >= limit:
             break
+    if len(records) < limit:
+        session_dir = get_session_dir(workspace)
+        for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if (data.get("channel") or "web") != "api":
+                continue
+            session_id = str(data.get("session_id") or path.stem.removeprefix("session-"))
+            if session_id in seen_session_ids:
+                continue
+            if agent_name and (data.get("agent_name") or "") != agent_name:
+                continue
+            fallback_status = "completed" if data.get("messages") else "created"
+            if status and fallback_status != status:
+                continue
+            messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+            response_text = ""
+            for msg in reversed(messages):
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                for block in msg.get("content", []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        response_text += str(block.get("text") or "")
+                if response_text:
+                    break
+            records.append(
+                {
+                    "invocation_id": f"session-{session_id}",
+                    "session_id": session_id,
+                    "agent_name": data.get("agent_name"),
+                    "channel": "api",
+                    "platform": data.get("platform") or "api",
+                    "model": data.get("model") or "",
+                    "status": fallback_status,
+                    "request_content": data.get("summary"),
+                    "response_text": response_text or None,
+                    "error": None,
+                    "created_at": data.get("created_at", path.stat().st_mtime),
+                    "message_count": data.get("message_count", len(messages)),
+                    "tool_call_count": 0,
+                }
+            )
+            if len(records) >= limit:
+                break
+    records.sort(key=lambda item: float(item.get("created_at") or 0.0), reverse=True)
     return records
 
 
 def load_invocation_record(workspace: str | Path | None, invocation_id: str) -> dict[str, Any] | None:
     """Load one invocation record by id."""
     safe_id = Path(invocation_id).name.removeprefix("invocation-").removesuffix(".json")
+    if safe_id.startswith("session-"):
+        session_id = safe_id.removeprefix("session-")
+        session_path = get_session_dir(workspace) / f"session-{session_id}.json"
+        if not session_path.exists():
+            return None
+        try:
+            data = json.loads(session_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if (data.get("channel") or "web") != "api":
+            return None
+        return {
+            **data,
+            "kind": "agent_invocation",
+            "invocation_id": f"session-{session_id}",
+            "request_content": data.get("summary"),
+            "response_text": None,
+            "status": "completed" if data.get("messages") else "created",
+            "tool_calls": [],
+            "status_messages": [],
+            "permission_requests": [],
+        }
     path = get_invocation_dir(workspace) / f"invocation-{safe_id}.json"
     if not path.exists():
         return None
