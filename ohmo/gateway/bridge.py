@@ -50,6 +50,10 @@ def _format_gateway_error(exc: Exception) -> str:
     return f"[ohmo gateway error] {message}"
 
 
+def _is_dingtalk_channel(channel: str) -> bool:
+    return channel == "dingtalk" or channel.startswith("dingtalk:")
+
+
 class OhmoGatewayBridge:
     """Consume inbound messages and publish assistant replies."""
 
@@ -209,6 +213,15 @@ class OhmoGatewayBridge:
                     reply = update.text
                     continue
                 if not update.text:
+                    continue
+                if update.kind == "tool_hint" and _is_dingtalk_channel(message.channel):
+                    logger.info(
+                        "ohmo outbound update suppressed channel=%s chat_id=%s session_key=%s kind=%s",
+                        message.channel,
+                        message.chat_id,
+                        session_key,
+                        update.kind,
+                    )
                     continue
                 logger.info(
                     "ohmo outbound update channel=%s chat_id=%s session_key=%s kind=%s content=%r",

@@ -52,6 +52,7 @@ from ohmo.session_storage import (
     get_session_dir,
     list_snapshots,
     load_by_id,
+    save_invocation_record,
     save_session_snapshot,
 )
 from ohmo.workspace import get_attachments_dir
@@ -177,6 +178,11 @@ def _prepare_user_text(body: MessageRequest, attachment_notes: str = "") -> str:
     if attachment_notes:
         user_text = f"{body.content.strip() or '[Attachment message]'}\n\n{attachment_notes}"
     return user_text
+
+
+def _record_id_from_path(path: Path) -> str:
+    stem = path.stem
+    return stem.removeprefix("invocation-")
 
 
 def _artifact_id(path: Path) -> str:
@@ -872,25 +878,39 @@ async def send_message(
                     except Exception:
                         pass
                     try:
-                        from ohmo.session_storage import save_session_snapshot
                         from openharness.api.usage import UsageSnapshot
                         usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
                         if not isinstance(usage_snap, UsageSnapshot):
                             usage_snap = UsageSnapshot()
-                        save_session_snapshot(
-                            cwd=Path.cwd(),
-                            workspace=runtime.workspace,
-                            model=settings.model or "",
-                            system_prompt=system_prompt,
-                            messages=engine.messages,
-                            usage=usage_snap,
-                            session_id=session_id,
-                            agent_name=agent_name,
-                            channel="web",
-                            platform="web",
-                        )
+                        if body.persist_mode == "session":
+                            save_session_snapshot(
+                                cwd=Path.cwd(),
+                                workspace=runtime.workspace,
+                                model=settings.model or "",
+                                system_prompt=system_prompt,
+                                messages=engine.messages,
+                                usage=usage_snap,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                channel="web",
+                                platform="web",
+                            )
+                        elif body.persist_mode == "log":
+                            save_invocation_record(
+                                cwd=Path.cwd(),
+                                workspace=runtime.workspace,
+                                model=settings.model or "",
+                                system_prompt=system_prompt,
+                                messages=engine.messages,
+                                usage=usage_snap,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                request_content=body.content,
+                                status="completed",
+                                tool_metadata=tool_metadata,
+                            )
                     except Exception:
-                        logger.exception("Failed to save session snapshot for %s", session_id)
+                        logger.exception("Failed to persist completed turn for %s", session_id)
                     await sse_queue.put(_sse_line(SSEDone(usage=usage_dict)))
                 elif isinstance(event, ErrorEvent):
                     if event.message == _EMPTY_ASSISTANT_MESSAGE:
@@ -948,6 +968,7 @@ async def send_message_sync(
     status_messages: list[str] = []
     text_parts: list[str] = []
     usage_dict: dict[str, Any] | None = None
+    invocation_id: str | None = None
 
     async def permission_prompt(tool_name: str, reason: str) -> bool:
         req_id = uuid4().hex[:8]
@@ -1135,20 +1156,41 @@ async def send_message_sync(
                     usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
                     if not isinstance(usage_snap, UsageSnapshot):
                         usage_snap = UsageSnapshot()
-                    save_session_snapshot(
-                        cwd=Path.cwd(),
-                        workspace=runtime.workspace,
-                        model=settings.model or "",
-                        system_prompt=system_prompt,
-                        messages=engine.messages,
-                        usage=usage_snap,
-                        session_id=session_id,
-                        agent_name=agent_name,
-                        channel="web",
-                        platform="web",
-                    )
+                    response_text = "".join(text_parts).strip()
+                    if body.persist_mode == "session":
+                        save_session_snapshot(
+                            cwd=Path.cwd(),
+                            workspace=runtime.workspace,
+                            model=settings.model or "",
+                            system_prompt=system_prompt,
+                            messages=engine.messages,
+                            usage=usage_snap,
+                            session_id=session_id,
+                            agent_name=agent_name,
+                            channel="web",
+                            platform="web",
+                        )
+                    elif body.persist_mode == "log":
+                        path = save_invocation_record(
+                            cwd=Path.cwd(),
+                            workspace=runtime.workspace,
+                            model=settings.model or "",
+                            system_prompt=system_prompt,
+                            messages=engine.messages,
+                            usage=usage_snap,
+                            session_id=session_id,
+                            agent_name=agent_name,
+                            request_content=body.content,
+                            response_text=response_text,
+                            status="completed",
+                            tool_calls=tool_calls,
+                            status_messages=status_messages,
+                            permission_requests=[item.model_dump() for item in permission_requests],
+                            tool_metadata=tool_metadata,
+                        )
+                        invocation_id = _record_id_from_path(path)
                 except Exception:
-                    logger.exception("Failed to save session snapshot for %s", session_id)
+                    logger.exception("Failed to persist completed turn for %s", session_id)
             elif isinstance(event, ErrorEvent):
                 if event.message == _EMPTY_ASSISTANT_MESSAGE:
                     status_messages.append(
@@ -1184,6 +1226,7 @@ async def send_message_sync(
             session_id=session_id,
             status="completed",
             text="".join(text_parts).strip(),
+            invocation_id=invocation_id,
             tool_calls=tool_calls,
             status_messages=status_messages,
             permission_requests=permission_requests,

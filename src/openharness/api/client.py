@@ -16,6 +16,7 @@ from openharness.api.errors import (
     OpenHarnessApiError,
     RateLimitFailure,
     RequestFailure,
+    describe_exception,
 )
 from openharness.auth.external import (
     claude_attribution_header,
@@ -171,19 +172,20 @@ class AnthropicApiClient:
                 raise  # Auth errors are not retried
             except Exception as exc:
                 last_error = exc
+                error_message = describe_exception(exc)
                 if attempt >= MAX_RETRIES or not _is_retryable(exc):
                     if isinstance(exc, APIError):
                         raise _translate_api_error(exc) from exc
-                    raise RequestFailure(str(exc)) from exc
+                    raise RequestFailure(error_message) from exc
 
                 delay = _get_retry_delay(attempt, exc)
                 status = getattr(exc, "status_code", "?")
                 log.warning(
                     "API request failed (attempt %d/%d, status=%s), retrying in %.1fs: %s",
-                    attempt + 1, MAX_RETRIES + 1, status, delay, exc,
+                    attempt + 1, MAX_RETRIES + 1, status, delay, error_message,
                 )
                 yield ApiRetryEvent(
-                    message=str(exc),
+                    message=error_message,
                     attempt=attempt + 1,
                     max_attempts=MAX_RETRIES + 1,
                     delay_seconds=delay,
@@ -193,7 +195,7 @@ class AnthropicApiClient:
         if last_error is not None:
             if isinstance(last_error, APIError):
                 raise _translate_api_error(last_error) from last_error
-            raise RequestFailure(str(last_error)) from last_error
+            raise RequestFailure(describe_exception(last_error)) from last_error
 
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Single attempt at streaming a message."""
@@ -259,8 +261,9 @@ class AnthropicApiClient:
 
 def _translate_api_error(exc: APIError) -> OpenHarnessApiError:
     name = exc.__class__.__name__
+    message = describe_exception(exc)
     if name in {"AuthenticationError", "PermissionDeniedError"}:
-        return AuthenticationFailure(str(exc))
+        return AuthenticationFailure(message)
     if name == "RateLimitError":
-        return RateLimitFailure(str(exc))
-    return RequestFailure(str(exc))
+        return RateLimitFailure(message)
+    return RequestFailure(message)

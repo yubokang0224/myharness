@@ -19,6 +19,7 @@ from openharness.api.client import (
     ApiTextDeltaEvent,
     SupportsStreamingMessages,
 )
+from openharness.api.errors import describe_exception
 from openharness.api.provider import is_model_multimodal
 from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_data_dir
@@ -779,7 +780,8 @@ async def run_query(
                     usage = event.usage
                     final_stop_reason = event.stop_reason
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = describe_exception(exc)
+            log.warning("Model stream failed: %s", error_msg, exc_info=True)
             if _is_completion_token_limit_error(exc):
                 supported_limit = _extract_completion_token_limit(exc)
                 if supported_limit is not None and effective_max_tokens > supported_limit:

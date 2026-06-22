@@ -32,6 +32,7 @@ class MessageRequest(BaseModel):
     content: str
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     response_format: Literal["text", "json"] = "text"
+    persist_mode: Literal["session", "log", "none"] = "session"
 
 
 class PermissionRequestInfo(BaseModel):
@@ -44,6 +45,7 @@ class MessageSyncResponse(BaseModel):
     session_id: str
     status: Literal["completed", "error"]
     text: str
+    invocation_id: str | None = None
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     status_messages: list[str] = Field(default_factory=list)
     permission_requests: list[PermissionRequestInfo] = Field(default_factory=list)

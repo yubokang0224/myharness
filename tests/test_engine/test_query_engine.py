@@ -213,6 +213,14 @@ class _NoopApiClient:
             yield None
 
 
+class BlankTimeoutApiClient:
+    async def stream_message(self, request):
+        del request
+        raise TimeoutError()
+        if False:
+            yield None
+
+
 def test_query_prompt_too_long_detection_handles_llama_cpp_errors():
     assert _is_prompt_too_long_error(
         RequestFailure("exceed_context_size_error: prompt exceeds the available context size")
@@ -259,6 +267,26 @@ async def test_query_engine_plain_text_reply(tmp_path: Path, monkeypatch):
     assert engine.total_usage.input_tokens == 10
     assert engine.total_usage.output_tokens == 5
     assert len(engine.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_query_engine_reports_blank_timeout_error(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_COORDINATOR_MODE", raising=False)
+    engine = QueryEngine(
+        api_client=BlankTimeoutApiClient(),
+        tool_registry=create_default_tool_registry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="openai-compatible-model",
+        system_prompt="system",
+    )
+
+    events = [event async for event in engine.submit_message("generate a long html page")]
+
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.message.startswith("Network error:")
+    assert "timed out" in error.message.lower()
+    assert "OPENHARNESS_TIMEOUT" in error.message
 
 
 @pytest.mark.asyncio

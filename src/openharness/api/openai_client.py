@@ -9,6 +9,7 @@ import re
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 from openai import AsyncOpenAI
 
 from openharness.api.client import (
@@ -23,6 +24,7 @@ from openharness.api.errors import (
     OpenHarnessApiError,
     RateLimitFailure,
     RequestFailure,
+    describe_exception,
 )
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import (
@@ -39,6 +41,7 @@ log = logging.getLogger(__name__)
 MAX_RETRIES = 3
 BASE_DELAY = 1.0
 MAX_DELAY = 30.0
+MIN_STREAM_READ_TIMEOUT_SECONDS = 180.0
 _MAX_COMPLETION_TOKEN_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
 
@@ -225,6 +228,12 @@ def _normalize_openai_base_url(base_url: str | None) -> str | None:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
+def _streaming_timeout(timeout: float) -> httpx.Timeout:
+    """Keep connect/write bounds while allowing long streamed generations."""
+    value = float(timeout)
+    return httpx.Timeout(value, read=max(value, MIN_STREAM_READ_TIMEOUT_SECONDS))
+
+
 class OpenAICompatibleClient:
     """Client for OpenAI-compatible APIs (DashScope, GitHub Models, etc.).
 
@@ -238,7 +247,7 @@ class OpenAICompatibleClient:
         if normalized_base_url:
             kwargs["base_url"] = normalized_base_url
         if timeout is not None:
-            kwargs["timeout"] = timeout
+            kwargs["timeout"] = _streaming_timeout(timeout)
         self._client = AsyncOpenAI(**kwargs)
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
@@ -254,16 +263,17 @@ class OpenAICompatibleClient:
                 raise
             except Exception as exc:
                 last_error = exc
+                error_message = describe_exception(exc)
                 if attempt >= MAX_RETRIES or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
 
                 delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
                 log.warning(
                     "OpenAI API request failed (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1, MAX_RETRIES + 1, delay, exc,
+                    attempt + 1, MAX_RETRIES + 1, delay, error_message,
                 )
                 yield ApiRetryEvent(
-                    message=str(exc),
+                    message=error_message,
                     attempt=attempt + 1,
                     max_attempts=MAX_RETRIES + 1,
                     delay_seconds=delay,
@@ -462,7 +472,7 @@ class OpenAICompatibleClient:
     @staticmethod
     def _translate_error(exc: Exception) -> OpenHarnessApiError:
         status = getattr(exc, "status_code", None)
-        msg = str(exc)
+        msg = describe_exception(exc)
         if status == 401 or status == 403:
             return AuthenticationFailure(msg)
         if status == 429:

@@ -18,7 +18,7 @@ from openharness.services.session_storage import (
 )
 from openharness.utils.fs import atomic_write_text
 
-from ohmo.workspace import get_sessions_dir
+from ohmo.workspace import get_invocations_dir, get_sessions_dir
 
 
 def get_session_dir(workspace: str | Path | None = None) -> Path:
@@ -26,6 +26,13 @@ def get_session_dir(workspace: str | Path | None = None) -> Path:
     session_dir = get_sessions_dir(workspace)
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
+
+
+def get_invocation_dir(workspace: str | Path | None = None) -> Path:
+    """Return the ohmo invocation-log directory."""
+    invocation_dir = get_invocations_dir(workspace)
+    invocation_dir.mkdir(parents=True, exist_ok=True)
+    return invocation_dir
 
 
 def _session_key_token(session_key: str) -> str:
@@ -139,6 +146,60 @@ def save_session_snapshot(
     session_path = session_dir / f"session-{sid}.json"
     atomic_write_text(session_path, data)
     return latest_path
+
+
+def save_invocation_record(
+    *,
+    cwd: str | Path,
+    workspace: str | Path | None = None,
+    model: str,
+    system_prompt: str,
+    messages: list[ConversationMessage],
+    usage: UsageSnapshot,
+    session_id: str | None = None,
+    agent_name: str | None = None,
+    channel: str = "api",
+    platform: str = "api",
+    request_content: str | None = None,
+    response_text: str | None = None,
+    status: str = "completed",
+    tool_calls: list[dict[str, Any]] | None = None,
+    status_messages: list[str] | None = None,
+    permission_requests: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+    tool_metadata: dict[str, object] | None = None,
+) -> Path:
+    """Persist a non-conversation API invocation record."""
+    invocation_dir = get_invocation_dir(workspace)
+    invocation_id = uuid4().hex[:12]
+    messages = sanitize_conversation_messages(messages)
+    payload = {
+        "app": "ohmo",
+        "kind": "agent_invocation",
+        "invocation_id": invocation_id,
+        "session_id": session_id,
+        "agent_name": agent_name,
+        "channel": channel,
+        "platform": platform,
+        "cwd": str(Path(cwd).resolve()),
+        "model": model,
+        "system_prompt": system_prompt,
+        "request_content": request_content,
+        "response_text": response_text,
+        "status": status,
+        "messages": [message.model_dump(mode="json") for message in messages],
+        "usage": usage.model_dump(),
+        "tool_calls": tool_calls or [],
+        "status_messages": status_messages or [],
+        "permission_requests": permission_requests or [],
+        "error": error,
+        "tool_metadata": _persistable_tool_metadata(tool_metadata),
+        "created_at": time.time(),
+        "message_count": len(messages),
+    }
+    path = invocation_dir / f"invocation-{invocation_id}.json"
+    atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+    return path
 
 
 def load_latest(workspace: str | Path | None = None) -> dict[str, Any] | None:

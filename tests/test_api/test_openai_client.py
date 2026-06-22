@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from openharness.api.client import ApiMessageRequest
+from openharness.api.errors import RequestFailure
 from openharness.api.openai_client import (
     OpenAICompatibleClient,
     _convert_messages_to_openai,
@@ -337,7 +338,7 @@ def test_openai_client_init_normalizes_base_url(monkeypatch):
     assert captured["base_url"] == "https://jarodfund.xyz/openai/v1"
 
 
-def test_openai_client_init_passes_timeout(monkeypatch):
+def test_openai_client_init_uses_streaming_timeout(monkeypatch):
     captured: dict[str, object] = {}
 
     class _StubAsyncOpenAI:
@@ -347,7 +348,35 @@ def test_openai_client_init_passes_timeout(monkeypatch):
     monkeypatch.setattr("openharness.api.openai_client.AsyncOpenAI", _StubAsyncOpenAI)
     OpenAICompatibleClient(api_key="test-key", timeout=45.0)
 
-    assert captured["timeout"] == 45.0
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.connect == 45.0
+    assert timeout.write == 45.0
+    assert timeout.pool == 45.0
+    assert timeout.read == 180.0
+
+
+def test_openai_client_init_preserves_larger_streaming_timeout(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("openharness.api.openai_client.AsyncOpenAI", _StubAsyncOpenAI)
+    OpenAICompatibleClient(api_key="test-key", timeout=240.0)
+
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 240.0
+
+
+def test_openai_client_translates_empty_timeout_error():
+    err = OpenAICompatibleClient._translate_error(TimeoutError())
+
+    assert isinstance(err, RequestFailure)
+    assert "timed out" in str(err).lower()
+    assert "OPENHARNESS_TIMEOUT" in str(err)
 
 
 def test_openai_client_uses_bearer_authorization_header():

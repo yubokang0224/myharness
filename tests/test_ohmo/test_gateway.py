@@ -19,7 +19,13 @@ from openharness.config.schema import Config, DingTalkBotConfig, DingTalkConfig
 from openharness.config.settings import Settings
 from openharness.coordinator.agent_definitions import AgentDefinition
 from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
-from openharness.engine.stream_events import AssistantTextDelta, CompactProgressEvent, ErrorEvent, ToolExecutionStarted
+from openharness.engine.stream_events import (
+    AssistantTextDelta,
+    AssistantTurnComplete,
+    CompactProgressEvent,
+    ErrorEvent,
+    ToolExecutionStarted,
+)
 from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.channels.impl.manager import ChannelManager
@@ -654,6 +660,61 @@ async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path
     assert captured["context_window_tokens"] == 220000
     assert captured["auto_compact_threshold_tokens"] == 180000
     assert set(captured["tool_registry"]._tools) == {"read_file"}
+
+
+@pytest.mark.asyncio
+async def test_sync_message_log_persist_mode_writes_invocation_not_session(tmp_path, monkeypatch):
+    settings = Settings(model="test-model")
+    monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda _: object())
+    monkeypatch.setattr("openharness.mcp.config.load_mcp_server_configs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("openharness.utils.internal_api_auth.make_hsjm_auth_metadata", lambda token: None)
+
+    class FakeMcpManager:
+        async def connect_all(self):
+            return None
+
+        async def close(self):
+            return None
+
+    class FakeToolRegistry:
+        def to_api_schema(self):
+            return []
+
+    class FakeEngine:
+        total_usage = UsageSnapshot()
+
+        def __init__(self, **_kwargs):
+            self.messages = []
+
+        async def submit_message(self, message):
+            assistant = ConversationMessage(role="assistant", content=[TextBlock(text="done")])
+            self.messages = [message, assistant]
+            yield AssistantTextDelta(text="done")
+            yield AssistantTurnComplete(message=assistant, usage=UsageSnapshot())
+
+    monkeypatch.setattr("openharness.mcp.client.McpClientManager", lambda *args, **kwargs: FakeMcpManager())
+    monkeypatch.setattr("openharness.tools.create_default_tool_registry", lambda _manager: FakeToolRegistry())
+    monkeypatch.setattr("openharness.engine.QueryEngine", FakeEngine)
+
+    response = await send_message_sync(
+        session_id="api-call-1",
+        body=MessageRequest(content="run this", persist_mode="log"),
+        auth=None,
+        runtime=SimpleNamespace(workspace=tmp_path),
+    )
+
+    assert response.status == "completed"
+    assert response.text == "done"
+    assert response.invocation_id
+    assert not list((tmp_path / "sessions").glob("session-*.json"))
+    records = list((tmp_path / "invocations").glob("invocation-*.json"))
+    assert len(records) == 1
+    payload = json.loads(records[0].read_text(encoding="utf-8"))
+    assert payload["kind"] == "agent_invocation"
+    assert payload["session_id"] == "api-call-1"
+    assert payload["request_content"] == "run this"
+    assert payload["response_text"] == "done"
 
 
 def test_channel_manager_expands_dingtalk_bots_and_skips_missing_agent(monkeypatch, caplog):
@@ -1731,6 +1792,46 @@ async def test_gateway_bridge_publishes_progress_updates():
     assert second.content.startswith("🛠️ ")
     assert "web_fetch" in second.content
     assert third.content == "Done"
+
+
+@pytest.mark.asyncio
+async def test_gateway_bridge_suppresses_dingtalk_tool_hints():
+    bus = MessageBus()
+
+    class FakeRuntimePool:
+        async def stream_message(self, message, session_key):
+            yield SimpleNamespace(
+                kind="tool_hint",
+                text="正在使用 web_fetch: https://example.com",
+                metadata={"_progress": True, "_tool_hint": True, "_session_key": session_key},
+            )
+            yield SimpleNamespace(kind="final", text="Done", metadata={"_session_key": session_key})
+
+    bridge = OhmoGatewayBridge(bus=bus, runtime_pool=FakeRuntimePool())
+    task = asyncio.create_task(bridge.run())
+    try:
+        await bus.publish_inbound(
+            InboundMessage(
+                channel="dingtalk:dingtalk-bot",
+                sender_id="u1",
+                chat_id="c1",
+                content="hi",
+                metadata={"bot_name": "dingtalk-bot", "default_agent": "生产助手"},
+            )
+        )
+        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(bus.consume_outbound(), timeout=0.1)
+    finally:
+        bridge.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert outbound.content == "Done"
+    assert not outbound.metadata.get("_tool_hint")
 
 
 @pytest.mark.asyncio

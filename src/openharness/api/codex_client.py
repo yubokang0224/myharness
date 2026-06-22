@@ -16,7 +16,13 @@ from openharness.api.client import (
     ApiStreamEvent,
     ApiTextDeltaEvent,
 )
-from openharness.api.errors import AuthenticationFailure, OpenHarnessApiError, RateLimitFailure, RequestFailure
+from openharness.api.errors import (
+    AuthenticationFailure,
+    OpenHarnessApiError,
+    RateLimitFailure,
+    RequestFailure,
+    describe_exception,
+)
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
 
@@ -222,13 +228,14 @@ class CodexApiClient:
                 return
             except Exception as exc:
                 last_error = exc
+                error_message = describe_exception(exc)
                 if attempt >= MAX_RETRIES or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
                 delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
                 import asyncio
 
                 yield ApiRetryEvent(
-                    message=str(exc),
+                    message=error_message,
                     attempt=attempt + 1,
                     max_attempts=MAX_RETRIES + 1,
                     delay_seconds=delay,
@@ -385,7 +392,7 @@ class CodexApiClient:
             return exc
         if isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
-            return _translate_status_error(status, str(exc))
+            return _translate_status_error(status, describe_exception(exc))
         if isinstance(exc, httpx.HTTPError):
-            return RequestFailure(str(exc))
-        return RequestFailure(str(exc))
+            return RequestFailure(describe_exception(exc))
+        return RequestFailure(describe_exception(exc))
