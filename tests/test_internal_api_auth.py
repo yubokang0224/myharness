@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from openharness.tools.internal_api_request_tool import _headers_with_channel_context
 from openharness.config.settings import Settings, load_settings
 from openharness.utils.internal_api_auth import apply_internal_api_auth, normalized_origin
 
@@ -63,13 +64,22 @@ def test_apply_internal_api_auth_for_allowlisted_agent_absolute_url():
     url, headers, attached = apply_internal_api_auth(
         "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
         {},
-        metadata={"hsjm_auth": {"token": "123"}},
+        metadata={"hsjm_auth": {"token": "web-token"}},
         settings=settings,
     )
 
     assert url == "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert"
-    assert headers["Authorization"] == "Bearer 123"
+    assert headers["Authorization"] == "Bearer web-token"
     assert attached is True
+
+
+def test_internal_api_request_headers_include_channel_context():
+    headers = _headers_with_channel_context(
+        {},
+        metadata={"channel_context": {"channel": "dingtalk"}},
+    )
+
+    assert headers["X-OHMO-Source-Channel"] == "dingtalk"
 
 
 def test_apply_internal_api_auth_downgrades_external_url_without_token():

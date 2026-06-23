@@ -319,7 +319,10 @@ def test_gateway_app_mounts_production_issue_proxy(tmp_path):
 
 
 def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkeypatch):
-    monkeypatch.setenv("OHMO_PRODUCTION_ISSUE_UPSTREAM_BASE_URL", "http://api.internal:5000")
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(internal_api={"base_url": "http://api.internal:5000"}),
+    )
     captured: dict[str, object] = {}
 
     class FakeResponse:
@@ -350,7 +353,7 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     client = TestClient(app)
     response = client.post(
         "/agent/api/v1/ProductionIssue/Insert",
-        headers={"Authorization": "Bearer 123"},
+        headers={"X-OHMO-Source-Channel": "dingtalk"},
         json={"title": "现场问题"},
     )
 
@@ -360,6 +363,48 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     assert captured["url"] == "http://api.internal:5000/ProductionIssue/Insert"
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer 123"
     assert b"title" in captured["kwargs"]["content"]
+
+
+def test_production_issue_proxy_forwards_user_token_for_non_dingtalk(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(internal_api={"base_url": "http://api.internal:5000"}),
+    )
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue._decode_bearer_credentials",
+        lambda credentials: ({"sub": "u1"}, credentials.credentials),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"success":true}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured["headers"] = kwargs["headers"]
+            return FakeResponse()
+
+    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.post(
+        "/agent/api/v1/ProductionIssue/Insert",
+        headers={"Authorization": "Bearer user-token"},
+        json={"title": "现场问题"},
+    )
+
+    assert response.status_code == 200
+    assert captured["headers"]["Authorization"] == "Bearer user-token"
 
 
 @pytest.mark.asyncio
@@ -1283,7 +1328,7 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_sets_dingtalk_internal_api_token(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     captured: dict[str, object] = {}
@@ -1299,6 +1344,7 @@ async def test_runtime_pool_stream_message_sets_dingtalk_internal_api_token(tmp_
                 return None
 
             async def submit_message(self, content):
+                captured["channel_context"] = self.tool_metadata.get("channel_context")
                 captured["hsjm_auth"] = self.tool_metadata.get("hsjm_auth")
                 yield AssistantTextDelta(text="done")
 
@@ -1321,11 +1367,18 @@ async def test_runtime_pool_stream_message_sets_dingtalk_internal_api_token(tmp_
     updates = [u async for u in pool.stream_message(message, "dingtalk:ops-bot:ops-agent:c1:u1")]
 
     assert updates[-1].text == "done"
-    assert captured["hsjm_auth"] == {"token": "123"}
+    assert captured["channel_context"] == {
+        "channel": "dingtalk",
+        "raw_channel": "dingtalk:ops-bot",
+        "chat_id": "c1",
+        "sender_id": "u1",
+        "session_key": "dingtalk:ops-bot:ops-agent:c1:u1",
+    }
+    assert captured["hsjm_auth"] is None
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_stream_message_preserves_non_dingtalk_internal_api_token(tmp_path, monkeypatch):
+async def test_runtime_pool_stream_message_preserves_existing_auth_metadata(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     captured: dict[str, object] = {}
@@ -1341,6 +1394,7 @@ async def test_runtime_pool_stream_message_preserves_non_dingtalk_internal_api_t
                 return None
 
             async def submit_message(self, content):
+                captured["channel_context"] = self.tool_metadata.get("channel_context")
                 captured["hsjm_auth"] = self.tool_metadata.get("hsjm_auth")
                 yield AssistantTextDelta(text="done")
 
@@ -1364,6 +1418,7 @@ async def test_runtime_pool_stream_message_preserves_non_dingtalk_internal_api_t
 
     assert updates[-1].text == "done"
     assert captured["hsjm_auth"] == {"token": "web-token"}
+    assert captured["channel_context"]["channel"] == "feishu"
 
 
 @pytest.mark.asyncio

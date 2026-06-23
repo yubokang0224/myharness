@@ -18,12 +18,15 @@ router = APIRouter(prefix="/ProductionIssue", tags=["production-issue"])
 _bearer_scheme = HTTPBearer(auto_error=False)
 _DINGTALK_INTERNAL_API_TOKEN_ENV = "OHMO_DINGTALK_INTERNAL_API_TOKEN"
 _DINGTALK_INTERNAL_API_DEFAULT_TOKEN = "123"
-_PRODUCTION_ISSUE_UPSTREAM_BASE_URL_ENV = "OHMO_PRODUCTION_ISSUE_UPSTREAM_BASE_URL"
 
 
 async def _resolve_forward_token(
+    request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> str:
+    if _source_channel(request) == "dingtalk":
+        return _dingtalk_internal_api_token()
+
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -31,12 +34,8 @@ async def _resolve_forward_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = credentials.credentials.strip()
-    if token == _dingtalk_internal_api_token():
-        return token
-
     _decode_bearer_credentials(credentials)
-    return token
+    return credentials.credentials.strip()
 
 
 @router.post("/Insert")
@@ -105,16 +104,11 @@ async def _forward(request: Request, method: str, path: str, token: str) -> Resp
 
 
 def _production_issue_upstream_base_url() -> str:
-    base_url = os.environ.get(_PRODUCTION_ISSUE_UPSTREAM_BASE_URL_ENV, "").strip()
-    if not base_url:
-        base_url = load_settings().internal_api.base_url.strip()
+    base_url = load_settings().internal_api.base_url.strip()
     if not base_url:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "ProductionIssue upstream is not configured. "
-                f"Set {_PRODUCTION_ISSUE_UPSTREAM_BASE_URL_ENV} or internal_api.base_url."
-            ),
+            detail="ProductionIssue upstream is not configured. Set internal_api.base_url.",
         )
     return base_url
 
@@ -125,3 +119,7 @@ def _dingtalk_internal_api_token() -> str:
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     return token
+
+
+def _source_channel(request: Request) -> str:
+    return request.headers.get("x-ohmo-source-channel", "").strip().lower()

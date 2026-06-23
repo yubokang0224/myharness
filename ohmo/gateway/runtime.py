@@ -61,8 +61,6 @@ _CHANNEL_THINKING_PHRASES_EN = (
 _TEXT_PREVIEW_BYTES = 4096
 _TEXT_PREVIEW_CHARS = 900
 _BINARY_HEAD_BYTES = 32
-_DINGTALK_INTERNAL_API_TOKEN_ENV = "OHMO_DINGTALK_INTERNAL_API_TOKEN"
-_DINGTALK_INTERNAL_API_DEFAULT_TOKEN = "123"
 _IMAGE_FALLBACK_NOTE = (
     "[Image attachment omitted because the active model does not support image input. "
     "Ask the user to resend the image as text or switch to a vision-capable model.]"
@@ -186,7 +184,7 @@ class OhmoSessionRuntimePool:
             latest_user_prompt=user_prompt,
             agent_name=self._agent_name_for_message(message),
         )
-        _apply_dingtalk_internal_api_auth(bundle, message)
+        _apply_channel_context_metadata(bundle, message, session_key)
         logger.info(
             "ohmo runtime processing start channel=%s chat_id=%s session_key=%s session_id=%s content=%r",
             message.channel,
@@ -685,35 +683,27 @@ class OhmoSessionRuntimePool:
             apply_agent_tool_policy(bundle.tool_registry, agent_def)
 
 
-def _apply_dingtalk_internal_api_auth(bundle: RuntimeBundle, message: InboundMessage) -> None:
-    """Use the DingTalk service token for internal API tool calls."""
-    if not _is_dingtalk_channel(message.channel):
-        return
-    token = _dingtalk_internal_api_token()
-    if not token:
-        return
-
+def _apply_channel_context_metadata(
+    bundle: RuntimeBundle,
+    message: InboundMessage,
+    session_key: str,
+) -> None:
+    """Expose channel context to internal agent-side proxy routes."""
     metadata = getattr(bundle.engine, "tool_metadata", None)
     if not isinstance(metadata, dict):
         metadata = {}
         try:
             setattr(bundle.engine, "tool_metadata", metadata)
         except Exception:
-            logger.debug("unable to attach DingTalk internal API token metadata", exc_info=True)
+            logger.debug("unable to attach channel context metadata", exc_info=True)
             return
-    metadata["hsjm_auth"] = {"token": token}
-
-
-def _dingtalk_internal_api_token() -> str:
-    raw = os.environ.get(_DINGTALK_INTERNAL_API_TOKEN_ENV, _DINGTALK_INTERNAL_API_DEFAULT_TOKEN)
-    token = raw.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
-    return token
-
-
-def _is_dingtalk_channel(channel: str) -> bool:
-    return channel == "dingtalk" or channel.startswith("dingtalk:")
+    metadata["channel_context"] = {
+        "channel": message.channel.split(":", 1)[0],
+        "raw_channel": message.channel,
+        "chat_id": message.chat_id,
+        "sender_id": message.sender_id,
+        "session_key": session_key,
+    }
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:
