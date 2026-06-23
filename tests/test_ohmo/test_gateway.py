@@ -7,7 +7,9 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from openharness.api.usage import UsageSnapshot
 from openharness.bridge import get_bridge_manager
@@ -46,6 +48,7 @@ from ohmo.gateway.routers.chat import (
     send_message_sync,
 )
 from ohmo.gateway.routers.agents import list_agent_tools, update_agent
+from ohmo.gateway.routers import production_issue
 from ohmo.gateway.routers.skills import list_mcp_servers
 from ohmo.gateway.schemas.agents import UpdateAgentRequest
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
@@ -304,6 +307,59 @@ async def test_gateway_startup_connects_shared_mcp_manager(tmp_path, monkeypatch
 
     assert connected and "metrics" in connected[0]
     assert closed == [True]
+
+
+def test_gateway_app_mounts_production_issue_proxy(tmp_path):
+    app = create_app(workspace=str(tmp_path))
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert "/agent/api/v1/ProductionIssue/Insert" in paths
+    assert "/agent/api/v1/ProductionIssue/AppendProcess" in paths
+    assert "/agent/api/v1/ProductionIssue/UpdateStatus" in paths
+
+
+def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("OHMO_PRODUCTION_ISSUE_UPSTREAM_BASE_URL", "http://api.internal:5000")
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"success":true}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured["method"] = method
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return FakeResponse()
+
+    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", FakeAsyncClient)
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.post(
+        "/agent/api/v1/ProductionIssue/Insert",
+        headers={"Authorization": "Bearer 123"},
+        json={"title": "现场问题"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"success": True}
+    assert captured["method"] == "POST"
+    assert captured["url"] == "http://api.internal:5000/ProductionIssue/Insert"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer 123"
+    assert b"title" in captured["kwargs"]["content"]
 
 
 @pytest.mark.asyncio

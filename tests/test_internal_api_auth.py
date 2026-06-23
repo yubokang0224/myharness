@@ -52,6 +52,26 @@ def test_apply_internal_api_auth_for_allowlisted_relative_url():
     assert attached is True
 
 
+def test_apply_internal_api_auth_for_allowlisted_agent_absolute_url():
+    settings = Settings(
+        internal_api={
+            "base_url": "http://192.168.6.123:2416",
+            "allowlist": ["http://192.168.6.123:2416"],
+        }
+    )
+
+    url, headers, attached = apply_internal_api_auth(
+        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
+        {},
+        metadata={"hsjm_auth": {"token": "123"}},
+        settings=settings,
+    )
+
+    assert url == "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert"
+    assert headers["Authorization"] == "Bearer 123"
+    assert attached is True
+
+
 def test_apply_internal_api_auth_downgrades_external_url_without_token():
     settings = Settings(
         internal_api={
