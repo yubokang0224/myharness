@@ -177,7 +177,7 @@ class OhmoSessionRuntimePool:
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         self._session_metadata[session_key] = self._session_metadata_for_message(message)
-        user_message = _build_inbound_user_message(message)
+        user_message = _build_inbound_user_message(message, session_key=session_key)
         user_prompt = user_message.text
         bundle = await self.get_bundle(
             session_key,
@@ -796,13 +796,17 @@ def _format_channel_progress(
     return text
 
 
-def _build_inbound_user_message(message: InboundMessage) -> ConversationMessage:
+def _build_inbound_user_message(message: InboundMessage, *, session_key: str | None = None) -> ConversationMessage:
     """Convert an inbound channel message into user content blocks."""
     content: list[TextBlock | ImageBlock] = []
+    channel_metadata_context = _build_channel_metadata_context(message, session_key)
     speaker_context = _build_speaker_context(message)
     base = (message.content or "").strip()
+    if channel_metadata_context:
+        content.append(TextBlock(text=channel_metadata_context))
     if speaker_context:
-        content.append(TextBlock(text=speaker_context))
+        prefix = "\n\n" if channel_metadata_context else ""
+        content.append(TextBlock(text=prefix + speaker_context))
     if base:
         content.append(TextBlock(text=base))
 
@@ -820,6 +824,31 @@ def _build_inbound_user_message(message: InboundMessage) -> ConversationMessage:
             logger.exception("ohmo runtime failed to encode image attachment path=%s", media_path)
 
     return ConversationMessage.from_user_content(content)
+
+
+def _build_channel_metadata_context(message: InboundMessage, session_key: str | None) -> str:
+    """Return channel metadata that skills can persist through internal APIs."""
+    if not (message.channel == "dingtalk" or message.channel.startswith("dingtalk:")):
+        return ""
+    metadata = message.metadata or {}
+    # DingTalk may only expose a display/nick name for business use. The
+    # transport sender_id can be a routing key, so do not persist it as a
+    # business source sender id unless the channel explicitly provides one.
+    payload = {
+        "channel": message.channel.split(":", 1)[0],
+        "chatId": message.chat_id,
+        "senderId": _optional_str(metadata.get("source_sender_id")),
+        "senderName": _optional_str(metadata.get("sender_name")),
+        "messageId": _optional_str(metadata.get("message_id")),
+        "conversationId": _optional_str(metadata.get("conversation_id")),
+        "sessionKey": session_key,
+        "attachmentPaths": list(message.media or []),
+    }
+    return "[Channel metadata for API recording]\n" + json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def _should_retry_without_image_input(error_message: str, messages: list[ConversationMessage]) -> bool:
