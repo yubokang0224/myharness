@@ -40,6 +40,8 @@ async def list_invocations(
     limit: int | None = Query(None, ge=1, le=200),
     agent_name: str | None = Query(None),
     status_filter: str | None = Query(None, alias="status"),
+    start_at: float | None = Query(None, ge=0),
+    end_at: float | None = Query(None, ge=0),
 ):
     """List invocation logs that were persisted outside chat sessions."""
     resolved_page_size = limit or page_size
@@ -52,12 +54,16 @@ async def list_invocations(
             offset=offset,
             agent_name=agent_name,
             status=status_filter,
+            start_at=start_at,
+            end_at=end_at,
         )
     ]
     total = count_invocation_records(
         workspace=runtime.workspace,
         agent_name=agent_name,
         status=status_filter,
+        start_at=start_at,
+        end_at=end_at,
     )
     return InvocationPage(items=items, total=total, page=page, page_size=resolved_page_size)
 

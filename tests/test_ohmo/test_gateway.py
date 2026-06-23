@@ -199,6 +199,38 @@ async def test_create_session_allows_anonymous_external_call(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_list_sessions_scans_past_filtered_api_sessions(tmp_path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("remote")],
+        usage=UsageSnapshot(),
+        session_id="remote-session",
+        session_key="dingtalk:dingtalk-bot:general-purpose:u1:u1",
+    )
+    for index in range(25):
+        await create_session(
+            body=CreateSessionRequest(title=f"API session {index}", agent_name="api-agent"),
+            _user=None,
+            runtime=SimpleNamespace(workspace=workspace),
+        )
+
+    sessions = await list_sessions(
+        _user={},
+        runtime=SimpleNamespace(workspace=workspace),
+        include_remote=True,
+        channel=None,
+        agent_name=None,
+    )
+
+    assert [session.id for session in sessions] == ["remote-session"]
+
+
+@pytest.mark.asyncio
 async def test_create_session_page_mode_is_visible_in_chat_list(tmp_path):
     session = await create_session(
         body=CreateSessionRequest(title="Page session", persist_mode="session"),

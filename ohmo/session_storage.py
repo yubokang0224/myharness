@@ -209,6 +209,8 @@ def list_invocation_records(
     offset: int = 0,
     agent_name: str | None = None,
     status: str | None = None,
+    start_at: float | None = None,
+    end_at: float | None = None,
 ) -> list[dict[str, Any]]:
     """List non-conversation invocation records, newest first."""
     offset = max(0, offset)
@@ -225,6 +227,11 @@ def list_invocation_records(
             continue
         if status and (data.get("status") or "") != status:
             continue
+        created_at = float(data.get("created_at", path.stat().st_mtime) or 0.0)
+        if start_at is not None and created_at < start_at:
+            continue
+        if end_at is not None and created_at > end_at:
+            continue
         session_id = data.get("session_id")
         if session_id:
             seen_session_ids.add(str(session_id))
@@ -240,7 +247,7 @@ def list_invocation_records(
                 "request_content": data.get("request_content"),
                 "response_text": data.get("response_text"),
                 "error": data.get("error"),
-                "created_at": data.get("created_at", path.stat().st_mtime),
+                "created_at": created_at,
                 "message_count": data.get("message_count", len(data.get("messages", []))),
                 "tool_call_count": len(data.get("tool_calls", [])) if isinstance(data.get("tool_calls"), list) else 0,
             }
@@ -264,6 +271,11 @@ def list_invocation_records(
             fallback_status = "completed" if data.get("messages") else "created"
             if status and fallback_status != status:
                 continue
+            created_at = float(data.get("created_at", path.stat().st_mtime) or 0.0)
+            if start_at is not None and created_at < start_at:
+                continue
+            if end_at is not None and created_at > end_at:
+                continue
             messages = data.get("messages") if isinstance(data.get("messages"), list) else []
             response_text = ""
             for msg in reversed(messages):
@@ -286,7 +298,7 @@ def list_invocation_records(
                     "request_content": data.get("summary"),
                     "response_text": response_text or None,
                     "error": None,
-                    "created_at": data.get("created_at", path.stat().st_mtime),
+                    "created_at": created_at,
                     "message_count": data.get("message_count", len(messages)),
                     "tool_call_count": 0,
                 }
@@ -302,6 +314,8 @@ def count_invocation_records(
     *,
     agent_name: str | None = None,
     status: str | None = None,
+    start_at: float | None = None,
+    end_at: float | None = None,
 ) -> int:
     """Count invocation records after applying filters."""
     return len(
@@ -311,6 +325,8 @@ def count_invocation_records(
             offset=0,
             agent_name=agent_name,
             status=status,
+            start_at=start_at,
+            end_at=end_at,
         )
     )
 

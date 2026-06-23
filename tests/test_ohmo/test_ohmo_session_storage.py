@@ -125,6 +125,43 @@ def test_ohmo_invocation_records_support_offset_pagination(tmp_path: Path):
     assert {item["session_id"] for item in first_page}.isdisjoint({item["session_id"] for item in second_page})
 
 
+def test_ohmo_invocation_records_support_time_filters(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    current_time = {"value": 1_000.0}
+    monkeypatch.setattr("ohmo.session_storage.time.time", lambda: current_time["value"])
+    save_invocation_record(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("old invoke")],
+        usage=UsageSnapshot(),
+        session_id="old-api-call",
+        agent_name="production-agent",
+        request_content="old invoke",
+        response_text="old done",
+    )
+    current_time["value"] = 2_000.0
+    save_invocation_record(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("new invoke")],
+        usage=UsageSnapshot(),
+        session_id="new-api-call",
+        agent_name="production-agent",
+        request_content="new invoke",
+        response_text="new done",
+    )
+
+    records = list_invocation_records(workspace, start_at=1_500.0, end_at=2_500.0)
+
+    assert [record["session_id"] for record in records] == ["new-api-call"]
+    assert count_invocation_records(workspace, start_at=1_500.0, end_at=2_500.0) == 1
+
+
 def test_ohmo_invocation_list_falls_back_to_api_session_snapshots(tmp_path: Path):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)

@@ -392,6 +392,9 @@ def _collect_artifacts_from_snapshot(snap: dict[str, Any], runtime: _RuntimeStat
 # Session CRUD
 # ---------------------------------------------------------------------------
 
+_SESSION_LIST_SCAN_LIMIT = 500
+
+
 @router.get("", response_model=list[SessionInfo])
 async def list_sessions(
     _user: Annotated[dict, Depends(get_current_user)],
@@ -402,7 +405,7 @@ async def list_sessions(
 ):
     """List all persisted sessions."""
     try:
-        snapshots = list_snapshots(workspace=runtime.workspace)
+        snapshots = list_snapshots(workspace=runtime.workspace, limit=_SESSION_LIST_SCAN_LIMIT)
     except Exception:
         snapshots = []
     result = []
