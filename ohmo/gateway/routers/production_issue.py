@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Annotated
 from urllib.parse import urljoin
 
@@ -81,11 +82,11 @@ async def _forward_production_issue(
     if not upstream_base_url:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="internal_api.base_url is not configured")
 
+    body = await request.body()
     upstream_url = urljoin(upstream_base_url.rstrip("/") + "/", f"ProductionIssue/{action}")
     headers = _forward_headers(request)
-    headers["Authorization"] = f"Bearer {_resolve_forward_token(request, credentials, settings.internal_api.dingtalk_token)}"
+    headers["Authorization"] = f"Bearer {_resolve_forward_token(request, credentials, settings.internal_api.dingtalk_token, body)}"
 
-    body = await request.body()
     async with httpx.AsyncClient(follow_redirects=False, timeout=30.0, trust_env=False) as client:
         upstream_response = await client.request(
             request.method,
@@ -106,8 +107,9 @@ def _resolve_forward_token(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None,
     dingtalk_token: str,
+    body: bytes,
 ) -> str:
-    source_channel = (request.headers.get(_SOURCE_CHANNEL_HEADER) or "").strip().lower()
+    source_channel = _source_channel(request, body)
     if source_channel == "dingtalk":
         token = dingtalk_token.strip()
         if token.lower().startswith("bearer "):
@@ -117,6 +119,30 @@ def _resolve_forward_token(
 
     _user, token = _decode_bearer_credentials(credentials)
     return token
+
+
+def _source_channel(request: Request, body: bytes) -> str:
+    header_channel = (request.headers.get(_SOURCE_CHANNEL_HEADER) or "").strip().lower()
+    if header_channel:
+        return header_channel
+    query_channel = (request.query_params.get("sourceChannel") or request.query_params.get("source_channel") or "").strip().lower()
+    if query_channel:
+        return query_channel
+    body_channel = _source_channel_from_json_body(body)
+    return body_channel.strip().lower()
+
+
+def _source_channel_from_json_body(body: bytes) -> str:
+    if not body:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("sourceChannel") or payload.get("source_channel")
+    return value if isinstance(value, str) else ""
 
 
 def _forward_headers(request: Request) -> dict[str, str]:

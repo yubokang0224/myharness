@@ -370,6 +370,48 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     assert b"title" in captured["kwargs"]["content"]
 
 
+def test_production_issue_proxy_detects_dingtalk_source_from_body(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"success":true}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured["headers"] = kwargs["headers"]
+            return FakeResponse()
+
+    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.post(
+        "/agent/api/v1/ProductionIssue/Insert",
+        json={"title": "现场问题", "sourceChannel": "dingtalk"},
+    )
+
+    assert response.status_code == 200
+    assert captured["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
+
+
 def test_production_issue_proxy_forwards_user_token_for_non_dingtalk(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "ohmo.gateway.routers.production_issue.load_settings",
