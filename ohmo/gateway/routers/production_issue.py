@@ -1,125 +1,129 @@
-"""Agent-side proxy routes for ProductionIssue APIs."""
+"""Production issue proxy routes for agent-side skill calls."""
 
 from __future__ import annotations
 
-import os
 from typing import Annotated
 from urllib.parse import urljoin
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from openharness.config.settings import load_settings
+from openharness.config import load_settings
 from ohmo.gateway.dependencies import _decode_bearer_credentials
 
-router = APIRouter(prefix="/ProductionIssue", tags=["production-issue"])
+router = APIRouter(prefix="/ProductionIssue", tags=["ProductionIssue"])
 
 _bearer_scheme = HTTPBearer(auto_error=False)
-_DINGTALK_INTERNAL_API_TOKEN_ENV = "OHMO_DINGTALK_INTERNAL_API_TOKEN"
-_DINGTALK_INTERNAL_API_DEFAULT_TOKEN = "123"
-
-
-async def _resolve_forward_token(
+_SOURCE_CHANNEL_HEADER = "x-ohmo-source-channel"
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+@router.post("/Insert")
+async def insert_production_issue(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
-) -> str:
-    if _source_channel(request) == "dingtalk":
-        return _dingtalk_internal_api_token()
-
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    _decode_bearer_credentials(credentials)
-    return credentials.credentials.strip()
-
-
-@router.post("/Insert")
-async def insert(
-    request: Request,
-    token: Annotated[str, Depends(_resolve_forward_token)],
 ) -> Response:
-    return await _forward(request, "POST", "/ProductionIssue/Insert", token)
+    return await _forward_production_issue("Insert", request, credentials)
 
 
 @router.post("/AppendProcess")
-async def append_process(
+async def append_production_issue_process(
     request: Request,
-    token: Annotated[str, Depends(_resolve_forward_token)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> Response:
-    return await _forward(request, "POST", "/ProductionIssue/AppendProcess", token)
+    return await _forward_production_issue("AppendProcess", request, credentials)
 
 
 @router.post("/UpdateStatus")
-async def update_status(
+async def update_production_issue_status(
     request: Request,
-    token: Annotated[str, Depends(_resolve_forward_token)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> Response:
-    return await _forward(request, "POST", "/ProductionIssue/UpdateStatus", token)
+    return await _forward_production_issue("UpdateStatus", request, credentials)
 
 
 @router.get("/GetListPaged")
-async def get_list_paged(
+async def get_production_issue_list(
     request: Request,
-    token: Annotated[str, Depends(_resolve_forward_token)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> Response:
-    return await _forward(request, "GET", "/ProductionIssue/GetListPaged", token)
+    return await _forward_production_issue("GetListPaged", request, credentials)
 
 
 @router.get("/Get")
-async def get_detail(
+async def get_production_issue(
     request: Request,
-    token: Annotated[str, Depends(_resolve_forward_token)],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> Response:
-    return await _forward(request, "GET", "/ProductionIssue/Get", token)
+    return await _forward_production_issue("Get", request, credentials)
 
 
-async def _forward(request: Request, method: str, path: str, token: str) -> Response:
-    base_url = _production_issue_upstream_base_url()
-    target_url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+async def _forward_production_issue(
+    action: str,
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> Response:
+    """Forward ProductionIssue skill calls to the configured upstream API."""
+
+    settings = load_settings()
+    upstream_base_url = settings.internal_api.base_url.strip()
+    if not upstream_base_url:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="internal_api.base_url is not configured")
+
+    upstream_url = urljoin(upstream_base_url.rstrip("/") + "/", f"ProductionIssue/{action}")
+    headers = _forward_headers(request)
+    headers["Authorization"] = f"Bearer {_resolve_forward_token(request, credentials, settings.internal_api.dingtalk_token)}"
+
     body = await request.body()
-    headers = {"Authorization": f"Bearer {token}"}
-    content_type = request.headers.get("content-type")
-    if content_type:
-        headers["Content-Type"] = content_type
-
-    async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
-        upstream = await client.request(
-            method,
-            target_url,
+    async with httpx.AsyncClient(follow_redirects=False, timeout=30.0, trust_env=False) as client:
+        upstream_response = await client.request(
+            request.method,
+            upstream_url,
             params=dict(request.query_params),
-            content=body if body else None,
             headers=headers,
+            content=body,
         )
 
     return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        media_type=upstream.headers.get("content-type"),
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        media_type=upstream_response.headers.get("content-type"),
     )
 
 
-def _production_issue_upstream_base_url() -> str:
-    base_url = load_settings().internal_api.base_url.strip()
-    if not base_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ProductionIssue upstream is not configured. Set internal_api.base_url.",
-        )
-    return base_url
+def _resolve_forward_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+    dingtalk_token: str,
+) -> str:
+    source_channel = (request.headers.get(_SOURCE_CHANNEL_HEADER) or "").strip().lower()
+    if source_channel == "dingtalk":
+        token = dingtalk_token.strip()
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if token:
+            return token
 
-
-def _dingtalk_internal_api_token() -> str:
-    raw = os.environ.get(_DINGTALK_INTERNAL_API_TOKEN_ENV, _DINGTALK_INTERNAL_API_DEFAULT_TOKEN)
-    token = raw.strip()
-    if token.lower().startswith("bearer "):
-        token = token[7:].strip()
+    _user, token = _decode_bearer_credentials(credentials)
     return token
 
 
-def _source_channel(request: Request) -> str:
-    return request.headers.get("x-ohmo-source-channel", "").strip().lower()
+def _forward_headers(request: Request) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in request.headers.items():
+        lower_key = key.lower()
+        if lower_key in _HOP_BY_HOP_HEADERS or lower_key == "authorization" or lower_key == _SOURCE_CHANNEL_HEADER:
+            continue
+        headers[key] = value
+    return headers

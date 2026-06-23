@@ -321,7 +321,12 @@ def test_gateway_app_mounts_production_issue_proxy(tmp_path):
 def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(internal_api={"base_url": "http://api.internal:5000"}),
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
     )
     captured: dict[str, object] = {}
 
@@ -361,7 +366,7 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     assert response.json() == {"success": True}
     assert captured["method"] == "POST"
     assert captured["url"] == "http://api.internal:5000/ProductionIssue/Insert"
-    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer 123"
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
     assert b"title" in captured["kwargs"]["content"]
 
 

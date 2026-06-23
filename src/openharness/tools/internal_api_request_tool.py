@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, Literal
 from urllib.parse import urljoin
 
@@ -53,11 +52,15 @@ class InternalApiRequestTool(BaseTool):
             return ToolResult(output=f"internal_api_request failed: {exc}", is_error=True)
 
         try:
+            headers = _headers_with_channel_context(
+                arguments.headers,
+                metadata=context.metadata,
+            )
             response, auth_attached = await _request_with_auth_per_redirect(
                 method=arguments.method,
                 url=url,
                 params=arguments.params,
-                headers=arguments.headers,
+                headers=headers,
                 json_body=arguments.json_body,
                 timeout=arguments.timeout,
                 metadata=context.metadata,
@@ -98,13 +101,12 @@ async def _request_with_auth_per_redirect(
     current_url = url
     current_params = params
     auth_attached_any = False
-    request_headers_base = _headers_with_channel_context(headers, metadata)
     async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, trust_env=False) as client:
         for redirect_count in range(MAX_REDIRECTS + 1):
             validate_http_url(current_url)
             request_url, request_headers, attached = apply_internal_api_auth(
                 current_url,
-                request_headers_base,
+                headers,
                 metadata=metadata,
             )
             auth_attached_any = auth_attached_any or attached
@@ -130,20 +132,18 @@ async def _request_with_auth_per_redirect(
 
 def _headers_with_channel_context(
     headers: dict[str, str] | None,
-    metadata: Mapping[str, Any],
+    *,
+    metadata: dict[str, Any] | None,
 ) -> dict[str, str]:
     next_headers = dict(headers or {})
-    if _has_header(next_headers, "X-OHMO-Source-Channel"):
+    if any(key.lower() == "x-ohmo-source-channel" for key in next_headers):
+        return next_headers
+    if not isinstance(metadata, dict):
         return next_headers
     channel_context = metadata.get("channel_context")
-    if not isinstance(channel_context, Mapping):
+    if not isinstance(channel_context, dict):
         return next_headers
     channel = channel_context.get("channel")
     if isinstance(channel, str) and channel.strip():
         next_headers["X-OHMO-Source-Channel"] = channel.strip()
     return next_headers
-
-
-def _has_header(headers: Mapping[str, str], name: str) -> bool:
-    lowered = name.lower()
-    return any(key.lower() == lowered for key in headers)

@@ -519,6 +519,7 @@ class InternalApiSettings(BaseModel):
 
     base_url: str = ""
     allowlist: list[str] = Field(default_factory=list)
+    dingtalk_token: str = "123"
 
 
 class Settings(BaseModel):

@@ -23,15 +23,17 @@ def make_hsjm_auth_metadata(token: str | None) -> dict[str, str]:
     return {"token": token} if token else {}
 
 
-def resolve_hsjm_user_token(metadata: Mapping[str, Any] | None = None) -> str:
+def resolve_hsjm_user_token(
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
     """Return the current HSJM user token from tool metadata or task env."""
     if metadata:
         raw_auth = metadata.get("hsjm_auth")
         if isinstance(raw_auth, Mapping):
             token = raw_auth.get("token")
             if isinstance(token, str) and token.strip():
-                return token.strip()
-    return os.environ.get(USER_BEARER_TOKEN_ENV, "").strip()
+                return _normalize_bearer_token(token)
+    return _normalize_bearer_token(os.environ.get(USER_BEARER_TOKEN_ENV, ""))
 
 
 def resolve_internal_api_url(url: str, settings: Settings | None = None) -> str:
@@ -85,6 +87,13 @@ def apply_internal_api_auth(
         return resolved_url, next_headers, False
     next_headers["Authorization"] = f"Bearer {token}"
     return resolved_url, next_headers, True
+
+
+def _normalize_bearer_token(value: str) -> str:
+    token = (value or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
 
 
 def normalized_origin(url: str) -> str | None:
