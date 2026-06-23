@@ -1227,6 +1227,90 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_stream_message_sets_dingtalk_internal_api_token(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    captured: dict[str, object] = {}
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
+                self.tool_metadata: dict[str, object] = {}
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                captured["hsjm_auth"] = self.tool_metadata.get("hsjm_auth")
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="dingtalk:ops-bot", sender_id="u1", chat_id="c1", content="check")
+    updates = [u async for u in pool.stream_message(message, "dingtalk:ops-bot:ops-agent:c1:u1")]
+
+    assert updates[-1].text == "done"
+    assert captured["hsjm_auth"] == {"token": "123"}
+
+
+@pytest.mark.asyncio
+async def test_runtime_pool_stream_message_preserves_non_dingtalk_internal_api_token(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    captured: dict[str, object] = {}
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
+                self.tool_metadata: dict[str, object] = {"hsjm_auth": {"token": "web-token"}}
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                captured["hsjm_auth"] = self.tool_metadata.get("hsjm_auth")
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="feishu", sender_id="u1", chat_id="c1", content="check")
+    updates = [u async for u in pool.stream_message(message, "feishu:c1:u1")]
+
+    assert updates[-1].text == "done"
+    assert captured["hsjm_auth"] == {"token": "web-token"}
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_checkpoints_user_message_before_tool_results(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
