@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from openharness.tools.internal_api_request_tool import _headers_with_channel_context
+from openharness.tools.internal_api_request_tool import (
+    _coerce_json_body,
+    _headers_with_channel_context,
+    _json_body_with_channel_context,
+    _normalize_method,
+)
 from openharness.config.settings import Settings, load_settings
 from openharness.utils.internal_api_auth import apply_internal_api_auth, normalized_origin
 
@@ -80,6 +85,61 @@ def test_internal_api_request_headers_include_channel_context():
     )
 
     assert headers["X-OHMO-Source-Channel"] == "dingtalk"
+
+
+def test_internal_api_request_body_includes_production_issue_channel_context():
+    body = _json_body_with_channel_context(
+        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
+        {"title": "合同号识别错误"},
+        metadata={
+            "channel_context": {
+                "channel": "dingtalk",
+                "chat_id": "chat-1",
+                "sender_name": "俞晨",
+                "message_id": "msg-1",
+                "conversation_id": "conv-1",
+                "session_key": "dingtalk:dingtalk-bot:生产助手:chat-1:sender-1",
+                "attachment_paths": ["/tmp/receipt.png"],
+            }
+        },
+    )
+
+    assert body["sourceChannel"] == "dingtalk"
+    assert body["sourceChatId"] == "chat-1"
+    assert body["sourceSenderName"] == "俞晨"
+    assert body["sourceMessageId"] == "msg-1"
+    assert body["sourceConversationId"] == "conv-1"
+    assert body["reporterName"] == "俞晨"
+    assert "sourceSenderId" not in body
+    assert body["attachments"] == [
+        {
+            "fileName": "receipt.png",
+            "sourceLocalPath": "/tmp/receipt.png",
+            "sourceType": "dingtalk",
+        }
+    ]
+
+
+def test_internal_api_request_coerces_json_string_body():
+    body = _coerce_json_body('{"title":"测试","sourceChannel":"dingtalk"}', None)
+
+    assert body == {"title": "测试", "sourceChannel": "dingtalk"}
+
+
+def test_internal_api_request_accepts_body_alias_for_json():
+    body = _coerce_json_body(None, '{"title":"测试"}')
+
+    assert body == {"title": "测试"}
+
+
+def test_internal_api_request_defaults_production_issue_write_to_post_with_body():
+    method = _normalize_method(
+        "GET",
+        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
+        {"title": "测试"},
+    )
+
+    assert method == "POST"
 
 
 def test_apply_internal_api_auth_downgrades_external_url_without_token():

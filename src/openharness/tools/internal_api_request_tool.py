@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin
 
@@ -25,6 +27,7 @@ class InternalApiRequestInput(BaseModel):
     params: dict[str, str] | None = None
     headers: dict[str, str] | None = None
     json_body: Any = Field(default=None, alias="json")
+    body: Any = Field(default=None, description="Compatibility alias for JSON request bodies.")
     timeout: float = Field(default=30.0, ge=1.0, le=120.0)
     max_chars: int = Field(default=12000, ge=500, le=50000)
 
@@ -52,16 +55,23 @@ class InternalApiRequestTool(BaseTool):
             return ToolResult(output=f"internal_api_request failed: {exc}", is_error=True)
 
         try:
+            json_body_input = _coerce_json_body(arguments.json_body, arguments.body)
+            method = _normalize_method(arguments.method, url, json_body_input)
+            json_body = _json_body_with_channel_context(
+                url,
+                json_body_input,
+                metadata=context.metadata,
+            )
             headers = _headers_with_channel_context(
                 arguments.headers,
                 metadata=context.metadata,
             )
             response, auth_attached = await _request_with_auth_per_redirect(
-                method=arguments.method,
+                method=method,
                 url=url,
                 params=arguments.params,
                 headers=headers,
-                json_body=arguments.json_body,
+                json_body=json_body,
                 timeout=arguments.timeout,
                 metadata=context.metadata,
             )
@@ -147,3 +157,97 @@ def _headers_with_channel_context(
     if isinstance(channel, str) and channel.strip():
         next_headers["X-OHMO-Source-Channel"] = channel.strip()
     return next_headers
+
+
+def _coerce_json_body(json_body: Any, body: Any) -> Any:
+    candidate = json_body if json_body is not None else body
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            return candidate
+    return candidate
+
+
+def _normalize_method(method: str, url: str, json_body: Any) -> str:
+    normalized = str(method or "GET").upper()
+    if normalized == "GET" and json_body is not None and _is_production_issue_write_url(url):
+        return "POST"
+    return normalized
+
+
+def _json_body_with_channel_context(
+    url: str,
+    json_body: Any,
+    *,
+    metadata: dict[str, Any] | None,
+) -> Any:
+    if not _is_production_issue_url(url) or not isinstance(json_body, dict):
+        return json_body
+    if not isinstance(metadata, dict):
+        return json_body
+    channel_context = metadata.get("channel_context")
+    if not isinstance(channel_context, dict):
+        return json_body
+
+    channel = _metadata_text(channel_context.get("channel"))
+    if not channel:
+        return json_body
+
+    next_body = dict(json_body)
+    _set_if_missing(next_body, "sourceChannel", channel)
+    _set_if_missing(next_body, "sourceChatId", _metadata_text(channel_context.get("chat_id")))
+    _set_if_missing(next_body, "sourceSenderId", _metadata_text(channel_context.get("source_sender_id")))
+    _set_if_missing(next_body, "sourceSenderName", _metadata_text(channel_context.get("sender_name")))
+    _set_if_missing(next_body, "sourceMessageId", _metadata_text(channel_context.get("message_id")))
+    _set_if_missing(next_body, "sourceConversationId", _metadata_text(channel_context.get("conversation_id")))
+    _set_if_missing(next_body, "sourceSessionKey", _metadata_text(channel_context.get("session_key")))
+    _set_if_missing(next_body, "reporterName", _metadata_text(channel_context.get("sender_name")))
+
+    if not next_body.get("attachments"):
+        attachment_paths = channel_context.get("attachment_paths")
+        if isinstance(attachment_paths, list):
+            attachments = [
+                {
+                    "fileName": Path(str(path)).name,
+                    "sourceLocalPath": str(path),
+                    "sourceType": channel,
+                }
+                for path in attachment_paths
+                if str(path).strip()
+            ]
+            if attachments:
+                next_body["attachments"] = attachments
+
+    return next_body
+
+
+def _is_production_issue_url(url: str) -> bool:
+    return "/productionissue/" in url.lower()
+
+
+def _is_production_issue_write_url(url: str) -> bool:
+    normalized = url.lower().rstrip("/")
+    return any(
+        normalized.endswith(path)
+        for path in (
+            "/productionissue/insert",
+            "/productionissue/appendprocess",
+            "/productionissue/updatestatus",
+        )
+    )
+
+
+def _metadata_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _set_if_missing(body: dict[str, Any], key: str, value: str) -> None:
+    if not value:
+        return
+    if key in body and body[key]:
+        return
+    body[key] = value

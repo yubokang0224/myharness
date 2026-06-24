@@ -299,6 +299,55 @@ class DingTalkChannel(BaseChannel):
             return None
         return unquote(match.group(1).strip())
 
+    @classmethod
+    def _download_filename(
+        cls,
+        filename: str | None,
+        content_disposition: str | None,
+        fallback: str,
+        content_type: str,
+        content: bytes,
+    ) -> str:
+        name = filename or cls._filename_from_content_disposition(content_disposition) or fallback
+        extension = cls._image_extension_from_bytes(content) or cls._image_extension_from_content_type(content_type)
+        if not extension:
+            return name
+        current_extension = cls._normalized_image_extension(Path(name).suffix)
+        if current_extension == extension:
+            return name
+        if current_extension in cls._IMAGE_EXTS or not Path(name).suffix:
+            return f"{Path(name).stem or 'image'}{extension}"
+        return name
+
+    @staticmethod
+    def _image_extension_from_bytes(content: bytes) -> str | None:
+        if content.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if content.startswith(b"BM"):
+            return ".bmp"
+        if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+            return ".webp"
+        return None
+
+    @classmethod
+    def _image_extension_from_content_type(cls, content_type: str) -> str | None:
+        if not content_type.startswith("image/"):
+            return None
+        return cls._normalized_image_extension(mimetypes.guess_extension(content_type))
+
+    @staticmethod
+    def _normalized_image_extension(extension: str | None) -> str | None:
+        if not extension:
+            return None
+        lowered = extension.lower()
+        if lowered in {".jpe", ".jpeg"}:
+            return ".jpg"
+        return lowered
+
     @staticmethod
     def _parse_json_object(value: Any) -> Any:
         if not isinstance(value, str):
@@ -576,10 +625,12 @@ class DingTalkChannel(BaseChannel):
                     continue
 
                 content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
-                filename = (
-                    item.get("filename")
-                    or self._filename_from_content_disposition(resp.headers.get("content-disposition"))
-                    or f"{message_id}_{index}"
+                filename = self._download_filename(
+                    item.get("filename"),
+                    resp.headers.get("content-disposition"),
+                    f"{message_id}_{index}",
+                    content_type,
+                    resp.content,
                 )
                 safe_name = self._safe_filename(filename)
                 if "." not in safe_name:

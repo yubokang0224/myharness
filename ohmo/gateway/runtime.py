@@ -129,6 +129,7 @@ class OhmoSessionRuntimePool:
             self._session_agents[session_key] = agent_def.name
         bundle = self._bundles.get(session_key)
         if bundle is not None:
+            self._apply_agent_tool_policy(bundle, agent_def)
             logger.info(
                 "ohmo runtime reusing session session_key=%s session_id=%s prompt=%r",
                 session_key,
@@ -702,7 +703,12 @@ def _apply_channel_context_metadata(
         "raw_channel": message.channel,
         "chat_id": message.chat_id,
         "sender_id": message.sender_id,
+        "source_sender_id": _optional_str(message.metadata.get("source_sender_id")),
+        "sender_name": _optional_str(message.metadata.get("sender_name")),
+        "message_id": _optional_str(message.metadata.get("message_id")),
+        "conversation_id": _optional_str(message.metadata.get("conversation_id")),
         "session_key": session_key,
+        "attachment_paths": list(message.media or []),
     }
 
 

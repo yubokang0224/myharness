@@ -367,7 +367,9 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     assert captured["method"] == "POST"
     assert captured["url"] == "http://api.internal:5000/ProductionIssue/Insert"
     assert captured["kwargs"]["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
-    assert b"title" in captured["kwargs"]["content"]
+    forwarded_body = json.loads(captured["kwargs"]["content"])
+    assert forwarded_body["title"]
+    assert forwarded_body["sourceChannel"] == "dingtalk"
 
 
 def test_production_issue_proxy_detects_dingtalk_source_from_body(tmp_path, monkeypatch):
@@ -410,6 +412,180 @@ def test_production_issue_proxy_detects_dingtalk_source_from_body(tmp_path, monk
 
     assert response.status_code == 200
     assert captured["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
+
+
+def test_production_issue_proxy_uploads_dingtalk_attachment_before_forwarding(tmp_path, monkeypatch):
+    media_root = tmp_path / "media"
+    media_dir = media_root / "dingtalk_ops-bot"
+    media_dir.mkdir(parents=True)
+    image_path = media_dir / "receipt.png"
+    image_path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+    monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(media_root))
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __init__(self, content: bytes, *, status_code: int = 200):
+            self.status_code = status_code
+            self.content = content
+            self.headers = {"content-type": "application/json"}
+            self.text = content.decode("utf-8")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers=None, files=None):
+            filename, content, mime_type = files["file"]
+            captured["upload"] = {
+                "url": url,
+                "headers": headers,
+                "filename": filename,
+                "content": content,
+                "mime_type": mime_type,
+            }
+            return FakeResponse(
+                b'{"isSuccess":true,"backResult":"/WebUp_Files/images/uploaded.jpg"}'
+            )
+
+        async def request(self, method, url, **kwargs):
+            captured["forward"] = {"method": method, "url": url, "kwargs": kwargs}
+            return FakeResponse(b'{"success":true}')
+
+    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.post(
+        "/agent/api/v1/ProductionIssue/Insert",
+        json={
+            "title": "现场问题",
+            "sourceChannel": "dingtalk",
+            "attachments": [
+                {
+                    "fileName": "receipt.png",
+                    "sourceLocalPath": str(image_path),
+                    "sourceType": "dingtalk",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    upload = captured["upload"]
+    assert upload["url"] == "http://api.internal:5000/Common/UploadImage"
+    assert upload["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
+    assert upload["filename"] == "receipt.jpg"
+    assert upload["mime_type"] == "image/jpeg"
+    forwarded_body = json.loads(captured["forward"]["kwargs"]["content"])
+    attachment = forwarded_body["attachments"][0]
+    assert attachment["fileUrl"] == "/WebUp_Files/images/uploaded.jpg"
+    assert attachment["fileName"] == "receipt.jpg"
+    assert attachment["fileSize"] == len(b"\xff\xd8\xff\xe0fake-jpeg")
+    assert attachment["mimeType"] == "image/jpeg"
+    assert attachment["sourceLocalPath"] == str(image_path)
+
+
+def test_production_issue_proxy_uploads_dingtalk_file_before_forwarding(tmp_path, monkeypatch):
+    media_root = tmp_path / "media"
+    media_dir = media_root / "dingtalk_ops-bot"
+    media_dir.mkdir(parents=True)
+    file_path = media_dir / "report.pdf"
+    file_path.write_bytes(b"%PDF-1.7 fake")
+    monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(media_root))
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def __init__(self, content: bytes, *, status_code: int = 200):
+            self.status_code = status_code
+            self.content = content
+            self.headers = {"content-type": "application/json"}
+            self.text = content.decode("utf-8")
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, *, headers=None, files=None):
+            filename, content, mime_type = files["file"]
+            captured["upload"] = {
+                "url": url,
+                "headers": headers,
+                "filename": filename,
+                "content": content,
+                "mime_type": mime_type,
+            }
+            return FakeResponse(
+                b'{"isSuccess":true,"backResult":"/WebUp_Files/files/uploaded.pdf"}'
+            )
+
+        async def request(self, method, url, **kwargs):
+            captured["forward"] = {"method": method, "url": url, "kwargs": kwargs}
+            return FakeResponse(b'{"success":true}')
+
+    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.post(
+        "/agent/api/v1/ProductionIssue/AppendProcess",
+        json={
+            "issueId": 1,
+            "content": "补充检测报告",
+            "sourceChannel": "dingtalk",
+            "attachments": [
+                {
+                    "fileName": "report.pdf",
+                    "sourceLocalPath": str(file_path),
+                    "sourceType": "dingtalk",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    upload = captured["upload"]
+    assert upload["url"] == "http://api.internal:5000/Common/UploadFile"
+    assert upload["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
+    assert upload["filename"] == "report.pdf"
+    assert upload["mime_type"] == "application/pdf"
+    forwarded_body = json.loads(captured["forward"]["kwargs"]["content"])
+    attachment = forwarded_body["attachments"][0]
+    assert attachment["fileUrl"] == "/WebUp_Files/files/uploaded.pdf"
+    assert attachment["fileName"] == "report.pdf"
+    assert attachment["fileSize"] == len(b"%PDF-1.7 fake")
+    assert attachment["mimeType"] == "application/pdf"
 
 
 def test_production_issue_proxy_forwards_user_token_for_non_dingtalk(tmp_path, monkeypatch):
@@ -1070,6 +1246,20 @@ async def test_dingtalk_channel_inbound_uses_instance_channel_and_agent_metadata
     assert inbound.metadata["platform"] == "dingtalk"
 
 
+def test_dingtalk_download_filename_uses_detected_image_extension():
+    from openharness.channels.impl.dingtalk import DingTalkChannel
+
+    filename = DingTalkChannel._download_filename(
+        "image.png",
+        None,
+        "fallback",
+        "image/png",
+        b"\xff\xd8\xff\xe0fake-jpeg",
+    )
+
+    assert filename == "image.jpg"
+
+
 @pytest.mark.asyncio
 async def test_dingtalk_send_prefers_robot_code_over_client_id():
     from openharness.channels.impl.dingtalk import DingTalkChannel
@@ -1331,6 +1521,49 @@ async def test_runtime_pool_applies_dingtalk_bound_agent_prompt_model_and_tools(
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_reapplies_agent_tool_policy_to_reused_bundle(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    disallowed_tools: list[str] = []
+
+    def fake_get_agent_definition(name):
+        return AgentDefinition(
+            name=name,
+            description="Ops assistant",
+            model="ops-model",
+            tools=["Read", "Bash"],
+            disallowed_tools=list(disallowed_tools),
+        )
+
+    async def fake_build_runtime(**kwargs):
+        return SimpleNamespace(
+            engine=SimpleNamespace(set_system_prompt=lambda prompt: None, messages=[]),
+            session_id="newsession",
+            current_settings=lambda: Settings(system_prompt=kwargs["system_prompt"], model=kwargs["model"]),
+            commands=create_default_command_registry(),
+            tool_registry=SimpleNamespace(_tools={"file_read": object(), "bash": object()}),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.get_agent_definition", fake_get_agent_definition)
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    session_key = "dingtalk:ops-bot:ops-agent:u1:u1"
+    bundle = await pool.get_bundle(session_key, agent_name="ops-agent")
+    assert "bash" in bundle.tool_registry._tools
+
+    disallowed_tools.append("Bash")
+    reused = await pool.get_bundle(session_key, agent_name="ops-agent")
+
+    assert reused is bundle
+    assert set(reused.tool_registry._tools) == {"file_read"}
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
@@ -1410,7 +1643,18 @@ async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_pat
     monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
 
     pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
-    message = InboundMessage(channel="dingtalk:ops-bot", sender_id="u1", chat_id="c1", content="check")
+    message = InboundMessage(
+        channel="dingtalk:ops-bot",
+        sender_id="u1",
+        chat_id="c1",
+        content="check",
+        media=["/tmp/photo.png"],
+        metadata={
+            "sender_name": "Alice",
+            "message_id": "msg-1",
+            "conversation_id": "conv-1",
+        },
+    )
     updates = [u async for u in pool.stream_message(message, "dingtalk:ops-bot:ops-agent:c1:u1")]
 
     assert updates[-1].text == "done"
@@ -1419,7 +1663,12 @@ async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_pat
         "raw_channel": "dingtalk:ops-bot",
         "chat_id": "c1",
         "sender_id": "u1",
+        "source_sender_id": None,
+        "sender_name": "Alice",
+        "message_id": "msg-1",
+        "conversation_id": "conv-1",
         "session_key": "dingtalk:ops-bot:ops-agent:c1:u1",
+        "attachment_paths": ["/tmp/photo.png"],
     }
     assert captured["hsjm_auth"] is None
 
