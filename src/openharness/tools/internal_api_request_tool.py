@@ -174,7 +174,11 @@ def _coerce_json_body(json_body: Any, body: Any) -> Any:
 
 def _normalize_method(method: str, url: str, json_body: Any) -> str:
     normalized = str(method or "GET").upper()
-    if normalized == "GET" and json_body is not None and _is_production_issue_write_url(url):
+    if (
+        normalized == "GET"
+        and json_body is not None
+        and (_is_production_issue_write_url(url) or _is_board_memo_write_url(url))
+    ):
         return "POST"
     return normalized
 
@@ -185,7 +189,7 @@ def _json_body_with_channel_context(
     *,
     metadata: dict[str, Any] | None,
 ) -> Any:
-    if not _is_production_issue_url(url) or not isinstance(json_body, dict):
+    if not (_is_production_issue_url(url) or _is_board_memo_url(url)) or not isinstance(json_body, dict):
         return json_body
     if not isinstance(metadata, dict):
         return json_body
@@ -237,6 +241,22 @@ def _is_production_issue_write_url(url: str) -> bool:
             "/productionissue/insert",
             "/productionissue/appendprocess",
             "/productionissue/updatestatus",
+        )
+    )
+
+
+def _is_board_memo_url(url: str) -> bool:
+    return "/boardmemo/" in url.lower()
+
+
+def _is_board_memo_write_url(url: str) -> bool:
+    normalized = url.lower().rstrip("/")
+    return any(
+        normalized.endswith(path)
+        for path in (
+            "/boardmemo/insert",
+            "/boardmemo/appenditem",
+            "/boardmemo/updateitem",
         )
     )
 

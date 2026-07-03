@@ -73,6 +73,7 @@ class OhmoGatewayBridge:
 
     async def run(self) -> None:
         self._running = True
+        logger.info("ohmo gateway bridge started bus=%s", hex(id(self._bus)))
         while self._running:
             try:
                 message = await asyncio.wait_for(self._bus.consume_inbound(), timeout=1.0)
@@ -80,41 +81,51 @@ class OhmoGatewayBridge:
                 continue
             except asyncio.CancelledError:
                 break
+            except Exception:
+                logger.exception("ohmo gateway bridge consume failed")
+                continue
 
-            session_key = session_key_for_message(message)
-            logger.info(
-                "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
-                message.channel,
-                message.chat_id,
-                message.sender_id,
-                session_key,
-                _content_snippet(message.content),
-            )
-            if message.content.strip() == "/stop":
-                await self._handle_stop(message, session_key)
-                continue
-            if message.content.strip() == "/restart":
-                await self._handle_restart(message, session_key)
-                continue
-            if self._is_dingtalk_new_dialog_command(message):
-                await self._handle_new_dialog(message, session_key)
-                continue
-            await self._interrupt_session(
-                session_key,
-                reason="replaced by a newer user message",
-                notify=OutboundMessage(
-                    channel=message.channel,
-                    chat_id=message.chat_id,
-                    content="⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。",
-                    metadata={"_progress": True, "_session_key": session_key},
-                ),
-            )
-            task = asyncio.create_task(
-                self._process_message(message, session_key),
-                name=f"ohmo-session:{session_key}",
-            )
-            self._session_tasks[session_key] = task
-            task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+            try:
+                session_key = session_key_for_message(message)
+                logger.info(
+                    "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
+                    message.channel,
+                    message.chat_id,
+                    message.sender_id,
+                    session_key,
+                    _content_snippet(message.content),
+                )
+                if message.content.strip() == "/stop":
+                    await self._handle_stop(message, session_key)
+                    continue
+                if message.content.strip() == "/restart":
+                    await self._handle_restart(message, session_key)
+                    continue
+                if self._is_dingtalk_new_dialog_command(message):
+                    await self._handle_new_dialog(message, session_key)
+                    continue
+                await self._interrupt_session(
+                    session_key,
+                    reason="replaced by a newer user message",
+                    notify=OutboundMessage(
+                        channel=message.channel,
+                        chat_id=message.chat_id,
+                        content="⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。",
+                        metadata={"_progress": True, "_session_key": session_key},
+                    ),
+                )
+                task = asyncio.create_task(
+                    self._process_message(message, session_key),
+                    name=f"ohmo-session:{session_key}",
+                )
+                self._session_tasks[session_key] = task
+                task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+            except Exception:
+                logger.exception(
+                    "ohmo gateway bridge failed to dispatch message channel=%s chat_id=%s",
+                    getattr(message, "channel", "?"),
+                    getattr(message, "chat_id", "?"),
+                )
 
     def stop(self) -> None:
         self._running = False

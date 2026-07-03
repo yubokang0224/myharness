@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ohmo.gateway.dependencies import get_runtime
-from ohmo.gateway.routers import agents, chat, invocations, models, production_issue, skills, tasks
+from ohmo.gateway.routers import agents, board_memo, chat, invocations, models, production_issue, skills, tasks
 from ohmo.workspace import initialize_workspace
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,7 @@ def create_app(
     app.include_router(tasks.router, prefix=prefix)
     app.include_router(models.router, prefix=prefix)
     app.include_router(production_issue.router, prefix=prefix)
+    app.include_router(board_memo.router, prefix=prefix)
 
     @app.get("/health")
     async def health() -> dict:
