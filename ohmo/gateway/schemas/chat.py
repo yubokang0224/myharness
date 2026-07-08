@@ -103,6 +103,11 @@ class SSEToolResult(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class SSEArtifact(BaseModel):
+    event: Literal["artifact_created"] = "artifact_created"
+    artifact: ArtifactInfo
+
+
 class SSEDone(BaseModel):
     event: Literal["done"] = "done"
     usage: dict[str, Any] | None = None
@@ -117,6 +122,16 @@ class SSEError(BaseModel):
 class SSEStatus(BaseModel):
     event: Literal["status"] = "status"
     message: str
+
+
+class SSECompact(BaseModel):
+    """Context-compaction progress so the client can show a persistent indicator."""
+
+    event: Literal["compact"] = "compact"
+    phase: str
+    trigger: str = "auto"
+    message: str | None = None
+    attempt: int | None = None
 
 
 class SSEPermissionRequest(BaseModel):

@@ -16,13 +16,19 @@ IGNORED_ARTIFACT_DIRS = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".tox",
     ".venv",
     "__pycache__",
+    "__pypackages__",
     "bin",
     "dist",
+    "env",
+    "envs",
     "node_modules",
     "obj",
+    "site-packages",
     "target",
+    "venv",
 }
 
 TEXT_EXTENSIONS = {

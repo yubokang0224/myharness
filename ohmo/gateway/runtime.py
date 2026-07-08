@@ -13,6 +13,8 @@ import string
 
 from openharness.channels.bus.events import InboundMessage
 from openharness.commands import CommandContext, CommandResult
+from openharness.config.paths import get_data_dir
+from openharness.tools.artifacts import IGNORED_ARTIFACT_DIRS
 from openharness.coordinator.agent_definitions import AgentDefinition, get_agent_definition
 from openharness.engine.messages import (
     ConversationMessage,
@@ -61,6 +63,8 @@ _CHANNEL_THINKING_PHRASES_EN = (
 _TEXT_PREVIEW_BYTES = 4096
 _TEXT_PREVIEW_CHARS = 900
 _BINARY_HEAD_BYTES = 32
+# Cap on files attached to a single outbound channel reply; extras are listed by name.
+_MAX_OUTBOUND_ARTIFACTS = 5
 _IMAGE_FALLBACK_NOTE = (
     "[Image attachment omitted because the active model does not support image input. "
     "Ask the user to resend the image as text or switch to a vision-capable model.]"
@@ -99,6 +103,7 @@ class OhmoSessionRuntimePool:
         self._bundles: dict[str, RuntimeBundle] = {}
         self._session_agents: dict[str, str] = {}
         self._session_metadata: dict[str, dict[str, str | None]] = {}
+        self._artifact_roots = _compute_artifact_roots(self._cwd, self._workspace)
 
     @property
     def active_sessions(self) -> int:
@@ -304,6 +309,7 @@ class OhmoSessionRuntimePool:
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             reply_parts: list[str] = []
+            artifact_paths: list[str] = []
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
                     async for update in self._convert_stream_event(
@@ -313,6 +319,7 @@ class OhmoSessionRuntimePool:
                         session_key=session_key,
                         content=user_prompt,
                         reply_parts=reply_parts,
+                        artifact_paths=artifact_paths,
                     ):
                         yield update
             except MaxTurnsExceeded as exc:
@@ -323,11 +330,17 @@ class OhmoSessionRuntimePool:
                 )
             await self._save_snapshot(bundle, session_key, user_prompt)
             reply = "".join(reply_parts).strip()
+            prefers_chinese = _prefers_chinese_progress(user_prompt)
+            send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+            if send_media and not reply:
+                reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+            if overflow_note:
+                reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
             if reply:
                 yield GatewayStreamUpdate(
                     kind="final",
                     text=reply,
-                    metadata={"_session_key": session_key},
+                    metadata={"_session_key": session_key, "_artifact_paths": send_media},
                 )
             return
 
@@ -344,6 +357,7 @@ class OhmoSessionRuntimePool:
     ):
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
         reply_parts: list[str] = []
+        artifact_paths: list[str] = []
         yield GatewayStreamUpdate(
             kind="progress",
             text=_format_channel_progress(
@@ -387,6 +401,7 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             content=user_prompt,
                             reply_parts=reply_parts,
+                            artifact_paths=artifact_paths,
                         ):
                             yield update
                     break
@@ -397,6 +412,7 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     content=user_prompt,
                     reply_parts=reply_parts,
+                    artifact_paths=artifact_paths,
                 ):
                     yield update
         except MaxTurnsExceeded as exc:
@@ -409,17 +425,24 @@ class OhmoSessionRuntimePool:
             return
         await self._save_snapshot(bundle, session_key, user_prompt)
         reply = "".join(reply_parts).strip()
+        prefers_chinese = _prefers_chinese_progress(user_prompt)
+        send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+        if send_media and not reply:
+            reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+        if overflow_note:
+            reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
         if reply:
             logger.info(
-                "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
+                "ohmo runtime processing complete session_key=%s session_id=%s reply=%r media=%s",
                 session_key,
                 bundle.session_id,
                 _content_snippet(reply),
+                len(send_media),
             )
             yield GatewayStreamUpdate(
                 kind="final",
                 text=reply,
-                metadata={"_session_key": session_key},
+                metadata={"_session_key": session_key, "_artifact_paths": send_media},
             )
 
     async def _convert_stream_event(
@@ -431,6 +454,7 @@ class OhmoSessionRuntimePool:
         session_key: str,
         content: str,
         reply_parts: list[str],
+        artifact_paths: list[str],
     ):
         if isinstance(event, AssistantTextDelta):
             reply_parts.append(event.text)
@@ -515,6 +539,12 @@ class OhmoSessionRuntimePool:
                 bundle.session_id,
                 event.tool_name,
             )
+            if not event.is_error:
+                for path in _artifact_paths_from_tool_metadata(event.metadata, self._artifact_roots):
+                    # Keep last-write order so repeated writes surface once, at the end.
+                    if path in artifact_paths:
+                        artifact_paths.remove(path)
+                    artifact_paths.append(path)
             return
         if isinstance(event, ErrorEvent):
             logger.error(
@@ -718,6 +748,67 @@ def _content_snippet(text: str, *, limit: int = 160) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+def _compute_artifact_roots(*candidates: object) -> list[Path]:
+    """Resolve directories that generated files may legitimately live under."""
+    roots: list[Path] = []
+    for raw in (*candidates, get_data_dir() / "tool_artifacts"):
+        if not raw:
+            continue
+        try:
+            root = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _artifact_paths_from_tool_metadata(metadata: object, roots: list[Path]) -> list[str]:
+    """Extract validated local file paths from a tool result's artifact metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    raw_artifacts = metadata.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return []
+    paths: list[str] = []
+    for raw_artifact in raw_artifacts:
+        if not isinstance(raw_artifact, dict):
+            continue
+        raw_path = raw_artifact.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if not path.is_file() or not any(path.is_relative_to(root) for root in roots):
+            continue
+        if any(part in IGNORED_ARTIFACT_DIRS for part in path.parts):
+            continue
+        if str(path) not in paths:
+            paths.append(str(path))
+    return paths
+
+
+def _split_outbound_artifacts(paths: list[str], *, prefers_chinese: bool) -> tuple[list[str], str]:
+    """Return (paths to attach, overflow note) honouring the per-reply cap."""
+    if len(paths) <= _MAX_OUTBOUND_ARTIFACTS:
+        return list(paths), ""
+    send = paths[-_MAX_OUTBOUND_ARTIFACTS:]
+    skipped = [Path(path).name for path in paths[: -_MAX_OUTBOUND_ARTIFACTS]]
+    if prefers_chinese:
+        note = (
+            f"📎 本轮共生成 {len(paths)} 个文件，已随消息发送最新 {len(send)} 个。"
+            f"未发送：{'、'.join(skipped)}。"
+        )
+    else:
+        note = (
+            f"📎 {len(paths)} files were generated this turn; the latest {len(send)} are attached. "
+            f"Not sent: {', '.join(skipped)}."
+        )
+    return send, note
 
 
 def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:

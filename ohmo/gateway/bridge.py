@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
+from openharness.utils.trace import set_trace_id
 
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -86,6 +87,9 @@ class OhmoGatewayBridge:
                 continue
 
             try:
+                # One trace id per inbound message; asyncio context propagation
+                # carries it into the session task, engine, and tool logs.
+                set_trace_id()
                 session_key = session_key_for_message(message)
                 logger.info(
                     "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
@@ -219,9 +223,12 @@ class OhmoGatewayBridge:
         }
         try:
             reply = ""
+            reply_media: list[str] = []
             async for update in self._runtime_pool.stream_message(message, session_key):
                 if update.kind == "final":
                     reply = update.text
+                    raw_media = (update.metadata or {}).get("_artifact_paths")
+                    reply_media = [str(path) for path in raw_media] if isinstance(raw_media, list) else []
                     continue
                 if not update.text:
                     continue
@@ -269,6 +276,7 @@ class OhmoGatewayBridge:
                 _content_snippet(message.content),
             )
             reply = _format_gateway_error(exc)
+            reply_media = []
         if not reply:
             logger.info(
                 "ohmo inbound finished without final reply channel=%s chat_id=%s session_key=%s",
@@ -278,17 +286,19 @@ class OhmoGatewayBridge:
             )
             return
         logger.info(
-            "ohmo outbound final channel=%s chat_id=%s session_key=%s content=%r",
+            "ohmo outbound final channel=%s chat_id=%s session_key=%s content=%r media=%s",
             message.channel,
             message.chat_id,
             session_key,
             _content_snippet(reply),
+            len(reply_media),
         )
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content=reply,
+                media=reply_media,
                 metadata={**inbound_meta, "_session_key": session_key},
             )
         )

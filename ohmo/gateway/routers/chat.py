@@ -19,7 +19,8 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_data_dir
-from openharness.tools.artifacts import preview_kind_for_path
+from openharness.tools.artifacts import IGNORED_ARTIFACT_DIRS, preview_kind_for_path
+from openharness.utils.trace import set_trace_id
 from ohmo.gateway.dependencies import (
     AuthContext,
     get_auth_context,
@@ -39,6 +40,8 @@ from ohmo.gateway.schemas.chat import (
     MessageSyncResponse,
     PermissionRequestInfo,
     SessionInfo,
+    SSEArtifact,
+    SSECompact,
     SSEDone,
     SSEError,
     SSEPermissionRequest,
@@ -101,6 +104,14 @@ _LEGACY_OUTPUT_PREFIXES = (
     "Generated ",
 )
 _LEGACY_PATH_LABEL_RE = re.compile(r"^\s*(?:路径|path|file|output)\s*[:：]\s*(?P<path>.+?)\s*$", re.IGNORECASE)
+
+_FILE_LINK_GUIDANCE = (
+    "\n\n[生成文件引用规范]\n"
+    "在回复正文中提到本次会话里你创建或修改过的文件时，必须使用 markdown 链接引用该文件："
+    "[文件名](artifact://文件名)，文件名保留完整扩展名，链接中的文件名要与实际写入的文件名完全一致。"
+    "例如：报告已生成：[分析报告.docx](artifact://分析报告.docx)。"
+    "不要只写裸文件名，也不要把文件名放进代码块里。"
+)
 
 
 def _safe_attachment_filename(filename: str | None) -> str:
@@ -180,6 +191,111 @@ def _prepare_user_text(body: MessageRequest, attachment_notes: str = "") -> str:
     return user_text
 
 
+# ---------------------------------------------------------------------------
+# Oversized-input funnel: spill huge pasted text to a file first, then reject
+# anything that still cannot fit the context window. Inputs below the spill
+# threshold stay inline; when the budget pre-check still fails (e.g. a large
+# agent system prompt shrinks the input budget below the threshold), callers
+# retry the spill with ``force=True`` before rejecting.
+# ---------------------------------------------------------------------------
+
+_INLINE_SPILL_THRESHOLD_TOKENS = 150_000
+_FORCED_SPILL_MIN_TOKENS = 2_000
+_SPILL_PREVIEW_HEAD_CHARS = 1_200
+_SPILL_PREVIEW_TAIL_CHARS = 600
+
+
+def _spill_oversized_input(
+    body: MessageRequest,
+    *,
+    attachment_notes: str,
+    user_text: str,
+    workspace: Any,
+    session_id: str,
+    force: bool = False,
+) -> tuple[str, str | None]:
+    """Spill an oversized pasted input to a file and reference it by path.
+
+    Returns ``(user_text, note)`` — *user_text* rewritten to a file reference
+    with head/tail previews when the spill happened, and *note* a user-facing
+    status line (``None`` when nothing was spilled). With ``force=True`` the
+    threshold is bypassed for any non-trivial content; a tiny message cannot
+    be the reason the budget check failed, so spilling it would not help.
+    """
+    from openharness.services.token_estimation import estimate_tokens
+
+    content = body.content or ""
+    estimated = estimate_tokens(content)
+    if estimated < (_FORCED_SPILL_MIN_TOKENS if force else _INLINE_SPILL_THRESHOLD_TOKENS):
+        return user_text, None
+    try:
+        target_dir = get_attachments_dir(workspace) / time.strftime("%Y%m%d")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        spill_path = (target_dir / f"paste-{session_id[:8]}-{uuid4().hex[:8]}.txt").resolve()
+        spill_path.write_text(content, encoding="utf-8")
+    except OSError:
+        logger.exception("Failed to spill oversized input for session %s", session_id)
+        return user_text, None
+    head = content[:_SPILL_PREVIEW_HEAD_CHARS].rstrip()
+    tail = content[-_SPILL_PREVIEW_TAIL_CHARS:].lstrip()
+    replacement = (
+        "[超长输入已转存为本地文件]\n"
+        f"用户本次输入约 {estimated:,} tokens，直接注入会超出或挤占模型上下文，"
+        f"完整内容已保存到 (path: {spill_path})。\n"
+        "请使用 read_file / grep 等工具按需分段读取该文件，不要一次性读入全部内容。\n"
+        "--- 内容开头预览 ---\n"
+        f"{head}\n"
+        "--- 内容结尾预览 ---\n"
+        f"{tail}"
+    )
+    if attachment_notes:
+        replacement = f"{replacement}\n\n{attachment_notes}"
+    note = (
+        f"输入约 {estimated:,} tokens，已转存为文件 {spill_path.name}，智能体将按需分段读取。"
+    )
+    logger.info(
+        "Spilled oversized input for session %s: ~%d tokens -> %s",
+        session_id,
+        estimated,
+        spill_path,
+    )
+    return replacement, note
+
+
+def _input_budget_error(
+    *,
+    user_text: str,
+    system_prompt: str,
+    settings: Any,
+) -> str | None:
+    """Reject a single input that cannot fit the model context window.
+
+    Fallback guard behind the spill: it only fires when the spill was skipped
+    or failed, so the request would otherwise burn an API round-trip on a
+    guaranteed "prompt too long" error.
+    """
+    from openharness.services.compact import get_context_window
+    from openharness.services.token_estimation import estimate_tokens
+
+    memory_settings = getattr(settings, "memory", None)
+    context_window = int(
+        getattr(settings, "context_window_tokens", None)
+        or getattr(memory_settings, "context_window_tokens", None)
+        or get_context_window(getattr(settings, "model", "") or "")
+    )
+    reserved_output = int(getattr(settings, "max_tokens", 0) or 0) or 20_000
+    reserved_output = min(reserved_output, max(1, context_window // 4))
+    input_budget = context_window - estimate_tokens(system_prompt) - reserved_output
+    input_tokens = estimate_tokens(user_text)
+    if input_tokens <= input_budget:
+        return None
+    return (
+        f"输入过大：本条消息约 {input_tokens / 10000:.1f} 万 tokens（估算），"
+        f"超过模型单次可接收的输入上限（约 {max(input_budget, 0) / 10000:.1f} 万 tokens）。"
+        "请拆分内容分多次发送，或将文本保存为附件上传，让智能体分段读取。"
+    )
+
+
 def _record_id_from_path(path: Path) -> str:
     stem = path.stem
     return stem.removeprefix("invocation-")
@@ -244,6 +360,10 @@ def _artifact_from_metadata(
     try:
         path = Path(raw_path).expanduser().resolve()
         if not path.is_file() or not _is_under_any_root(path, roots):
+            return None
+        # Skip dependency/build internals (venv, site-packages, ...) that file
+        # change scanning may have picked up in older records.
+        if any(part in IGNORED_ARTIFACT_DIRS for part in path.parts):
             return None
         stat = path.stat()
     except OSError:
@@ -331,6 +451,45 @@ def _legacy_artifacts_from_tool(
             continue
         seen.add(str(path))
         artifacts.append({"path": str(path)})
+    return artifacts
+
+
+def _artifacts_from_tool_completion(
+    *,
+    tool_name: str | None,
+    tool_input: dict[str, Any],
+    output: str,
+    metadata: dict[str, Any] | None,
+    is_error: bool,
+    cwd: Path,
+    roots: list[Path],
+) -> list[ArtifactInfo]:
+    """Build ArtifactInfo entries for a single completed tool execution."""
+    if is_error:
+        return []
+
+    raw_artifacts: list[Any] = []
+    if isinstance(metadata, dict) and isinstance(metadata.get("artifacts"), list):
+        raw_artifacts = metadata["artifacts"]
+    if not raw_artifacts:
+        raw_artifacts = _legacy_artifacts_from_tool(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            output=output or "",
+            cwd=cwd,
+            roots=roots,
+        )
+
+    artifacts: list[ArtifactInfo] = []
+    seen: set[str] = set()
+    for raw_artifact in raw_artifacts:
+        if not isinstance(raw_artifact, dict):
+            continue
+        artifact = _artifact_from_metadata(raw_artifact, tool_name=tool_name, tool_use_id=None, roots=roots)
+        if artifact is None or artifact.path in seen:
+            continue
+        seen.add(artifact.path)
+        artifacts.append(artifact)
     return artifacts
 
 
@@ -685,6 +844,8 @@ async def send_message(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Send a user message and receive an SSE stream of assistant events."""
+    trace_id = set_trace_id()
+    start_monotonic = time.monotonic()
     abort_event = asyncio.Event()
     _abort_events[session_id] = abort_event
 
@@ -737,6 +898,8 @@ async def send_message(
     # waiting for a permission response.
     # ------------------------------------------------------------------
     async def run_engine() -> None:
+        set_trace_id(trace_id)
+        mcp_manager = None
         try:
             from openharness.config import load_settings
             from openharness.ui.runtime import _resolve_api_client_from_settings
@@ -750,6 +913,7 @@ async def send_message(
             from openharness.engine.stream_events import (
                 AssistantTextDelta,
                 AssistantTurnComplete,
+                CompactProgressEvent,
                 ErrorEvent,
                 StatusEvent,
                 ToolExecutionCompleted,
@@ -825,11 +989,57 @@ async def send_message(
             attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
             user_text = _prepare_user_text(body, attachment_notes)
 
+            user_text, spill_note = _spill_oversized_input(
+                body,
+                attachment_notes=attachment_notes,
+                user_text=user_text,
+                workspace=runtime.workspace,
+                session_id=session_id,
+            )
+            if spill_note:
+                await sse_queue.put(_sse_line(SSEStatus(message=spill_note)))
+
             system_prompt = build_runtime_system_prompt(
                 settings,
                 cwd=effective_cwd,
                 latest_user_prompt=user_text,
+            ) + _FILE_LINK_GUIDANCE
+
+            budget_error = _input_budget_error(
+                user_text=user_text,
+                system_prompt=system_prompt,
+                settings=settings,
             )
+            if budget_error and spill_note is None:
+                # Below the spill threshold but still over budget (e.g. a large
+                # agent system prompt shrinks the input budget): force the
+                # spill before rejecting.
+                user_text, spill_note = _spill_oversized_input(
+                    body,
+                    attachment_notes=attachment_notes,
+                    user_text=user_text,
+                    workspace=runtime.workspace,
+                    session_id=session_id,
+                    force=True,
+                )
+                if spill_note:
+                    await sse_queue.put(_sse_line(SSEStatus(message=spill_note)))
+                    system_prompt = build_runtime_system_prompt(
+                        settings,
+                        cwd=effective_cwd,
+                        latest_user_prompt=user_text,
+                    ) + _FILE_LINK_GUIDANCE
+                    budget_error = _input_budget_error(
+                        user_text=user_text,
+                        system_prompt=system_prompt,
+                        settings=settings,
+                    )
+            if budget_error:
+                logger.warning("Rejected oversized input for session %s: %s", session_id, budget_error)
+                await sse_queue.put(_sse_line(SSEError(message=budget_error, recoverable=True)))
+                return
+
+            artifact_roots = _safe_artifact_roots({"cwd": str(effective_cwd)}, runtime)
 
             engine = QueryEngine(
                 api_client=api_client,
@@ -877,6 +1087,7 @@ async def send_message(
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             status_messages: list[str] = []
+            turn_recorded = False
             async for event in engine.submit_message(user_message):
                 if abort_event.is_set():
                     await sse_queue.put(_sse_line(SSEError(message="Generation aborted", recoverable=True)))
@@ -897,11 +1108,14 @@ async def send_message(
                     )
                     await sse_queue.put(_sse_line(SSEToolCall(tool_name=event.tool_name, tool_input=event.tool_input)))
                 elif isinstance(event, ToolExecutionCompleted):
+                    matched_tool_input: dict[str, Any] = {}
                     for call in reversed(tool_calls):
                         if call.get("tool_name") == event.tool_name and call.get("output") is None:
                             call["output"] = event.output
                             call["is_error"] = event.is_error
                             call["metadata"] = event.metadata
+                            if isinstance(call.get("tool_input"), dict):
+                                matched_tool_input = call["tool_input"]
                             break
                     await sse_queue.put(
                         _sse_line(
@@ -913,6 +1127,16 @@ async def send_message(
                             )
                         )
                     )
+                    for artifact in _artifacts_from_tool_completion(
+                        tool_name=event.tool_name,
+                        tool_input=matched_tool_input,
+                        output=event.output,
+                        metadata=event.metadata,
+                        is_error=event.is_error,
+                        cwd=effective_cwd,
+                        roots=artifact_roots,
+                    ):
+                        await sse_queue.put(_sse_line(SSEArtifact(artifact=artifact)))
                 elif isinstance(event, AssistantTurnComplete):
                     usage_dict = None
                     try:
@@ -926,7 +1150,7 @@ async def send_message(
                             usage_snap = UsageSnapshot()
                         if persist_mode == "session":
                             save_session_snapshot(
-                                cwd=Path.cwd(),
+                                cwd=effective_cwd,
                                 workspace=runtime.workspace,
                                 model=settings.model or "",
                                 system_prompt=system_prompt,
@@ -937,9 +1161,33 @@ async def send_message(
                                 channel="web",
                                 platform="web",
                             )
+                            # Also record the turn as an invocation so web chats
+                            # (including the default agent) show up in metrics.
+                            # History lives in the session snapshot, so keep
+                            # messages empty to avoid duplicating it per turn.
+                            save_invocation_record(
+                                cwd=effective_cwd,
+                                workspace=runtime.workspace,
+                                model=settings.model or "",
+                                system_prompt="",
+                                messages=[],
+                                usage=usage_snap,
+                                session_id=session_id,
+                                agent_name=agent_name,
+                                channel="web",
+                                platform="web",
+                                request_content=body.content,
+                                response_text="".join(text_parts).strip(),
+                                status="completed",
+                                tool_calls=tool_calls,
+                                status_messages=status_messages,
+                                trace_id=trace_id,
+                                duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                            )
+                            turn_recorded = True
                         elif persist_mode == "log":
                             save_invocation_record(
-                                cwd=Path.cwd(),
+                                cwd=effective_cwd,
                                 workspace=runtime.workspace,
                                 model=settings.model or "",
                                 system_prompt=system_prompt,
@@ -953,7 +1201,10 @@ async def send_message(
                                 tool_calls=tool_calls,
                                 status_messages=status_messages,
                                 tool_metadata=tool_metadata,
+                                trace_id=trace_id,
+                                duration_ms=int((time.monotonic() - start_monotonic) * 1000),
                             )
+                            turn_recorded = True
                     except Exception:
                         logger.exception("Failed to persist completed turn for %s", session_id)
                     await sse_queue.put(_sse_line(SSEDone(usage=usage_dict)))
@@ -964,7 +1215,50 @@ async def send_message(
                         )
                         await sse_queue.put(_sse_line(SSEDone(usage=None)))
                     else:
+                        if not event.recoverable and not turn_recorded and persist_mode in ("session", "log"):
+                            try:
+                                from openharness.api.usage import UsageSnapshot
+                                usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+                                if not isinstance(usage_snap, UsageSnapshot):
+                                    usage_snap = UsageSnapshot()
+                                channel = "web" if persist_mode == "session" else "api"
+                                save_invocation_record(
+                                    cwd=effective_cwd,
+                                    workspace=runtime.workspace,
+                                    model=settings.model or "",
+                                    system_prompt="",
+                                    messages=[],
+                                    usage=usage_snap,
+                                    session_id=session_id,
+                                    agent_name=agent_name,
+                                    channel=channel,
+                                    platform=channel,
+                                    request_content=body.content,
+                                    response_text="".join(text_parts).strip() or None,
+                                    status="error",
+                                    tool_calls=tool_calls,
+                                    status_messages=status_messages,
+                                    error=event.message,
+                                    trace_id=trace_id,
+                                    duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                                )
+                                turn_recorded = True
+                            except Exception:
+                                logger.exception("Failed to persist error invocation for %s", session_id)
                         await sse_queue.put(_sse_line(SSEError(message=event.message, recoverable=event.recoverable)))
+                elif isinstance(event, CompactProgressEvent):
+                    if event.message:
+                        status_messages.append(f"[compact:{event.phase}] {event.message}")
+                    await sse_queue.put(
+                        _sse_line(
+                            SSECompact(
+                                phase=event.phase,
+                                trigger=event.trigger,
+                                message=event.message,
+                                attempt=event.attempt,
+                            )
+                        )
+                    )
                 elif isinstance(event, StatusEvent):
                     status_messages.append(event.message)
                     await sse_queue.put(_sse_line(SSEStatus(message=event.message)))
@@ -973,6 +1267,11 @@ async def send_message(
             logger.exception("Error in engine task for session %s", session_id)
             await sse_queue.put(_sse_line(SSEError(message=str(exc), recoverable=False)))
         finally:
+            if mcp_manager is not None:
+                try:
+                    await mcp_manager.close()
+                except Exception:
+                    pass
             _abort_events.pop(session_id, None)
             await sse_queue.put(None)  # signal end-of-stream
 
@@ -1009,6 +1308,8 @@ async def send_message_sync(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Send a user message and return the final assistant text as JSON."""
+    trace_id = set_trace_id()
+    start_monotonic = time.monotonic()
     permission_requests: list[PermissionRequestInfo] = []
     tool_calls: list[dict[str, Any]] = []
     status_messages: list[str] = []
@@ -1025,6 +1326,44 @@ async def send_message_sync(
         return False
 
     mcp_manager = None
+    settings = None
+    engine = None
+    agent_name: str | None = None
+    system_prompt = ""
+    effective_cwd = Path.cwd()
+
+    def _persist_error_invocation(error_text: str) -> None:
+        """Best-effort persistence so failed calls show up in metrics/reports."""
+        nonlocal invocation_id
+        if persist_mode != "log":
+            return
+        try:
+            usage_snap = getattr(engine, "total_usage", None) if engine is not None else None
+            if not isinstance(usage_snap, UsageSnapshot):
+                usage_snap = UsageSnapshot()
+            path = save_invocation_record(
+                cwd=effective_cwd,
+                workspace=runtime.workspace,
+                model=(settings.model or "") if settings is not None else "",
+                system_prompt=system_prompt,
+                messages=engine.messages if engine is not None else [],
+                usage=usage_snap,
+                session_id=session_id,
+                agent_name=agent_name,
+                request_content=body.content,
+                response_text="".join(text_parts).strip() or None,
+                status="error",
+                tool_calls=tool_calls,
+                status_messages=status_messages,
+                permission_requests=[item.model_dump() for item in permission_requests],
+                error=error_text,
+                trace_id=trace_id,
+                duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+            )
+            invocation_id = _record_id_from_path(path)
+        except Exception:
+            logger.exception("Failed to persist error invocation for %s", session_id)
+
     try:
         from openharness.config import load_settings
         from openharness.ui.runtime import _resolve_api_client_from_settings
@@ -1038,6 +1377,7 @@ async def send_message_sync(
         from openharness.engine.stream_events import (
             AssistantTextDelta,
             AssistantTurnComplete,
+            CompactProgressEvent,
             ErrorEvent,
             StatusEvent,
             ToolExecutionCompleted,
@@ -1073,6 +1413,7 @@ async def send_message_sync(
             api_client = _resolve_api_client_from_settings(settings)
         except SystemExit:
             logger.warning("Model provider authentication is not configured for session %s", session_id)
+            _persist_error_invocation(_AUTH_CONFIG_ERROR_MESSAGE)
             return MessageSyncResponse(
                 session_id=session_id,
                 status="error",
@@ -1118,11 +1459,64 @@ async def send_message_sync(
         attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
         user_text = _prepare_user_text(body, attachment_notes)
 
+        user_text, spill_note = _spill_oversized_input(
+            body,
+            attachment_notes=attachment_notes,
+            user_text=user_text,
+            workspace=runtime.workspace,
+            session_id=session_id,
+        )
+        if spill_note:
+            status_messages.append(spill_note)
+
         system_prompt = build_runtime_system_prompt(
             settings,
             cwd=effective_cwd,
             latest_user_prompt=user_text,
         )
+
+        budget_error = _input_budget_error(
+            user_text=user_text,
+            system_prompt=system_prompt,
+            settings=settings,
+        )
+        if budget_error and spill_note is None:
+            # Below the spill threshold but still over budget (e.g. a large
+            # agent system prompt shrinks the input budget): force the spill
+            # before rejecting.
+            user_text, spill_note = _spill_oversized_input(
+                body,
+                attachment_notes=attachment_notes,
+                user_text=user_text,
+                workspace=runtime.workspace,
+                session_id=session_id,
+                force=True,
+            )
+            if spill_note:
+                status_messages.append(spill_note)
+                system_prompt = build_runtime_system_prompt(
+                    settings,
+                    cwd=effective_cwd,
+                    latest_user_prompt=user_text,
+                )
+                budget_error = _input_budget_error(
+                    user_text=user_text,
+                    system_prompt=system_prompt,
+                    settings=settings,
+                )
+        if budget_error:
+            logger.warning("Rejected oversized input for session %s: %s", session_id, budget_error)
+            _persist_error_invocation(budget_error)
+            return MessageSyncResponse(
+                session_id=session_id,
+                status="error",
+                text="",
+                tool_calls=tool_calls,
+                status_messages=status_messages,
+                permission_requests=permission_requests,
+                error=budget_error,
+                recoverable=True,
+            )
 
         engine = QueryEngine(
             api_client=api_client,
@@ -1206,7 +1600,7 @@ async def send_message_sync(
                     response_text = "".join(text_parts).strip()
                     if persist_mode == "session":
                         save_session_snapshot(
-                            cwd=Path.cwd(),
+                            cwd=effective_cwd,
                             workspace=runtime.workspace,
                             model=settings.model or "",
                             system_prompt=system_prompt,
@@ -1219,7 +1613,7 @@ async def send_message_sync(
                         )
                     elif persist_mode == "log":
                         path = save_invocation_record(
-                            cwd=Path.cwd(),
+                            cwd=effective_cwd,
                             workspace=runtime.workspace,
                             model=settings.model or "",
                             system_prompt=system_prompt,
@@ -1234,6 +1628,8 @@ async def send_message_sync(
                             status_messages=status_messages,
                             permission_requests=[item.model_dump() for item in permission_requests],
                             tool_metadata=tool_metadata,
+                            trace_id=trace_id,
+                            duration_ms=int((time.monotonic() - start_monotonic) * 1000),
                         )
                         invocation_id = _record_id_from_path(path)
                 except Exception:
@@ -1243,6 +1639,7 @@ async def send_message_sync(
                     status_messages.append(
                         "Model returned an empty assistant message; this turn was skipped."
                     )
+                    _persist_error_invocation(_EMPTY_ASSISTANT_SYNC_ERROR)
                     return MessageSyncResponse(
                         session_id=session_id,
                         status="error",
@@ -1255,6 +1652,7 @@ async def send_message_sync(
                         recoverable=True,
                     )
                 else:
+                    _persist_error_invocation(event.message)
                     return MessageSyncResponse(
                         session_id=session_id,
                         status="error",
@@ -1266,6 +1664,9 @@ async def send_message_sync(
                         error=event.message,
                         recoverable=event.recoverable,
                     )
+            elif isinstance(event, CompactProgressEvent):
+                if event.message:
+                    status_messages.append(f"[compact:{event.phase}] {event.message}")
             elif isinstance(event, StatusEvent):
                 status_messages.append(event.message)
 
@@ -1282,6 +1683,7 @@ async def send_message_sync(
 
     except Exception as exc:
         logger.exception("Error in sync engine task for session %s", session_id)
+        _persist_error_invocation(str(exc))
         return MessageSyncResponse(
             session_id=session_id,
             status="error",
