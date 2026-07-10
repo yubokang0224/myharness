@@ -321,6 +321,7 @@ def list_invocation_records(
                     "created_at": created_at,
                     "message_count": data.get("message_count", len(messages)),
                     "tool_call_count": 0,
+                    "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
                 }
             )
             if len(records) >= max_needed:

@@ -26,6 +26,7 @@ from openharness.engine.stream_events import (
     AssistantTurnComplete,
     CompactProgressEvent,
     ErrorEvent,
+    ToolExecutionCompleted,
     ToolExecutionStarted,
 )
 from openharness.memory import add_memory_entry as add_project_memory_entry
@@ -52,7 +53,12 @@ from ohmo.gateway.routers import production_issue
 from ohmo.gateway.routers.skills import list_mcp_servers
 from ohmo.gateway.schemas.agents import UpdateAgentRequest
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
-from ohmo.gateway.runtime import OhmoSessionRuntimePool, _build_inbound_user_message, _format_channel_progress
+from ohmo.gateway.runtime import (
+    OhmoSessionRuntimePool,
+    _build_inbound_user_message,
+    _format_channel_progress,
+    _strip_image_blocks_from_messages,
+)
 from ohmo.gateway.service import OhmoGatewayService, gateway_status, stop_gateway_process
 from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.memory import add_memory_entry as add_ohmo_memory_entry
@@ -311,7 +317,9 @@ async def test_gateway_startup_connects_shared_mcp_manager(tmp_path, monkeypatch
 
 def test_gateway_app_mounts_production_issue_proxy(tmp_path):
     app = create_app(workspace=str(tmp_path))
-    paths = {getattr(route, "path", "") for route in app.routes}
+    # FastAPI >= 0.115 keeps included routers as lazy _IncludedRouter entries in
+    # app.routes, so collect the mounted paths from the OpenAPI schema instead.
+    paths = set(app.openapi()["paths"])
 
     assert "/agent/api/v1/ProductionIssue/Insert" in paths
     assert "/agent/api/v1/ProductionIssue/AppendProcess" in paths
@@ -1608,6 +1616,69 @@ async def test_runtime_pool_stream_message_emits_progress_and_tool_hint(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_runtime_pool_stream_message_records_invocation_per_turn(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            def __init__(self):
+                self.messages = []
+                self.total_usage = UsageSnapshot()
+                self.tool_metadata: dict[str, object] = {}
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                # Reused engines accumulate usage across turns.
+                self.total_usage = UsageSnapshot(
+                    input_tokens=self.total_usage.input_tokens + 120,
+                    output_tokens=self.total_usage.output_tokens + 30,
+                )
+                yield ToolExecutionStarted(tool_name="web_fetch", tool_input={"url": "https://example.com"})
+                yield ToolExecutionCompleted(tool_name="web_fetch", output="ok", is_error=False)
+                yield AssistantTextDelta(text="done")
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            cwd=str(tmp_path),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(channel="dingtalk:ops-bot", sender_id="u1", chat_id="c1", content="check")
+    session_key = "dingtalk:ops-bot:ops-agent:c1:u1"
+    async for _ in pool.stream_message(message, session_key):
+        pass
+    async for _ in pool.stream_message(message, session_key):
+        pass
+
+    records = sorted((workspace / "invocations").glob("invocation-*.json"))
+    assert len(records) == 2
+    for path in records:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["channel"] == "dingtalk"
+        assert payload["status"] == "completed"
+        # Cumulative engine usage must be recorded as a per-turn delta.
+        assert payload["usage"] == {"input_tokens": 120, "output_tokens": 30}
+        assert payload["tool_calls"][0]["tool_name"] == "web_fetch"
+        assert payload["tool_calls"][0]["output"] == "ok"
+        assert isinstance(payload["duration_ms"], int)
+        assert payload["messages"] == []
+        assert payload["request_content"] == "check"
+        assert payload["response_text"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
@@ -1769,7 +1840,10 @@ async def test_runtime_pool_checkpoints_user_message_before_tool_results(tmp_pat
     assert snapshot is not None
     assert snapshot["message_count"] == 1
     assert snapshot["messages"][0]["role"] == "user"
-    assert snapshot["messages"][0]["content"][0]["text"] == "OP020 OEE"
+    texts = [block["text"] for block in snapshot["messages"][0]["content"]]
+    assert texts[0].startswith("[Channel metadata for API recording]")
+    assert '"chatId": "c1"' in texts[0]
+    assert texts[-1] == "OP020 OEE"
 
 
 @pytest.mark.asyncio
@@ -2289,13 +2363,15 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
     assert any(isinstance(block, ImageBlock) for block in submitted.content)
     text = "".join(block.text for block in submitted.content if isinstance(block, TextBlock))
     assert "[Channel attachments]" in text
-    assert f"image: example.png (path: {image_path})" in text
+    # Images travel as ImageBlock content, so the textual notes only list
+    # non-image attachments.
+    assert "example.png" not in text
     assert f"file: report.txt (path: {report_path})" in text
     assert "text preview: Quarterly summary Revenue up 12%" in text
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_retries_with_attachment_summary_when_model_rejects_images(tmp_path, monkeypatch):
+async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_images(tmp_path, monkeypatch):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     image_path = tmp_path / "example.png"
@@ -2373,8 +2449,49 @@ async def test_runtime_pool_retries_with_attachment_summary_when_model_rejects_i
         for block in item.content
         if isinstance(block, TextBlock)
     )
-    assert "[Channel attachments]" in text
-    assert f"image: example.png (path: {image_path})" in text
+    # The retry keeps the user text and appends a fallback note naming the
+    # omitted image so the model knows an attachment was dropped.
+    assert "帮我看这个图片" in text
+    assert "[Image attachment omitted because the active model does not support image input" in text
+    assert "example.png" in text
+    assert "Ask the user to resend the image as text" in text
+    assert text.index("帮我看这个图片") < text.index("[Image attachment omitted")
+    assert "[Channel attachments]" not in text
+
+
+def test_strip_image_blocks_appends_note_with_paths_and_single_guidance():
+    older = ConversationMessage.from_user_content(
+        [
+            TextBlock(text="看下第一张图"),
+            ImageBlock(media_type="image/png", data="aaaa", source_path="C:/tmp/first.png"),
+        ]
+    )
+    reply = ConversationMessage(role="assistant", content=[TextBlock(text="好的")])
+    latest = ConversationMessage.from_user_content(
+        [
+            ImageBlock(media_type="image/png", data="bbbb", source_path="C:/tmp/latest.png"),
+        ]
+    )
+    stripped = _strip_image_blocks_from_messages([older, reply, latest])
+
+    assert all(
+        not isinstance(block, ImageBlock)
+        for message in stripped
+        for block in message.content
+    )
+    older_text = stripped[0].text
+    latest_text = stripped[2].text
+    # Every stripped message names its omitted files, anchored where the image was.
+    assert "看下第一张图" in older_text
+    assert "first.png" in older_text
+    assert "latest.png" in latest_text
+    # The resend/switch-model guidance appears only once, on the most recent
+    # image-bearing message, so long histories are not flooded with it.
+    guidance = "Ask the user to resend the image"
+    assert guidance not in older_text
+    assert guidance in latest_text
+    # Messages without images pass through untouched.
+    assert stripped[1] is reply
 
 
 def test_runtime_pool_includes_group_speaker_context():
