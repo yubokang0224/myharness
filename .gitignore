@@ -39,3 +39,5 @@ match_delivery_to_purchase.py
 parse_pdf.py
 DOCS.md
 仓库入库准则.md
+deploy-procurement-bot/gateway.json钉钉配置片段.json
+deploy-procurement-bot/部署步骤.md

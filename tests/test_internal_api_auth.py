@@ -109,6 +109,7 @@ def test_internal_api_request_body_includes_production_issue_channel_context():
     assert body["sourceSenderName"] == "俞晨"
     assert body["sourceMessageId"] == "msg-1"
     assert body["sourceConversationId"] == "conv-1"
+    assert body["idempotencyKey"] == "production-site-issue:msg-1:insert"
     assert body["reporterName"] == "俞晨"
     assert "sourceSenderId" not in body
     assert body["attachments"] == [

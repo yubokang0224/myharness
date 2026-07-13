@@ -1,0 +1,4 @@
+interface:
+  display_name: "MOM Business Query"
+  short_description: "Query MOM/MES business data safely"
+  default_prompt: "查询 MOM/MES 项目、人员、物料、工单或质量数据并生成分析。"

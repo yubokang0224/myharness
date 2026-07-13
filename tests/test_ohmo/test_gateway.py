@@ -86,6 +86,28 @@ def test_gateway_router_falls_back_to_chat_and_sender_scope():
     assert session_key_for_message(message) == "telegram:chat-1:u1"
 
 
+def test_build_inbound_user_message_hides_dingtalk_api_metadata():
+    message = InboundMessage(
+        channel="dingtalk:ops-bot",
+        sender_id="u1",
+        chat_id="chat-1",
+        content="从下午二点到三点二十，停机原因是缺料，记录入库吧",
+        timestamp=datetime.utcnow(),
+        metadata={
+            "sender_name": "俞晨",
+            "message_id": "msg-1",
+            "conversation_id": "conv-1",
+        },
+    )
+
+    user_message = _build_inbound_user_message(message, session_key="dingtalk:ops-bot:chat-1:u1")
+
+    assert "从下午二点到三点二十，停机原因是缺料，记录入库吧" in user_message.text
+    assert "[Channel metadata for API recording]" not in user_message.text
+    assert "attachmentPaths" not in user_message.text
+    assert "messageId" not in user_message.text
+
+
 def test_gateway_router_separates_senders_in_same_chat_thread():
     first = InboundMessage(
         channel="slack",
@@ -1658,7 +1680,10 @@ async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_pat
     updates = [u async for u in pool.stream_message(message, "dingtalk:ops-bot:ops-agent:c1:u1")]
 
     assert updates[-1].text == "done"
-    assert captured["channel_context"] == {
+    channel_context = captured["channel_context"]
+    assert isinstance(channel_context["timestamp"], str)
+    assert channel_context["timestamp"]
+    assert {key: value for key, value in channel_context.items() if key != "timestamp"} == {
         "channel": "dingtalk",
         "raw_channel": "dingtalk:ops-bot",
         "chat_id": "c1",

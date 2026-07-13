@@ -206,6 +206,7 @@ def _json_body_with_channel_context(
     _set_if_missing(next_body, "sourceConversationId", _metadata_text(channel_context.get("conversation_id")))
     _set_if_missing(next_body, "sourceSessionKey", _metadata_text(channel_context.get("session_key")))
     _set_if_missing(next_body, "reporterName", _metadata_text(channel_context.get("sender_name")))
+    _set_production_issue_idempotency_key(next_body, url, channel_context)
 
     if not next_body.get("attachments"):
         attachment_paths = channel_context.get("attachment_paths")
@@ -239,6 +240,34 @@ def _is_production_issue_write_url(url: str) -> bool:
             "/productionissue/updatestatus",
         )
     )
+
+
+def _set_production_issue_idempotency_key(
+    body: dict[str, Any],
+    url: str,
+    channel_context: dict[str, Any],
+) -> None:
+    if body.get("idempotencyKey") or body.get("idempotency_key"):
+        return
+
+    normalized = url.lower().rstrip("/")
+    if normalized.endswith("/productionissue/insert"):
+        action = "insert"
+    elif normalized.endswith(("/productionissue/appendprocess", "/productionissue/updatestatus")):
+        action = "process"
+    else:
+        return
+
+    seed = (
+        _metadata_text(channel_context.get("message_id"))
+        or _metadata_text(body.get("sourceMessageId"))
+        or _metadata_text(channel_context.get("timestamp"))
+        or _metadata_text(channel_context.get("session_key"))
+    )
+    if not seed:
+        return
+
+    body["idempotencyKey"] = f"production-site-issue:{seed}:{action}"
 
 
 def _metadata_text(value: Any) -> str:
