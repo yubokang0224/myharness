@@ -35,6 +35,19 @@ def get_invocation_dir(workspace: str | Path | None = None) -> Path:
     return invocation_dir
 
 
+# Sentinel filter value meaning "records without an agent_name" (the default agent).
+DEFAULT_AGENT_SENTINEL = "__default__"
+
+
+def matches_agent_filter(record_agent_name: object, agent_name: str | None) -> bool:
+    """Return True when a record's agent_name passes the requested filter."""
+    if not agent_name:
+        return True
+    if agent_name == DEFAULT_AGENT_SENTINEL:
+        return not (record_agent_name or "")
+    return (record_agent_name or "") == agent_name
+
+
 def _session_key_token(session_key: str) -> str:
     return hashlib.sha1(session_key.encode("utf-8")).hexdigest()[:12]
 
@@ -168,6 +181,8 @@ def save_invocation_record(
     permission_requests: list[dict[str, Any]] | None = None,
     error: str | None = None,
     tool_metadata: dict[str, object] | None = None,
+    trace_id: str | None = None,
+    duration_ms: int | None = None,
 ) -> Path:
     """Persist a non-conversation API invocation record."""
     invocation_dir = get_invocation_dir(workspace)
@@ -187,6 +202,8 @@ def save_invocation_record(
         "request_content": request_content,
         "response_text": response_text,
         "status": status,
+        "trace_id": trace_id,
+        "duration_ms": duration_ms,
         "messages": [message.model_dump(mode="json") for message in messages],
         "usage": usage.model_dump(),
         "tool_calls": tool_calls or [],
@@ -223,7 +240,7 @@ def list_invocation_records(
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        if agent_name and (data.get("agent_name") or "") != agent_name:
+        if not matches_agent_filter(data.get("agent_name"), agent_name):
             continue
         if status and (data.get("status") or "") != status:
             continue
@@ -250,6 +267,9 @@ def list_invocation_records(
                 "created_at": created_at,
                 "message_count": data.get("message_count", len(data.get("messages", []))),
                 "tool_call_count": len(data.get("tool_calls", [])) if isinstance(data.get("tool_calls"), list) else 0,
+                "trace_id": data.get("trace_id"),
+                "duration_ms": data.get("duration_ms"),
+                "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
             }
         )
         if len(records) >= max_needed:
@@ -266,7 +286,7 @@ def list_invocation_records(
             session_id = str(data.get("session_id") or path.stem.removeprefix("session-"))
             if session_id in seen_session_ids:
                 continue
-            if agent_name and (data.get("agent_name") or "") != agent_name:
+            if not matches_agent_filter(data.get("agent_name"), agent_name):
                 continue
             fallback_status = "completed" if data.get("messages") else "created"
             if status and fallback_status != status:
@@ -301,6 +321,7 @@ def list_invocation_records(
                     "created_at": created_at,
                     "message_count": data.get("message_count", len(messages)),
                     "tool_call_count": 0,
+                    "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
                 }
             )
             if len(records) >= max_needed:

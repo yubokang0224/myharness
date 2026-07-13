@@ -248,7 +248,15 @@ class OpenAICompatibleClient:
             kwargs["base_url"] = normalized_base_url
         if timeout is not None:
             kwargs["timeout"] = _streaming_timeout(timeout)
+        self._base_url = normalized_base_url or ""
         self._client = AsyncOpenAI(**kwargs)
+
+    def _omit_stream_options_with_tools(self, model: str) -> bool:
+        """Moonshot/Kimi rejects tool-call follow-ups when stream_options triggers
+        thinking mode (empty reasoning_content error); everyone else needs
+        stream_options for usage reporting."""
+        haystack = f"{self._base_url} {model}".lower()
+        return "moonshot" in haystack or "kimi" in haystack
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Yield text deltas and the final message, matching the Anthropic client interface."""
@@ -297,11 +305,8 @@ class OpenAICompatibleClient:
         params.update(_token_limit_param_for_model(request.model, request.max_tokens))
         if openai_tools:
             params["tools"] = openai_tools
-            # Some providers (Kimi) error on empty reasoning_content in
-            # tool-call follow-ups.  Omit the entire stream_options key if
-            # tools are present – avoids triggering model-side thinking mode
-            # that requires reasoning_content on every assistant message.
-            params.pop("stream_options", None)
+            if self._omit_stream_options_with_tools(request.model):
+                params.pop("stream_options", None)
 
         # Collect full response while streaming text deltas
         collected_content = ""

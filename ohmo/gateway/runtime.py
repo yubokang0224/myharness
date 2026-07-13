@@ -10,9 +10,13 @@ from pathlib import Path
 import json
 import os
 import string
+import time
 
+from openharness.api.usage import UsageSnapshot
 from openharness.channels.bus.events import InboundMessage
 from openharness.commands import CommandContext, CommandResult
+from openharness.config.paths import get_data_dir
+from openharness.tools.artifacts import IGNORED_ARTIFACT_DIRS
 from openharness.coordinator.agent_definitions import AgentDefinition, get_agent_definition
 from openharness.engine.messages import (
     ConversationMessage,
@@ -32,12 +36,13 @@ from openharness.engine.stream_events import (
 )
 from openharness.prompts import build_runtime_system_prompt
 from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
+from openharness.utils.trace import get_trace_id
 
 from ohmo.gateway.config import load_gateway_config
 from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
-from ohmo.session_storage import OhmoSessionBackend
+from ohmo.session_storage import OhmoSessionBackend, save_invocation_record
 from ohmo.workspace import get_plugins_dir, get_skills_dir, initialize_workspace
 
 logger = logging.getLogger(__name__)
@@ -61,9 +66,13 @@ _CHANNEL_THINKING_PHRASES_EN = (
 _TEXT_PREVIEW_BYTES = 4096
 _TEXT_PREVIEW_CHARS = 900
 _BINARY_HEAD_BYTES = 32
-_IMAGE_FALLBACK_NOTE = (
-    "[Image attachment omitted because the active model does not support image input. "
-    "Ask the user to resend the image as text or switch to a vision-capable model.]"
+# Cap on files attached to a single outbound channel reply; extras are listed by name.
+_MAX_OUTBOUND_ARTIFACTS = 5
+_IMAGE_FALLBACK_NOTE_PREFIX = (
+    "[Image attachment omitted because the active model does not support image input"
+)
+_IMAGE_FALLBACK_NOTE_GUIDANCE = (
+    " Ask the user to resend the image as text or switch to a vision-capable model."
 )
 
 
@@ -99,6 +108,10 @@ class OhmoSessionRuntimePool:
         self._bundles: dict[str, RuntimeBundle] = {}
         self._session_agents: dict[str, str] = {}
         self._session_metadata: dict[str, dict[str, str | None]] = {}
+        # Last recorded cumulative usage per session; engines are reused across
+        # turns so per-turn usage is the delta against this baseline.
+        self._session_usage_baseline: dict[str, tuple[int, int]] = {}
+        self._artifact_roots = _compute_artifact_roots(self._cwd, self._workspace)
 
     @property
     def active_sessions(self) -> int:
@@ -304,6 +317,9 @@ class OhmoSessionRuntimePool:
             )
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             reply_parts: list[str] = []
+            artifact_paths: list[str] = []
+            turn_stats: dict = {"tool_calls": [], "error": None}
+            started_at = time.monotonic()
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
                     async for update in self._convert_stream_event(
@@ -313,21 +329,40 @@ class OhmoSessionRuntimePool:
                         session_key=session_key,
                         content=user_prompt,
                         reply_parts=reply_parts,
+                        artifact_paths=artifact_paths,
+                        turn_stats=turn_stats,
                     ):
                         yield update
             except MaxTurnsExceeded as exc:
+                turn_stats["error"] = f"Stopped after {exc.max_turns} turns (max_turns)."
                 yield GatewayStreamUpdate(
                     kind="error",
                     text=f"Stopped after {exc.max_turns} turns (max_turns).",
                     metadata={"_session_key": session_key},
                 )
             await self._save_snapshot(bundle, session_key, user_prompt)
+            self._record_invocation(
+                bundle=bundle,
+                session_key=session_key,
+                user_prompt=str(message.content or "") or user_prompt,
+                response_text="".join(reply_parts).strip(),
+                tool_calls=turn_stats["tool_calls"],
+                status="error" if turn_stats.get("error") else "completed",
+                error=turn_stats.get("error"),
+                started_at=started_at,
+            )
             reply = "".join(reply_parts).strip()
+            prefers_chinese = _prefers_chinese_progress(user_prompt)
+            send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+            if send_media and not reply:
+                reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+            if overflow_note:
+                reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
             if reply:
                 yield GatewayStreamUpdate(
                     kind="final",
                     text=reply,
-                    metadata={"_session_key": session_key},
+                    metadata={"_session_key": session_key, "_artifact_paths": send_media},
                 )
             return
 
@@ -344,6 +379,9 @@ class OhmoSessionRuntimePool:
     ):
         bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
         reply_parts: list[str] = []
+        artifact_paths: list[str] = []
+        turn_stats: dict = {"tool_calls": [], "error": None}
+        started_at = time.monotonic()
         yield GatewayStreamUpdate(
             kind="progress",
             text=_format_channel_progress(
@@ -387,6 +425,8 @@ class OhmoSessionRuntimePool:
                             session_key=session_key,
                             content=user_prompt,
                             reply_parts=reply_parts,
+                            artifact_paths=artifact_paths,
+                            turn_stats=turn_stats,
                         ):
                             yield update
                     break
@@ -397,6 +437,8 @@ class OhmoSessionRuntimePool:
                     session_key=session_key,
                     content=user_prompt,
                     reply_parts=reply_parts,
+                    artifact_paths=artifact_paths,
+                    turn_stats=turn_stats,
                 ):
                     yield update
         except MaxTurnsExceeded as exc:
@@ -406,20 +448,47 @@ class OhmoSessionRuntimePool:
                 metadata={"_session_key": session_key},
             )
             await self._save_snapshot(bundle, session_key, user_prompt)
+            self._record_invocation(
+                bundle=bundle,
+                session_key=session_key,
+                user_prompt=str(message.content or "") or user_prompt,
+                response_text="".join(reply_parts).strip(),
+                tool_calls=turn_stats["tool_calls"],
+                status="error",
+                error=f"Stopped after {exc.max_turns} turns (max_turns).",
+                started_at=started_at,
+            )
             return
         await self._save_snapshot(bundle, session_key, user_prompt)
+        self._record_invocation(
+            bundle=bundle,
+            session_key=session_key,
+            user_prompt=str(message.content or "") or user_prompt,
+            response_text="".join(reply_parts).strip(),
+            tool_calls=turn_stats["tool_calls"],
+            status="error" if turn_stats.get("error") else "completed",
+            error=turn_stats.get("error"),
+            started_at=started_at,
+        )
         reply = "".join(reply_parts).strip()
+        prefers_chinese = _prefers_chinese_progress(user_prompt)
+        send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+        if send_media and not reply:
+            reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+        if overflow_note:
+            reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
         if reply:
             logger.info(
-                "ohmo runtime processing complete session_key=%s session_id=%s reply=%r",
+                "ohmo runtime processing complete session_key=%s session_id=%s reply=%r media=%s",
                 session_key,
                 bundle.session_id,
                 _content_snippet(reply),
+                len(send_media),
             )
             yield GatewayStreamUpdate(
                 kind="final",
                 text=reply,
-                metadata={"_session_key": session_key},
+                metadata={"_session_key": session_key, "_artifact_paths": send_media},
             )
 
     async def _convert_stream_event(
@@ -431,6 +500,8 @@ class OhmoSessionRuntimePool:
         session_key: str,
         content: str,
         reply_parts: list[str],
+        artifact_paths: list[str],
+        turn_stats: dict | None = None,
     ):
         if isinstance(event, AssistantTextDelta):
             reply_parts.append(event.text)
@@ -481,6 +552,16 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionStarted):
+            if turn_stats is not None:
+                turn_stats.setdefault("tool_calls", []).append(
+                    {
+                        "tool_name": event.tool_name,
+                        "tool_input": event.tool_input,
+                        "output": None,
+                        "is_error": None,
+                        "metadata": None,
+                    }
+                )
             summary = _summarize_tool_input(event.tool_name, event.tool_input)
             logger.info(
                 "ohmo runtime tool start session_key=%s session_id=%s tool=%s summary=%r",
@@ -509,14 +590,29 @@ class OhmoSessionRuntimePool:
             )
             return
         if isinstance(event, ToolExecutionCompleted):
+            if turn_stats is not None:
+                for call in reversed(turn_stats.get("tool_calls", [])):
+                    if call.get("tool_name") == event.tool_name and call.get("output") is None:
+                        call["output"] = event.output
+                        call["is_error"] = event.is_error
+                        call["metadata"] = event.metadata
+                        break
             logger.info(
                 "ohmo runtime tool complete session_key=%s session_id=%s tool=%s",
                 session_key,
                 bundle.session_id,
                 event.tool_name,
             )
+            if not event.is_error:
+                for path in _artifact_paths_from_tool_metadata(event.metadata, self._artifact_roots):
+                    # Keep last-write order so repeated writes surface once, at the end.
+                    if path in artifact_paths:
+                        artifact_paths.remove(path)
+                    artifact_paths.append(path)
             return
         if isinstance(event, ErrorEvent):
+            if turn_stats is not None:
+                turn_stats["error"] = event.message
             logger.error(
                 "ohmo runtime error session_key=%s session_id=%s message=%r",
                 session_key,
@@ -573,6 +669,67 @@ class OhmoSessionRuntimePool:
             bundle.session_id,
             len(bundle.engine.messages),
         )
+
+    def _turn_usage_delta(self, session_key: str, bundle: RuntimeBundle) -> UsageSnapshot:
+        """Per-turn usage: the reused engine accumulates across turns, so diff
+        against the last recorded total. A rebuilt/cleared engine restarts its
+        counter from zero, which shows up as a shrinking total."""
+        total = getattr(bundle.engine, "total_usage", None)
+        current_in = int(getattr(total, "input_tokens", 0) or 0)
+        current_out = int(getattr(total, "output_tokens", 0) or 0)
+        base_in, base_out = self._session_usage_baseline.get(session_key, (0, 0))
+        if current_in < base_in or current_out < base_out:
+            base_in = base_out = 0
+        self._session_usage_baseline[session_key] = (current_in, current_out)
+        return UsageSnapshot(input_tokens=current_in - base_in, output_tokens=current_out - base_out)
+
+    def _record_invocation(
+        self,
+        *,
+        bundle: RuntimeBundle,
+        session_key: str,
+        user_prompt: str,
+        response_text: str,
+        tool_calls: list,
+        status: str,
+        error: str | None,
+        started_at: float,
+    ) -> None:
+        """Persist one channel turn as an invocation record so remote traffic
+        (DingTalk etc.) shows up in metrics alongside web/api calls. History
+        lives in the session snapshot, so messages stay empty per turn."""
+        metadata = self._session_metadata.get(session_key, {})
+        channel = metadata.get("channel") or "remote"
+        try:
+            model = bundle.current_settings().model or ""
+        except Exception:
+            model = getattr(bundle.engine, "model", "") or ""
+        try:
+            save_invocation_record(
+                cwd=self._cwd,
+                workspace=self._workspace,
+                model=model,
+                system_prompt="",
+                messages=[],
+                usage=self._turn_usage_delta(session_key, bundle),
+                session_id=bundle.session_id,
+                agent_name=metadata.get("agent_name") or self._session_agents.get(session_key),
+                channel=channel,
+                platform=metadata.get("platform") or channel,
+                request_content=user_prompt,
+                response_text=response_text or None,
+                status=status,
+                tool_calls=tool_calls,
+                error=error,
+                trace_id=get_trace_id(),
+                duration_ms=int((time.monotonic() - started_at) * 1000),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist invocation record session_key=%s session_id=%s",
+                session_key,
+                bundle.session_id,
+            )
 
     async def _refresh_bundle(
         self,
@@ -719,6 +876,67 @@ def _content_snippet(text: str, *, limit: int = 160) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+def _compute_artifact_roots(*candidates: object) -> list[Path]:
+    """Resolve directories that generated files may legitimately live under."""
+    roots: list[Path] = []
+    for raw in (*candidates, get_data_dir() / "tool_artifacts"):
+        if not raw:
+            continue
+        try:
+            root = Path(str(raw)).expanduser().resolve()
+        except Exception:
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _artifact_paths_from_tool_metadata(metadata: object, roots: list[Path]) -> list[str]:
+    """Extract validated local file paths from a tool result's artifact metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    raw_artifacts = metadata.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        return []
+    paths: list[str] = []
+    for raw_artifact in raw_artifacts:
+        if not isinstance(raw_artifact, dict):
+            continue
+        raw_path = raw_artifact.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        try:
+            path = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if not path.is_file() or not any(path.is_relative_to(root) for root in roots):
+            continue
+        if any(part in IGNORED_ARTIFACT_DIRS for part in path.parts):
+            continue
+        if str(path) not in paths:
+            paths.append(str(path))
+    return paths
+
+
+def _split_outbound_artifacts(paths: list[str], *, prefers_chinese: bool) -> tuple[list[str], str]:
+    """Return (paths to attach, overflow note) honouring the per-reply cap."""
+    if len(paths) <= _MAX_OUTBOUND_ARTIFACTS:
+        return list(paths), ""
+    send = paths[-_MAX_OUTBOUND_ARTIFACTS:]
+    skipped = [Path(path).name for path in paths[: -_MAX_OUTBOUND_ARTIFACTS]]
+    if prefers_chinese:
+        note = (
+            f"📎 本轮共生成 {len(paths)} 个文件，已随消息发送最新 {len(send)} 个。"
+            f"未发送：{'、'.join(skipped)}。"
+        )
+    else:
+        note = (
+            f"📎 {len(paths)} files were generated this turn; the latest {len(send)} are attached. "
+            f"Not sent: {', '.join(skipped)}."
+        )
+    return send, note
 
 
 def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:
@@ -896,16 +1114,49 @@ def _strip_image_blocks_from_engine_history(engine) -> None:
 
 
 def _strip_image_blocks_from_messages(messages: list[ConversationMessage]) -> list[ConversationMessage]:
-    return [_strip_image_blocks_from_message(message) for message in messages]
+    # The resend/switch-model guidance is only appended to the most recent
+    # image-bearing message; earlier stripped messages keep a compact marker so
+    # a long history is not flooded with repeated instructions.
+    last_image_index = max(
+        (
+            index
+            for index, message in enumerate(messages)
+            if any(isinstance(block, ImageBlock) for block in message.content)
+        ),
+        default=-1,
+    )
+    return [
+        _strip_image_blocks_from_message(message, include_guidance=index == last_image_index)
+        for index, message in enumerate(messages)
+    ]
 
 
-def _strip_image_blocks_from_message(message: ConversationMessage) -> ConversationMessage:
-    if not any(isinstance(block, ImageBlock) for block in message.content):
+def _strip_image_blocks_from_message(
+    message: ConversationMessage,
+    *,
+    include_guidance: bool = True,
+) -> ConversationMessage:
+    stripped = [block for block in message.content if isinstance(block, ImageBlock)]
+    if not stripped:
         return message
     content = [block for block in message.content if not isinstance(block, ImageBlock)]
-    if not any(isinstance(block, TextBlock) for block in content):
-        content.append(TextBlock(text=_IMAGE_FALLBACK_NOTE))
+    has_text = any(isinstance(block, TextBlock) and block.text.strip() for block in content)
+    note = _image_fallback_note(stripped, include_guidance=include_guidance)
+    # Provider clients join adjacent text blocks without a separator, so pad
+    # the note when the message keeps its own text.
+    content.append(TextBlock(text="\n\n" + note if has_text else note))
     return message.model_copy(update={"content": content})
+
+
+def _image_fallback_note(stripped: list[ImageBlock], *, include_guidance: bool) -> str:
+    sources = ", ".join(
+        block.source_path or f"<{block.media_type or 'image'}>" for block in stripped
+    )
+    note = _IMAGE_FALLBACK_NOTE_PREFIX
+    note += f": {sources}." if sources else "."
+    if include_guidance:
+        note += _IMAGE_FALLBACK_NOTE_GUIDANCE
+    return note + "]"
 
 
 def _build_speaker_context(message: InboundMessage) -> str:

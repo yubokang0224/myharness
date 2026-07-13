@@ -140,6 +140,12 @@ class BaseChannel(ABC):
         )
 
         await self.bus.publish_inbound(msg)
+        logger.info(
+            "%s inbound published bus=%s qsize=%d",
+            self.name,
+            hex(id(self.bus)),
+            self.bus.inbound_size,
+        )
 
     @property
     def is_running(self) -> bool:

@@ -44,11 +44,15 @@ memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
 soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
+failures_app = typer.Typer(name="failures", help="Aggregate failure signals into review reports")
+eval_app = typer.Typer(name="eval", help="Regression evaluation for prompt/skill changes")
 
 app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
+app.add_typer(failures_app)
+app.add_typer(eval_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
@@ -377,15 +381,13 @@ def _maybe_restart_gateway(*, cwd: str | Path, workspace: str | Path) -> None:
 
 
 def _configure_gateway_logging(workspace: str | Path | None = None) -> None:
-    """Configure foreground gateway logging."""
+    """Configure foreground gateway logging (console + JSONL file)."""
+    from ohmo.logging_setup import configure_process_logging
+
     config = load_gateway_config(workspace)
     level_name = str(config.log_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-        force=True,
-    )
+    configure_process_logging("gateway", workspace=workspace, level=level)
 
 
 @app.callback(invoke_without_command=True)
@@ -652,6 +654,99 @@ def gateway_status_cmd(
     print(state.model_dump_json(indent=2))
 
 
+@failures_app.command("report")
+def failures_report_cmd(
+    days: int = typer.Option(7, "--days", help="Look-back window in days"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    email: bool = typer.Option(False, "--email", help="Email the report via alerting SMTP config"),
+    max_groups: int = typer.Option(30, "--max-groups", help="Maximum groups listed in the report"),
+) -> None:
+    """Scan invocation/session records for failure signals and write the review report."""
+    from ohmo.failure_report import write_report
+
+    path, markdown, count = write_report(workspace, days=days, max_groups=max_groups)
+    print(f"失败信号 {count} 条，报告已生成: {path}")
+    if email:
+        from datetime import datetime
+
+        from ohmo.alerting import send_email
+
+        alerting = load_gateway_config(workspace).alerting
+        subject = f"[ohmo周报] 智能体失败信号建议修订清单 {datetime.now().strftime('%Y-%m-%d')}"
+        ok = send_email(
+            alerting,
+            subject=subject,
+            body=markdown,
+            attachments=[(path.name, markdown.encode("utf-8"))],
+        )
+        print("邮件已发送。" if ok else "邮件发送失败（检查 gateway.json alerting SMTP 配置）。")
+
+
+@eval_app.command("init")
+def eval_init_cmd(
+    output: str = typer.Option("eval-cases.json", "--output", help="Where to write the case file"),
+    from_sessions: bool = typer.Option(
+        False, "--from-sessions", help="Extract real user prompts from persisted session/invocation records"
+    ),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    days: int = typer.Option(30, "--days", help="Look-back window when using --from-sessions"),
+    limit: int = typer.Option(20, "--limit", help="Max cases when using --from-sessions"),
+) -> None:
+    """Write an evaluation case file (sample, or extracted from real history)."""
+    import json as _json
+
+    from ohmo.eval_runner import SAMPLE_CASES, extract_cases_from_sessions
+
+    path = Path(output)
+    if path.exists():
+        print(f"{path} 已存在，不覆盖。")
+        raise typer.Exit(1)
+    if from_sessions:
+        cases = extract_cases_from_sessions(workspace, days=days, limit=limit)
+        if not cases:
+            print(f"最近 {days} 天的会话/调用记录里没有可用的用户问题，改用 `ohmo eval init` 生成样例后手工填写。")
+            raise typer.Exit(1)
+        path.write_text(_json.dumps(cases, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"已从历史记录抽取 {len(cases)} 条真实用户问题写入: {path}")
+        print("默认只校验“有非空输出且不报错”；对重要场景补充 must_contain 判分标准。")
+    else:
+        path.write_text(_json.dumps(SAMPLE_CASES, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"样例用例已写入: {path}（把 prompt 换成真实用户问题；或用 --from-sessions 从会话记录自动抽取）")
+
+
+@eval_app.command("run")
+def eval_run_cmd(
+    cases: str = typer.Option(..., "--cases", help="JSON case file (see `ohmo eval init`)"),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    cwd: str | None = typer.Option(None, "--cwd", help="Working directory for the agent run"),
+    model: str | None = typer.Option(None, "--model", help="Model override"),
+    label: str | None = typer.Option(None, "--label", help="Run label (defaults to timestamp)"),
+    baseline: str | None = typer.Option(
+        None, "--baseline", help="Previous run dir (or its summary.json) to diff against"
+    ),
+) -> None:
+    """Run all cases through ohmo print mode and grade the outputs."""
+    from ohmo.eval_runner import run_eval
+
+    out_dir, summary, diff_lines = run_eval(
+        Path(cases),
+        workspace=workspace,
+        cwd=cwd,
+        model=model,
+        label=label,
+        baseline=Path(baseline) if baseline else None,
+    )
+    print(
+        f"\n共 {summary['total']} 例：通过 {summary['passed']}，失败 {summary['failed']}，"
+        f"平均分 {summary['average_score']}"
+    )
+    print(f"结果目录: {out_dir}")
+    for line in diff_lines:
+        print(line)
+    if any(line.startswith("[回归]") for line in diff_lines) or summary["failed"] > 0:
+        raise typer.Exit(1)
+
+
 @app.command("serve")
 def serve_cmd(
     host: str = typer.Option("0.0.0.0", "--host", help="Bind host"),
@@ -668,10 +763,15 @@ def serve_cmd(
         raise typer.Exit(1)
 
     from ohmo.gateway.api import create_app
+    from ohmo.logging_setup import configure_process_logging
 
     effective_workspace = workspace
     if effective_workspace:
         effective_workspace = str(Path(effective_workspace).resolve())
+
+    config = load_gateway_config(effective_workspace)
+    level = getattr(logging, str(config.log_level or "INFO").upper(), logging.INFO)
+    configure_process_logging("agent-api", workspace=effective_workspace, level=level)
 
     api_app = create_app(
         cors_origins=cors_origins or None,

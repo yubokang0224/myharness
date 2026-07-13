@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable
 
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
+from openharness.utils.trace import set_trace_id
 
 from ohmo.gateway.router import session_key_for_message
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
@@ -73,6 +74,7 @@ class OhmoGatewayBridge:
 
     async def run(self) -> None:
         self._running = True
+        logger.info("ohmo gateway bridge started bus=%s", hex(id(self._bus)))
         while self._running:
             try:
                 message = await asyncio.wait_for(self._bus.consume_inbound(), timeout=1.0)
@@ -80,41 +82,54 @@ class OhmoGatewayBridge:
                 continue
             except asyncio.CancelledError:
                 break
+            except Exception:
+                logger.exception("ohmo gateway bridge consume failed")
+                continue
 
-            session_key = session_key_for_message(message)
-            logger.info(
-                "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
-                message.channel,
-                message.chat_id,
-                message.sender_id,
-                session_key,
-                _content_snippet(message.content),
-            )
-            if message.content.strip() == "/stop":
-                await self._handle_stop(message, session_key)
-                continue
-            if message.content.strip() == "/restart":
-                await self._handle_restart(message, session_key)
-                continue
-            if self._is_dingtalk_new_dialog_command(message):
-                await self._handle_new_dialog(message, session_key)
-                continue
-            await self._interrupt_session(
-                session_key,
-                reason="replaced by a newer user message",
-                notify=OutboundMessage(
-                    channel=message.channel,
-                    chat_id=message.chat_id,
-                    content="⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。",
-                    metadata={"_progress": True, "_session_key": session_key},
-                ),
-            )
-            task = asyncio.create_task(
-                self._process_message(message, session_key),
-                name=f"ohmo-session:{session_key}",
-            )
-            self._session_tasks[session_key] = task
-            task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+            try:
+                # One trace id per inbound message; asyncio context propagation
+                # carries it into the session task, engine, and tool logs.
+                set_trace_id()
+                session_key = session_key_for_message(message)
+                logger.info(
+                    "ohmo inbound received channel=%s chat_id=%s sender_id=%s session_key=%s content=%r",
+                    message.channel,
+                    message.chat_id,
+                    message.sender_id,
+                    session_key,
+                    _content_snippet(message.content),
+                )
+                if message.content.strip() == "/stop":
+                    await self._handle_stop(message, session_key)
+                    continue
+                if message.content.strip() == "/restart":
+                    await self._handle_restart(message, session_key)
+                    continue
+                if self._is_dingtalk_new_dialog_command(message):
+                    await self._handle_new_dialog(message, session_key)
+                    continue
+                await self._interrupt_session(
+                    session_key,
+                    reason="replaced by a newer user message",
+                    notify=OutboundMessage(
+                        channel=message.channel,
+                        chat_id=message.chat_id,
+                        content="⏹️ 已停止上一条正在处理的任务，继续看你的最新消息。",
+                        metadata={"_progress": True, "_session_key": session_key},
+                    ),
+                )
+                task = asyncio.create_task(
+                    self._process_message(message, session_key),
+                    name=f"ohmo-session:{session_key}",
+                )
+                self._session_tasks[session_key] = task
+                task.add_done_callback(lambda finished, key=session_key: self._cleanup_task(key, finished))
+            except Exception:
+                logger.exception(
+                    "ohmo gateway bridge failed to dispatch message channel=%s chat_id=%s",
+                    getattr(message, "channel", "?"),
+                    getattr(message, "chat_id", "?"),
+                )
 
     def stop(self) -> None:
         self._running = False
@@ -208,9 +223,12 @@ class OhmoGatewayBridge:
         }
         try:
             reply = ""
+            reply_media: list[str] = []
             async for update in self._runtime_pool.stream_message(message, session_key):
                 if update.kind == "final":
                     reply = update.text
+                    raw_media = (update.metadata or {}).get("_artifact_paths")
+                    reply_media = [str(path) for path in raw_media] if isinstance(raw_media, list) else []
                     continue
                 if not update.text:
                     continue
@@ -258,6 +276,7 @@ class OhmoGatewayBridge:
                 _content_snippet(message.content),
             )
             reply = _format_gateway_error(exc)
+            reply_media = []
         if not reply:
             logger.info(
                 "ohmo inbound finished without final reply channel=%s chat_id=%s session_key=%s",
@@ -267,17 +286,19 @@ class OhmoGatewayBridge:
             )
             return
         logger.info(
-            "ohmo outbound final channel=%s chat_id=%s session_key=%s content=%r",
+            "ohmo outbound final channel=%s chat_id=%s session_key=%s content=%r media=%s",
             message.channel,
             message.chat_id,
             session_key,
             _content_snippet(reply),
+            len(reply_media),
         )
         await self._bus.publish_outbound(
             OutboundMessage(
                 channel=message.channel,
                 chat_id=message.chat_id,
                 content=reply,
+                media=reply_media,
                 metadata={**inbound_meta, "_session_key": session_key},
             )
         )
