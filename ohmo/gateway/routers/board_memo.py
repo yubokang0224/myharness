@@ -80,6 +80,30 @@ async def update_board_memo_item(
     return await _forward_board_memo("UpdateItem", request, credentials)
 
 
+@router.post("/Update")
+async def update_board_memo(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> Response:
+    return await _forward_board_memo("Update", request, credentials)
+
+
+@router.post("/Delete")
+async def delete_board_memo(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> Response:
+    return await _forward_board_memo("Delete", request, credentials)
+
+
+@router.post("/DeleteItem")
+async def delete_board_memo_item(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> Response:
+    return await _forward_board_memo("DeleteItem", request, credentials)
+
+
 @router.get("/GetListPaged")
 async def get_board_memo_list(
     request: Request,

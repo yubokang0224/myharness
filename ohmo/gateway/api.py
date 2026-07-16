@@ -14,7 +14,9 @@ from ohmo.gateway.routers import (
     agents,
     board_memo,
     chat,
+    cron,
     invocations,
+    kb,
     logs,
     metrics,
     models,
@@ -113,9 +115,11 @@ def create_app(
     app.include_router(agents.router, prefix=prefix)
     app.include_router(skills.router, prefix=prefix)
     app.include_router(tasks.router, prefix=prefix)
+    app.include_router(cron.router, prefix=prefix)
     app.include_router(models.router, prefix=prefix)
     app.include_router(production_issue.router, prefix=prefix)
     app.include_router(board_memo.router, prefix=prefix)
+    app.include_router(kb.router, prefix=prefix)
     app.include_router(logs.router, prefix=prefix)
     app.include_router(metrics.router, prefix=prefix)
 

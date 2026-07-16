@@ -191,6 +191,34 @@ def _prepare_user_text(body: MessageRequest, attachment_notes: str = "") -> str:
     return user_text
 
 
+def _kb_preference_note(body: MessageRequest) -> str:
+    """Render the client's per-message KB preference as a system-prompt suffix.
+
+    Appended to the runtime system prompt only — never into the user text,
+    which is persisted verbatim and feeds session titles. Advisory for the
+    model; the hard namespace ACL is enforced by the /Kb proxy routes.
+    """
+    kb = getattr(body, "kb", None)
+    if kb is None:
+        return ""
+    if not kb.enabled:
+        return (
+            "\n\n[知识库检索设置]（仅本条消息生效）用户已关闭知识库检索："
+            "不要调用知识库检索接口（Kb/Recall），直接基于对话内容和自身知识回答。"
+        )
+    namespaces = ", ".join(name for name in kb.namespaces if name)
+    if namespaces:
+        return (
+            f"\n\n[知识库检索设置]（仅本条消息生效）用户已启用知识库检索，指定知识库：{namespaces}。"
+            f"回答涉及事实、规范、参数或历史经验时，先按 knowledge-base 技能调用 Kb/Recall"
+            f"（namespaces 填 [{namespaces}]）再作答，并标注引用来源。"
+        )
+    return (
+        "\n\n[知识库检索设置]（仅本条消息生效）用户已启用知识库检索（未指定知识库，使用当前智能体的默认知识库）。"
+        "回答涉及事实、规范、参数或历史经验时，先按 knowledge-base 技能检索再作答，并标注引用来源。"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Oversized-input funnel: spill huge pasted text to a file first, then reject
 # anything that still cannot fit the context window. Inputs below the spill
@@ -1003,7 +1031,7 @@ async def send_message(
                 settings,
                 cwd=effective_cwd,
                 latest_user_prompt=user_text,
-            ) + _FILE_LINK_GUIDANCE
+            ) + _FILE_LINK_GUIDANCE + _kb_preference_note(body)
 
             budget_error = _input_budget_error(
                 user_text=user_text,
@@ -1028,7 +1056,7 @@ async def send_message(
                         settings,
                         cwd=effective_cwd,
                         latest_user_prompt=user_text,
-                    ) + _FILE_LINK_GUIDANCE
+                    ) + _FILE_LINK_GUIDANCE + _kb_preference_note(body)
                     budget_error = _input_budget_error(
                         user_text=user_text,
                         system_prompt=system_prompt,
@@ -1473,7 +1501,7 @@ async def send_message_sync(
             settings,
             cwd=effective_cwd,
             latest_user_prompt=user_text,
-        )
+        ) + _kb_preference_note(body)
 
         budget_error = _input_budget_error(
             user_text=user_text,
@@ -1498,7 +1526,7 @@ async def send_message_sync(
                     settings,
                     cwd=effective_cwd,
                     latest_user_prompt=user_text,
-                )
+                ) + _kb_preference_note(body)
                 budget_error = _input_budget_error(
                     user_text=user_text,
                     system_prompt=system_prompt,

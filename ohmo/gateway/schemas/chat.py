@@ -29,11 +29,19 @@ class SessionInfo(BaseModel):
     message_count: int = 0
 
 
+class KbPreference(BaseModel):
+    """Per-message knowledge-base retrieval preference set by the client UI."""
+
+    enabled: bool = True
+    namespaces: list[str] = Field(default_factory=list)
+
+
 class MessageRequest(BaseModel):
     content: str
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     response_format: Literal["text", "json"] = "text"
     persist_mode: Literal["session", "log", "none"] | None = None
+    kb: KbPreference | None = None
 
 
 class PermissionRequestInfo(BaseModel):

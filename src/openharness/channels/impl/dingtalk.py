@@ -580,6 +580,10 @@ class DingTalkChannel(BaseChannel):
             or "attachment"
         )
         message_id = str(getattr(chatbot_msg, "message_id", None) or raw_data.get("msgId") or int(time.time()))
+        # DingTalk messageId is base64-like and may contain "/" (e.g. msgRiVZT/XrJh...),
+        # which would split the target filename into non-existent subdirectories and
+        # make write_bytes fail with ENOENT. Sanitize it for filesystem use.
+        message_id = re.sub(r"[^A-Za-z0-9._-]+", "_", message_id)
 
         download_targets: list[dict[str, str]] = []
         for item in deduped_items:

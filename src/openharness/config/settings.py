@@ -522,6 +522,50 @@ class InternalApiSettings(BaseModel):
     dingtalk_token: str = "123"
 
 
+class KbAgentAccess(BaseModel):
+    """Knowledge-base namespaces one agent may read from / write to."""
+
+    read: list[str] = Field(default_factory=list)
+    write: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+class KbSettings(BaseModel):
+    """RAG semantic-hub integration used by the gateway /Kb proxy routes.
+
+    The hub JWT secret stays server-side: skills and the web UI always go
+    through the gateway, which signs short-lived tokens scoped to the
+    namespaces allowed for the calling agent.
+    """
+
+    hub_base_url: str = ""
+    jwt_secret: str = ""
+    jwt_ttl_seconds: int = 600
+    default_mode: str = "express"
+    default_top_k: int = 8
+    timeout: float = 30.0
+    # namespace -> human-readable label, drives the web UI pickers.
+    namespaces: dict[str, str] = Field(default_factory=dict)
+    # agent name -> namespace access; the union of all lists is the hard ACL.
+    agents: dict[str, KbAgentAccess] = Field(default_factory=dict)
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.hub_base_url.strip() and self.jwt_secret)
+
+    def readable_namespaces(self) -> set[str]:
+        names = set(self.namespaces)
+        for access in self.agents.values():
+            names.update(access.read)
+        return names
+
+    def writable_namespaces(self) -> set[str]:
+        names: set[str] = set()
+        for access in self.agents.values():
+            names.update(access.write)
+        return names
+
+
 class Settings(BaseModel):
     """Main settings model for OpenHarness."""
 
@@ -564,6 +608,9 @@ class Settings(BaseModel):
 
     # Internal API auth forwarding for backend tools.
     internal_api: InternalApiSettings = Field(default_factory=InternalApiSettings)
+
+    # RAG knowledge-base hub proxied by the gateway /Kb routes.
+    kb: KbSettings = Field(default_factory=KbSettings)
 
     def merged_profiles(self) -> dict[str, ProviderProfile]:
         """Return the saved profiles merged over the built-in catalog."""

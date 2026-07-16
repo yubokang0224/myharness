@@ -23,17 +23,17 @@ def test_internal_api_env_overrides_config(tmp_path, monkeypatch):
 """.strip(),
         encoding="utf-8",
     )
-    monkeypatch.setenv("OHMO_INTERNAL_API_BASE_URL", "http://39.106.250.202:2415")
+    monkeypatch.setenv("OHMO_INTERNAL_API_BASE_URL", "http://192.168.6.123:2415")
     monkeypatch.setenv(
         "OHMO_INTERNAL_API_ALLOWLIST",
-        "http://39.106.250.202:2415,http://localhost:2415",
+        "http://192.168.6.123:2415,http://localhost:2415",
     )
 
     settings = load_settings(config_path)
 
-    assert settings.internal_api.base_url == "http://39.106.250.202:2415"
+    assert settings.internal_api.base_url == "http://3192.168.6.123:2415"
     assert settings.internal_api.allowlist == [
-        "http://39.106.250.202:2415",
+        "http://192.168.6.123:2415",
         "http://localhost:2415",
     ]
 
@@ -41,8 +41,8 @@ def test_internal_api_env_overrides_config(tmp_path, monkeypatch):
 def test_apply_internal_api_auth_for_allowlisted_relative_url():
     settings = Settings(
         internal_api={
-            "base_url": "http://39.106.250.202:2415",
-            "allowlist": ["http://39.106.250.202:2415"],
+            "base_url": "http://192.168.6.123:2415",
+            "allowlist": ["http://192.168.6.123:2415"],
         }
     )
 
@@ -53,7 +53,7 @@ def test_apply_internal_api_auth_for_allowlisted_relative_url():
         settings=settings,
     )
 
-    assert url == "http://39.106.250.202:2415/api/demo"
+    assert url == "http://192.168.6.123:2415/api/demo"
     assert headers["Authorization"] == "Bearer abc"
     assert attached is True
 
