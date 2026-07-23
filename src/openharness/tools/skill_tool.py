@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import BaseModel, Field
 
 from openharness.skills import load_skill_registry
@@ -34,4 +36,13 @@ class SkillTool(BaseTool):
         skill = registry.get(arguments.name) or registry.get(arguments.name.lower()) or registry.get(arguments.name.title())
         if skill is None:
             return ToolResult(output=f"Skill not found: {arguments.name}", is_error=True)
+        if skill.path:
+            # Skills reference bundled files relative to their own directory
+            # (./scripts/…, ./references/…); tell the model where that is.
+            skill_dir = str(Path(skill.path).parent)
+            header = (
+                f"[Skill directory: {skill_dir}]\n"
+                "(Relative paths in this skill such as ./scripts/… resolve against this directory.)\n\n"
+            )
+            return ToolResult(output=header + skill.content)
         return ToolResult(output=skill.content)

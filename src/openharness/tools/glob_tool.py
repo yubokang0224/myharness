@@ -35,7 +35,14 @@ class GlobTool(BaseTool):
 
     async def execute(self, arguments: GlobToolInput, context: ToolExecutionContext) -> ToolResult:
         root, pattern = _resolve_glob_request(context.cwd, arguments.root, arguments.pattern)
-        matches = await _glob(root, pattern, limit=arguments.limit)
+        try:
+            matches = await _glob(root, pattern, limit=arguments.limit)
+        except (ValueError, OSError) as exc:
+            # e.g. pathlib rejects patterns where '**' is not a whole component
+            return ToolResult(
+                output=f"glob failed for pattern {arguments.pattern!r}: {exc}",
+                is_error=True,
+            )
         if not matches:
             return ToolResult(output="(no matches)")
         return ToolResult(output="\n".join(matches))

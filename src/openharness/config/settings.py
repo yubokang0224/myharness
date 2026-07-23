@@ -539,6 +539,10 @@ class KbSettings(BaseModel):
     """
 
     hub_base_url: str = ""
+    # 登录换 token 模式(hub 2026-07 起用账号签发 30 天 access_token):
+    # 配置了 hub_username/hub_password 时优先走登录;jwt_secret 仅作旧部署回退。
+    hub_username: str = ""
+    hub_password: str = ""
     jwt_secret: str = ""
     jwt_ttl_seconds: int = 600
     default_mode: str = "express"
@@ -551,7 +555,8 @@ class KbSettings(BaseModel):
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.hub_base_url.strip() and self.jwt_secret)
+        has_auth = bool(self.hub_username.strip() and self.hub_password) or bool(self.jwt_secret)
+        return bool(self.hub_base_url.strip() and has_auth)
 
     def readable_namespaces(self) -> set[str]:
         names = set(self.namespaces)

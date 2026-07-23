@@ -855,6 +855,19 @@ def _apply_channel_context_metadata(
         except Exception:
             logger.debug("unable to attach channel context metadata", exc_info=True)
             return
+    # Keep the most recent attachment-bearing message around: confirm-style
+    # follow-ups ("确认入库") carry no media, but downstream API auto-fill
+    # (BoardMemo Insert attachments/idempotency) needs the original photo turn.
+    previous_context = metadata.get("channel_context")
+    previous_context = previous_context if isinstance(previous_context, dict) else {}
+    current_paths = list(message.media or [])
+    message_id = _optional_str(message.metadata.get("message_id"))
+    if current_paths:
+        last_attachment_paths = current_paths
+        last_attachment_message_id = message_id
+    else:
+        last_attachment_paths = list(previous_context.get("last_attachment_paths") or [])
+        last_attachment_message_id = _optional_str(previous_context.get("last_attachment_message_id"))
     metadata["channel_context"] = {
         "channel": message.channel.split(":", 1)[0],
         "raw_channel": message.channel,
@@ -862,11 +875,13 @@ def _apply_channel_context_metadata(
         "sender_id": message.sender_id,
         "source_sender_id": _optional_str(message.metadata.get("source_sender_id")),
         "sender_name": _optional_str(message.metadata.get("sender_name")),
-        "message_id": _optional_str(message.metadata.get("message_id")),
+        "message_id": message_id,
         "conversation_id": _optional_str(message.metadata.get("conversation_id")),
         "session_key": session_key,
         "timestamp": message.timestamp.isoformat() if message.timestamp else "",
-        "attachment_paths": list(message.media or []),
+        "attachment_paths": current_paths,
+        "last_attachment_paths": last_attachment_paths,
+        "last_attachment_message_id": last_attachment_message_id,
     }
 
 

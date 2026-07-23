@@ -73,12 +73,14 @@ async def get_kb_config(
     """Knowledge-base configuration for UI pickers (namespaces, agent access)."""
 
     kb = load_settings().kb
+    hub_titles = await _hub_workspace_titles(kb) if kb.is_configured else {}
     payload: dict[str, Any] = {
         "configured": kb.is_configured,
         "default_mode": kb.default_mode,
         "default_top_k": kb.default_top_k,
+        # 显示名优先取 RAG 侧 workspace 标题；本地 label 只是 hub 不可达兜底
         "namespaces": [
-            {"name": name, "label": label or name}
+            {"name": name, "label": hub_titles.get(name) or label or name}
             for name, label in sorted(kb.namespaces.items())
         ],
         "agents": {
@@ -90,6 +92,53 @@ async def get_kb_config(
     if request.query_params.get("probe") and kb.is_configured:
         payload["hub_ok"] = await _probe_hub(kb)
     return payload
+
+
+@router.put("/AgentAccess/{agent_name}")
+async def put_kb_agent_access(
+    agent_name: str,
+    request: Request,
+    _user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    """Set one agent's knowledge-base authorization (called by the Agent 配置 UI).
+
+    Stored in settings.kb.agents — the same mapping the Recall/Ingest ACL
+    enforces, so changes take effect immediately.
+    """
+    from openharness.config import save_settings
+    from openharness.config.settings import KbAgentAccess
+
+    payload, _channel = await _read_json_body(request)
+    agent_name = agent_name.strip()
+    if not agent_name:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="agent name is required")
+
+    settings = load_settings()
+    kb = settings.kb
+    known = set(kb.namespaces)
+    read = _string_list(payload.get("read"))
+    write = _string_list(payload.get("write"))
+    unknown = [ns for ns in {*read, *write} if ns not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"unknown namespaces: {unknown}; registered namespaces: {sorted(known)}",
+        )
+    not_readable = [ns for ns in write if ns not in read]
+    if not_readable:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"writable namespaces must also be readable: {not_readable}",
+        )
+
+    access = KbAgentAccess(read=read, write=write, enabled=bool(payload.get("enabled", True)))
+    kb.agents[agent_name] = access
+    save_settings(settings)
+    logger.info(
+        "Kb agent access updated agent=%s read=%s write=%s enabled=%s",
+        agent_name, read, write, access.enabled,
+    )
+    return {"agent": agent_name, "read": read, "write": write, "enabled": access.enabled}
 
 
 @router.post("/Recall")
@@ -121,9 +170,8 @@ async def kb_recall(
         )
 
     top_k = _clamp_int(payload.get("top_k") or payload.get("topK"), kb.default_top_k, 1, _MAX_TOP_K)
-    namespaces = _resolve_recall_namespaces(kb, payload)
+    namespaces = _resolve_recall_namespaces(kb, payload, source_channel)
 
-    token = _sign_hub_token(kb, namespaces=namespaces, permission="read")
     started = time.monotonic()
     chunks: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -134,7 +182,6 @@ async def kb_recall(
                 _recall_one(
                     client,
                     kb,
-                    token=token,
                     namespace=namespace,
                     query=query,
                     mode=mode,
@@ -189,11 +236,13 @@ async def kb_ingest(
     namespace = _text(payload.get("namespace"))
     if not namespace:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="namespace is required")
-    writable = kb.writable_namespaces()
+    agent_name, access = _caller_access(kb, payload, source_channel)
+    writable = set(access.write) if access is not None else kb.writable_namespaces()
     if namespace not in writable:
+        who = f"agent '{agent_name}'" if access is not None else "caller"
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"namespace '{namespace}' is not writable; writable namespaces: {sorted(writable)}",
+            detail=f"namespace '{namespace}' is not writable for {who}; writable: {sorted(writable)}",
         )
 
     text = _text(payload.get("text")) or _text(payload.get("content"))
@@ -250,12 +299,9 @@ async def kb_ingest(
         if payload.get("dry_run") or payload.get("dryRun"):
             hub_body["dry_run"] = True
 
-        token = _sign_hub_token(kb, namespaces=[namespace], permission="write")
         try:
-            response = await client.post(
-                _hub_url(kb, "/v1/hub/ingest"),
-                headers={"Authorization": f"Bearer {token}"},
-                json=hub_body,
+            response = await _hub_post(
+                client, kb, "/v1/hub/ingest", hub_body, namespaces=[namespace], permission="write"
             )
         except httpx.HTTPError as exc:
             raise HTTPException(
@@ -323,7 +369,6 @@ async def _recall_one(
     client: httpx.AsyncClient,
     kb: KbSettings,
     *,
-    token: str,
     namespace: str,
     query: str,
     mode: str,
@@ -340,11 +385,7 @@ async def _recall_one(
     if isinstance(min_importance, (int, float)):
         body["min_importance"] = max(0.0, min(1.0, float(min_importance)))
 
-    response = await client.post(
-        _hub_url(kb, "/v1/hub/recall"),
-        headers={"Authorization": f"Bearer {token}"},
-        json=body,
-    )
+    response = await _hub_post(client, kb, "/v1/hub/recall", body, namespaces=[namespace], permission="read")
     if response.status_code >= 400:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
 
@@ -374,7 +415,30 @@ def _trim_chunk(raw: dict[str, Any], namespace: str) -> dict[str, Any]:
     }
 
 
-def _resolve_recall_namespaces(kb: KbSettings, payload: dict[str, Any]) -> list[str]:
+def _resolve_caller_agent(kb: KbSettings, payload: dict[str, Any], source_channel: str) -> str:
+    """Best-effort caller identity, strongest source first.
+
+    DingTalk skill calls carry a runtime-injected sourceSessionKey of the form
+    ``dingtalk:<bot>:<agent>:<chat>:<sender>`` — that agent name is trusted and
+    wins over any model-supplied agent_name field.
+    """
+    if source_channel == "dingtalk":
+        key = _text(payload.get("sourceSessionKey") or payload.get("source_session_key"))
+        parts = key.split(":")
+        if len(parts) >= 3 and parts[0] == "dingtalk" and parts[2] in kb.agents:
+            return parts[2]
+    return _text(payload.get("agent_name") or payload.get("agentName"))
+
+
+def _caller_access(kb: KbSettings, payload: dict[str, Any], source_channel: str):
+    """Return (agent_name, KbAgentAccess | None) for per-agent enforcement."""
+    agent_name = _resolve_caller_agent(kb, payload, source_channel)
+    return agent_name, (kb.agents.get(agent_name) if agent_name else None)
+
+
+def _resolve_recall_namespaces(
+    kb: KbSettings, payload: dict[str, Any], source_channel: str
+) -> list[str]:
     readable = kb.readable_namespaces()
     if not readable:
         raise HTTPException(
@@ -382,21 +446,30 @@ def _resolve_recall_namespaces(kb: KbSettings, payload: dict[str, Any]) -> list[
             detail="no readable namespaces configured (settings.kb)",
         )
 
+    agent_name, access = _caller_access(kb, payload, source_channel)
+    if access is not None and source_channel == "dingtalk" and not access.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"knowledge base retrieval is disabled for agent '{agent_name}'",
+        )
+    # Identified agents are confined to their own read list; unidentified
+    # callers (web UI constrains choices itself) fall back to the global set.
+    allowed = set(access.read) if access is not None else readable
+
     requested = _string_list(payload.get("namespaces"))
     single = _text(payload.get("namespace"))
     if single and single not in requested:
         requested.append(single)
 
     if not requested:
-        agent_name = _text(payload.get("agent_name") or payload.get("agentName"))
-        access = kb.agents.get(agent_name) if agent_name else None
-        requested = list(access.read) if access and access.read else sorted(readable)
+        requested = sorted(allowed)
 
-    denied = [namespace for namespace in requested if namespace not in readable]
+    denied = [namespace for namespace in requested if namespace not in allowed]
     if denied:
+        who = f"agent '{agent_name}'" if access is not None else "caller"
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"namespaces not allowed: {denied}; readable namespaces: {sorted(readable)}",
+            detail=f"namespaces not allowed for {who}: {denied}; allowed: {sorted(allowed)}",
         )
     # De-duplicate, preserve order.
     return list(dict.fromkeys(requested))
@@ -508,7 +581,7 @@ def _require_kb_configured(kb: KbSettings | None = None) -> KbSettings:
     if not kb.is_configured:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="knowledge base is not configured (settings.kb.hub_base_url / jwt_secret)",
+            detail="knowledge base is not configured (settings.kb.hub_base_url + hub_username/hub_password or jwt_secret)",
         )
     return kb
 
@@ -558,8 +631,137 @@ def _sign_hub_token(kb: KbSettings, *, namespaces: list[str], permission: str) -
     return jwt.encode(payload, kb.jwt_secret, algorithm="HS256")
 
 
+# Hub 登录 token 缓存:hub 已从共享 JWT 密钥改为账号登录签发长效 access_token,
+# 网关按需登录并缓存,401 时强制重登一次。namespace 级 ACL 仍由本网关自己执行。
+_hub_login_lock = asyncio.Lock()
+_hub_login_cache: dict[str, Any] = {"key": None, "token": "", "expires_at": 0.0}
+
+
+async def _resolve_hub_token(
+    kb: KbSettings,
+    *,
+    namespaces: list[str],
+    permission: str,
+    force_refresh: bool = False,
+) -> str:
+    username = kb.hub_username.strip()
+    if not (username and kb.hub_password):
+        # 旧模式:共享密钥自签短时 token
+        return _sign_hub_token(kb, namespaces=namespaces, permission=permission)
+
+    key = (kb.hub_base_url.strip(), username)
+
+    def _cached() -> str:
+        if (
+            _hub_login_cache["key"] == key
+            and _hub_login_cache["token"]
+            and time.time() < _hub_login_cache["expires_at"]
+        ):
+            return _hub_login_cache["token"]
+        return ""
+
+    if not force_refresh:
+        token = _cached()
+        if token:
+            return token
+
+    async with _hub_login_lock:
+        if not force_refresh:
+            token = _cached()
+            if token:
+                return token
+        try:
+            async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+                response = await client.post(
+                    _hub_url(kb, "/api/v1/auth/login"),
+                    json={"username": username, "password": kb.hub_password},
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"hub login unavailable: {exc}",
+            ) from exc
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"hub login failed (HTTP {response.status_code}): {response.text[:200]}",
+            )
+        data = _safe_json(response)
+        tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+        token = _text(tokens.get("access_token")) or _text(data.get("access_token"))
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="hub login succeeded but returned no access_token",
+            )
+        ttl = None
+        for candidate in (data.get("expires_in"), tokens.get("expires_in")):
+            try:
+                ttl = float(candidate)
+                break
+            except (TypeError, ValueError):
+                continue
+        if not ttl or ttl <= 0:
+            ttl = 12 * 3600.0
+        # 提前 10 分钟视为过期,避免边界 401;真过期还有 401 重登兜底
+        _hub_login_cache.update({"key": key, "token": token, "expires_at": time.time() + max(600.0, ttl - 600.0)})
+        logger.info("Kb hub login ok user=%s ttl=%ss", username, int(ttl))
+        return token
+
+
+async def _hub_post(
+    client: httpx.AsyncClient,
+    kb: KbSettings,
+    path: str,
+    body: dict[str, Any],
+    *,
+    namespaces: list[str],
+    permission: str,
+) -> httpx.Response:
+    """POST to the hub with auth; on 401 (login mode) re-login once and retry."""
+    token = await _resolve_hub_token(kb, namespaces=namespaces, permission=permission)
+    response = await client.post(_hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body)
+    if response.status_code == 401 and kb.hub_username.strip():
+        logger.info("Kb hub token rejected (401), re-login and retry path=%s", path)
+        token = await _resolve_hub_token(kb, namespaces=namespaces, permission=permission, force_refresh=True)
+        response = await client.post(_hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body)
+    return response
+
+
 def _hub_url(kb: KbSettings, path: str) -> str:
     return kb.hub_base_url.rstrip("/") + path
+
+
+# 库显示名以 RAG 侧 workspace 标题为准（他们改名自动跟随）；本地 label 仅作
+# hub 不可达时的兜底。进程内缓存 60s，避免每次打开配置页都打一次 hub。
+_workspace_title_cache: dict[str, Any] = {"at": 0.0, "titles": {}}
+_WORKSPACE_TITLE_TTL = 60.0
+
+
+async def _hub_workspace_titles(kb: KbSettings) -> dict[str, str]:
+    now = time.monotonic()
+    if now - _workspace_title_cache["at"] < _WORKSPACE_TITLE_TTL and _workspace_title_cache["titles"]:
+        return _workspace_title_cache["titles"]
+    try:
+        token = await _resolve_hub_token(kb, namespaces=["*"], permission="read")
+        async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
+            response = await client.get(
+                _hub_url(kb, "/api/v1/dashboard/workspaces"),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        if response.status_code < 400:
+            workspaces = _safe_json(response).get("workspaces") or []
+            titles = {
+                str(ws.get("namespace")): str(ws.get("title"))
+                for ws in workspaces
+                if isinstance(ws, dict) and ws.get("namespace") and ws.get("title")
+            }
+            _workspace_title_cache.update(at=now, titles=titles)
+            return titles
+        logger.warning("Kb workspace titles fetch failed HTTP %s", response.status_code)
+    except (HTTPException, httpx.HTTPError) as exc:
+        logger.warning("Kb workspace titles unavailable, using local labels: %s", exc)
+    return _workspace_title_cache["titles"] or {}
 
 
 async def _probe_hub(kb: KbSettings) -> bool:

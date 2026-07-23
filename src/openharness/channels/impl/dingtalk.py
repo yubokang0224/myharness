@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 
 MAX_INBOUND_MEDIA_BYTES = 50 * 1024 * 1024
 
+# 网页对话可就地渲染 ```echarts 代码块;钉钉渲染不了,发送前替换为提示
+_ECHARTS_BLOCK_RE = re.compile(r"```echarts\s*\n.*?```", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_echarts_blocks(content: str) -> str:
+    return _ECHARTS_BLOCK_RE.sub("(图表仅网页对话可显示，此处省略；数据见上方表格)", content)
+
 try:
     from dingtalk_stream import (
         AckMessage,
@@ -777,7 +784,7 @@ class DingTalkChannel(BaseChannel):
             token,
             chat_id,
             "sampleMarkdown",
-            {"text": content, "title": "Nanobot Reply"},
+            {"text": _strip_echarts_blocks(content), "title": "Nanobot Reply"},
         )
 
     async def _send_media_ref(self, token: str, chat_id: str, media_ref: str) -> bool:

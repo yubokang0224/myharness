@@ -188,6 +188,35 @@ def _convert_assistant_message(msg: ConversationMessage) -> dict[str, Any]:
     return openai_msg
 
 
+def _sanitized_request_payload(params: dict[str, Any]) -> dict[str, Any]:
+    """Copy request params for diagnostics, dropping image payloads and tool schemas."""
+
+    def _clean_message(msg: Any) -> Any:
+        if not isinstance(msg, dict):
+            return msg
+        cleaned = dict(msg)
+        content = cleaned.get("content")
+        if isinstance(content, list):
+            blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    url = str((block.get("image_url") or {}).get("url") or "")
+                    blocks.append({"type": "image_url", "image_url": {"url": f"<{len(url)} chars omitted>"}})
+                else:
+                    blocks.append(block)
+            cleaned["content"] = blocks
+        return cleaned
+
+    payload = {key: value for key, value in params.items() if key not in {"messages", "tools"}}
+    payload["tool_names"] = [
+        tool.get("function", {}).get("name", "")
+        for tool in params.get("tools") or []
+        if isinstance(tool, dict)
+    ]
+    payload["messages"] = [_clean_message(msg) for msg in params.get("messages") or []]
+    return payload
+
+
 def _parse_assistant_response(response: Any) -> ConversationMessage:
     """Parse an OpenAI ChatCompletion response into a ConversationMessage."""
     choice = response.choices[0]
@@ -353,8 +382,14 @@ class OpenAICompatibleClient:
             if chunk_finish:
                 finish_reason = chunk_finish
 
-            # Accumulate reasoning_content from thinking models (not shown to user)
-            reasoning_piece = getattr(delta, "reasoning_content", None) or ""
+            # Accumulate reasoning from thinking models (not shown to user).
+            # vLLM's reasoning parser emits `reasoning` while other providers
+            # use `reasoning_content` — accept both.
+            reasoning_piece = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+                or ""
+            )
             if reasoning_piece:
                 reasoning_delta_chunks += 1
                 collected_reasoning += reasoning_piece
@@ -454,6 +489,10 @@ class OpenAICompatibleClient:
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
+            )
+            log.warning(
+                "empty assistant response request payload: %s",
+                json.dumps(_sanitized_request_payload(params), ensure_ascii=False)[:80000],
             )
 
         yield ApiMessageCompleteEvent(

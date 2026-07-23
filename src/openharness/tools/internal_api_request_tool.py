@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin
@@ -10,8 +11,13 @@ from urllib.parse import urljoin
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from openharness.config.settings import load_settings
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
-from openharness.utils.internal_api_auth import apply_internal_api_auth, resolve_internal_api_url
+from openharness.utils.internal_api_auth import (
+    apply_internal_api_auth,
+    resolve_hsjm_user_token,
+    resolve_internal_api_url,
+)
 from openharness.utils.network_guard import NetworkGuardError, validate_http_url
 
 MAX_REDIRECTS = 5
@@ -24,7 +30,7 @@ class InternalApiRequestInput(BaseModel):
 
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = Field(default="GET")
     url: str = Field(description="Absolute URL or internal API path such as /api/items")
-    params: dict[str, str] | None = None
+    params: dict[str, str | int | float | bool] | None = None
     headers: dict[str, str] | None = None
     json_body: Any = Field(default=None, alias="json")
     body: Any = Field(default=None, description="Compatibility alias for JSON request bodies.")
@@ -62,6 +68,7 @@ class InternalApiRequestTool(BaseTool):
                 json_body_input,
                 metadata=context.metadata,
             )
+            await _upload_local_attachments_in_place(json_body, url, context.metadata)
             headers = _headers_with_channel_context(
                 arguments.headers,
                 metadata=context.metadata,
@@ -212,8 +219,16 @@ def _json_body_with_channel_context(
     _set_if_missing(next_body, "reporterName", _metadata_text(channel_context.get("sender_name")))
     _set_production_issue_idempotency_key(next_body, url, channel_context)
 
-    if not next_body.get("attachments"):
+    body_attachments = next_body.get("attachments")
+    needs_attachments = not body_attachments
+    if _is_board_memo_insert_url(url) and not _has_usable_attachment(body_attachments):
+        # 模型可能带了只剩 fileName 的空壳附件（拿不到本地路径时），一并视为缺失
+        needs_attachments = True
+    if needs_attachments:
         attachment_paths = channel_context.get("attachment_paths")
+        if _is_board_memo_insert_url(url) and not _paths_present(attachment_paths):
+            # 确认消息本身不带附件：回退到本会话最近一次带图消息（白板首图）
+            attachment_paths = channel_context.get("last_attachment_paths")
         if isinstance(attachment_paths, list):
             attachments = [
                 {
@@ -227,7 +242,126 @@ def _json_body_with_channel_context(
             if attachments:
                 next_body["attachments"] = attachments
 
+    _set_board_memo_insert_idempotency_key(next_body, channel_context, url)
+
     return next_body
+
+
+_IMAGE_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+async def _upload_local_attachments_in_place(
+    json_body: Any,
+    url: str,
+    metadata: dict[str, Any] | None,
+) -> None:
+    """Upload attachment files that exist on this machine, filling fileUrl in place.
+
+    附件文件在工具所在机器上，而 2416 中转可能部署在另一台机器、读不到本机路径。
+    因此凡本机存在的 sourceLocalPath 先直传 Common/Upload* 换成 fileUrl 再转发；
+    带 fileUrl 的附件下游中转会原样放行。上传失败时保留原路径，交由中转兜底。
+    """
+    if not _is_board_memo_insert_url(url) or not isinstance(json_body, dict):
+        return
+    attachments = json_body.get("attachments")
+    if not isinstance(attachments, list):
+        return
+
+    pending = [
+        entry
+        for entry in attachments
+        if isinstance(entry, dict)
+        and not str(entry.get("fileUrl") or "").strip()
+        and str(entry.get("sourceLocalPath") or "").strip()
+        and Path(str(entry.get("sourceLocalPath")).strip()).is_file()
+    ]
+    if not pending:
+        return
+
+    token = resolve_hsjm_user_token(metadata)
+    if not token:
+        try:
+            token = str(load_settings().internal_api.dingtalk_token or "").strip()
+        except Exception:
+            token = ""
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+    if not token:
+        return
+
+    async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+        for entry in pending:
+            path = Path(str(entry.get("sourceLocalPath")).strip())
+            try:
+                content = path.read_bytes()
+            except OSError:
+                continue
+            extension = path.suffix.lower()
+            action = "UploadImage" if extension in _IMAGE_UPLOAD_EXTENSIONS else "UploadFile"
+            mime_type, _ = mimetypes.guess_type(str(path))
+            upload_url = resolve_internal_api_url(f"/Common/{action}")
+            try:
+                response = await client.post(
+                    upload_url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    files={"file": (path.name, content, mime_type or "application/octet-stream")},
+                )
+            except httpx.HTTPError:
+                continue
+            if response.status_code >= 400:
+                continue
+            try:
+                result = response.json()
+            except ValueError:
+                continue
+            is_success = result.get("isSuccess")
+            if is_success is None:
+                is_success = result.get("IsSuccess")
+            file_url = result.get("backResult") or result.get("BackResult")
+            if not is_success or not file_url:
+                continue
+            entry["fileUrl"] = str(file_url)
+            entry["fileName"] = path.name
+            entry["fileSize"] = len(content)
+            if mime_type and not str(entry.get("mimeType") or "").strip():
+                entry["mimeType"] = mime_type
+
+
+def _paths_present(paths: Any) -> bool:
+    return isinstance(paths, list) and any(str(path).strip() for path in paths)
+
+
+def _has_usable_attachment(attachments: Any) -> bool:
+    if not isinstance(attachments, list):
+        return False
+    for entry in attachments:
+        if isinstance(entry, dict) and (
+            str(entry.get("fileUrl") or "").strip()
+            or str(entry.get("sourceLocalPath") or "").strip()
+        ):
+            return True
+    return False
+
+
+def _is_board_memo_insert_url(url: str) -> bool:
+    return url.lower().rstrip("/").endswith("/boardmemo/insert")
+
+
+def _set_board_memo_insert_idempotency_key(
+    body: dict[str, Any],
+    channel_context: dict[str, Any],
+    url: str,
+) -> None:
+    """Fill the insert idempotency key from the photo message when the model omits it."""
+    if not _is_board_memo_insert_url(url):
+        return
+    if body.get("idempotencyKey") or body.get("idempotency_key"):
+        return
+    message_id = _metadata_text(channel_context.get("last_attachment_message_id")) or _metadata_text(
+        channel_context.get("message_id")
+    )
+    if message_id:
+        body["idempotencyKey"] = f"board-memo:{message_id}:insert"
 
 
 def _is_production_issue_url(url: str) -> bool:

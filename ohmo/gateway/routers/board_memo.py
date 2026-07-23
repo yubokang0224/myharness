@@ -112,6 +112,14 @@ async def get_board_memo_list(
     return await _forward_board_memo("GetListPaged", request, credentials)
 
 
+@router.get("/GetItemListPaged")
+async def get_board_memo_item_list(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+) -> Response:
+    return await _forward_board_memo("GetItemListPaged", request, credentials)
+
+
 @router.get("/Get")
 async def get_board_memo(
     request: Request,

@@ -43,3 +43,4 @@ deploy-procurement-bot/gateway.json钉钉配置片段.json
 deploy-procurement-bot/部署步骤.md
 docs/可观测性与运维指南.md
 
+tests/

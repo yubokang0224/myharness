@@ -388,7 +388,7 @@ async def update_profile(
 async def delete_profile(
     name: str,
     _user: Annotated[dict, Depends(get_current_user)],
-) -> None:
+):
     """Delete a custom (non-builtin) provider profile."""
     from openharness.config import load_settings, save_settings
     from openharness.config.settings import builtin_provider_profile_names
@@ -494,7 +494,7 @@ async def set_profile_api_key(
 async def delete_profile_api_key(
     name: str,
     _user: Annotated[dict, Depends(get_current_user)],
-) -> None:
+):
     """Remove stored API key for a profile."""
     from openharness.config import load_settings
     from openharness.config.settings import (

@@ -40,11 +40,11 @@ def build_ohmo_system_prompt(
 
     soul = _read_text(get_soul_path(root))
     if soul:
-        sections.extend(["# ohmo Soul", soul])
+        sections.extend(["# 小锦 Soul", soul])
 
     identity = _read_text(get_identity_path(root))
     if identity:
-        sections.extend(["# ohmo Identity", identity])
+        sections.extend(["# 小锦 Identity", identity])
 
     user = _read_text(get_user_path(root))
     if user:
@@ -56,7 +56,7 @@ def build_ohmo_system_prompt(
 
     sections.extend(
         [
-            "# ohmo Workspace",
+            "# 小锦 Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",
             "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
