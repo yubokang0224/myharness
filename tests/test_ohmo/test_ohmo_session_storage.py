@@ -4,6 +4,7 @@ from pathlib import Path
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage
 
+from ohmo import record_index
 from ohmo.session_storage import (
     OhmoSessionBackend,
     count_invocation_records,
@@ -160,6 +161,87 @@ def test_ohmo_invocation_records_support_time_filters(tmp_path: Path, monkeypatc
 
     assert [record["session_id"] for record in records] == ["new-api-call"]
     assert count_invocation_records(workspace, start_at=1_500.0, end_at=2_500.0) == 1
+
+
+def test_record_index_backfills_historical_json_once(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    invocation_path = get_invocation_dir(workspace) / "invocation-legacy.json"
+    invocation_path.write_text(
+        json.dumps(
+            {
+                "invocation_id": "legacy",
+                "session_id": "legacy-session",
+                "agent_name": "production-agent",
+                "channel": "api",
+                "model": "test-model",
+                "status": "completed",
+                "created_at": 2_000.0,
+                "messages": [],
+                "usage": {"input_tokens": 3, "output_tokens": 4},
+                "tool_calls": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [item["invocation_id"] for item in list_invocation_records(workspace)] == ["legacy"]
+
+    def fail_json_read(*_args, **_kwargs):
+        raise AssertionError("indexed list/count queries must not reread JSON files")
+
+    monkeypatch.setattr(Path, "read_text", fail_json_read)
+    assert count_invocation_records(workspace) == 1
+    assert [item["invocation_id"] for item in list_invocation_records(workspace)] == ["legacy"]
+    assert record_index.invocation_daily(workspace, start_at=0.0, agent_name=None)[0][
+        "invocations"
+    ] == 1
+
+
+def test_record_index_aggregates_daily_metrics_in_sql(tmp_path: Path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    current_time = {"value": 2_000.0}
+    monkeypatch.setattr("ohmo.session_storage.time.time", lambda: current_time["value"])
+
+    save_invocation_record(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("success")],
+        usage=UsageSnapshot(input_tokens=10, output_tokens=5),
+        agent_name="production-agent",
+        tool_calls=[{"tool_name": "read_file"}],
+        duration_ms=100,
+    )
+    save_invocation_record(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("failure")],
+        usage=UsageSnapshot(input_tokens=20, output_tokens=7),
+        agent_name="production-agent",
+        status="failed",
+        error="boom",
+        duration_ms=300,
+    )
+
+    rows = record_index.invocation_daily(
+        workspace,
+        start_at=1_000.0,
+        agent_name="production-agent",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["invocations"] == 2
+    assert rows[0]["completed"] == 1
+    assert rows[0]["errors"] == 1
+    assert rows[0]["tool_calls"] == 1
+    assert rows[0]["input_tokens"] == 30
+    assert rows[0]["output_tokens"] == 12
+    assert rows[0]["avg_duration_ms"] == 200
 
 
 def test_ohmo_invocation_list_falls_back_to_api_session_snapshots(tmp_path: Path):

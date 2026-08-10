@@ -184,6 +184,7 @@ def send_email(
     *,
     subject: str,
     body: str,
+    html: bool = False,
     attachments: list[tuple[str, bytes]] | None = None,
 ) -> bool:
     """One-shot email helper (used by the weekly failure report)."""
@@ -194,7 +195,11 @@ def send_email(
     msg["Subject"] = subject
     msg["From"] = config.from_address or config.smtp_username
     msg["To"] = ", ".join(config.to_addresses)
-    msg.set_content(body)
+    if html:
+        msg.set_content("此邮件为 HTML 格式，请使用支持 HTML 的邮件客户端查看。")
+        msg.add_alternative(body, subtype="html")
+    else:
+        msg.set_content(body)
     for filename, data in attachments or []:
         msg.add_attachment(
             data,

@@ -52,6 +52,7 @@ from ohmo.gateway.schemas.chat import (
 )
 from ohmo.gateway.tool_policy import apply_agent_tool_policy
 from ohmo.session_storage import (
+    delete_session_index,
     get_session_dir,
     list_snapshots,
     load_by_id,
@@ -592,7 +593,15 @@ async def list_sessions(
 ):
     """List all persisted sessions."""
     try:
-        snapshots = list_snapshots(workspace=runtime.workspace, limit=_SESSION_LIST_SCAN_LIMIT)
+        snapshots = await asyncio.to_thread(
+            list_snapshots,
+            runtime.workspace,
+            limit=_SESSION_LIST_SCAN_LIMIT,
+            include_remote=include_remote,
+            channel=channel,
+            exclude_channel="api" if channel != "api" else None,
+            agent_name=agent_name,
+        )
     except Exception:
         snapshots = []
     result = []
@@ -680,6 +689,7 @@ async def delete_session(
             path.unlink()
         except OSError:
             pass
+    delete_session_index(runtime.workspace, session_id)
 
 
 @router.get("/{session_id}/messages", response_model=list[MessageInfo])

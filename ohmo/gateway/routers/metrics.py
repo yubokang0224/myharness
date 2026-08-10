@@ -1,12 +1,8 @@
-"""Daily aggregated metrics over persisted invocation/session records.
-
-Deliberately file-based (no Prometheus): scans the workspace JSON records and
-aggregates per calendar day so the web UI can chart call volume, error rate,
-token spend, and latency without extra infrastructure.
-"""
+"""Daily metrics aggregated from the persisted record metadata index."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -14,6 +10,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
 
+from ohmo import record_index
 from ohmo.gateway.dependencies import _RuntimeState, get_current_user, get_runtime
 from ohmo.gateway.schemas.metrics import DailyMetrics, InvocationDayMetrics, SessionDayMetrics
 from ohmo.session_storage import list_invocation_records, list_snapshots, matches_agent_filter
@@ -37,6 +34,33 @@ async def daily_metrics(
 ):
     """Aggregate invocation and session records per day, newest day first."""
     cutoff = time.time() - days * 86400
+
+    try:
+        def load_indexed_metrics() -> tuple[list[dict], list[dict]]:
+            invocations = record_index.invocation_daily(
+                runtime.workspace,
+                start_at=cutoff,
+                agent_name=agent_name,
+            )
+            sessions = record_index.session_daily(
+                runtime.workspace,
+                start_at=cutoff,
+                agent_name=agent_name,
+            )
+            return invocations, sessions
+
+        invocation_rows, session_rows = await asyncio.to_thread(load_indexed_metrics)
+        invocation_daily = [InvocationDayMetrics(**row) for row in invocation_rows]
+        session_daily = [SessionDayMetrics(**row) for row in session_rows]
+        return DailyMetrics(
+            days=days,
+            invocation_daily=invocation_daily,
+            session_daily=session_daily,
+        )
+    except Exception:
+        # Keep the JSON path as a recovery fallback if the local index is
+        # unavailable or corrupted.  Normal requests never enter this branch.
+        logger.exception("Failed to query metrics index; falling back to JSON scan")
 
     inv_days: dict[str, dict] = {}
     durations: dict[str, list[int]] = {}

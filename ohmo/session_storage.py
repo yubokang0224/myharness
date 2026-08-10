@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,10 @@ from openharness.services.session_storage import (
 )
 from openharness.utils.fs import atomic_write_text
 
+from ohmo import record_index
 from ohmo.workspace import get_invocations_dir, get_sessions_dir
+
+logger = logging.getLogger(__name__)
 
 
 def get_session_dir(workspace: str | Path | None = None) -> Path:
@@ -158,6 +162,12 @@ def save_session_snapshot(
         atomic_write_text(_session_key_latest_path(workspace, session_key), data)
     session_path = session_dir / f"session-{sid}.json"
     atomic_write_text(session_path, data)
+    try:
+        record_index.index_session(workspace, session_path, payload)
+    except Exception:
+        # The JSON snapshot is still authoritative.  A failed index update must
+        # not lose the conversation; a future index rebuild can recover it.
+        logger.exception("Failed to update record index for session %s", sid)
     return latest_path
 
 
@@ -216,10 +226,14 @@ def save_invocation_record(
     }
     path = invocation_dir / f"invocation-{invocation_id}.json"
     atomic_write_text(path, json.dumps(payload, indent=2) + "\n")
+    try:
+        record_index.index_invocation(workspace, path, payload)
+    except Exception:
+        logger.exception("Failed to update record index for invocation %s", invocation_id)
     return path
 
 
-def list_invocation_records(
+def _list_invocation_records_from_files(
     workspace: str | Path | None = None,
     *,
     limit: int = 50,
@@ -330,6 +344,40 @@ def list_invocation_records(
     return records[offset : offset + limit]
 
 
+def list_invocation_records(
+    workspace: str | Path | None = None,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    agent_name: str | None = None,
+    status: str | None = None,
+    start_at: float | None = None,
+    end_at: float | None = None,
+) -> list[dict[str, Any]]:
+    """List invocation summaries from the persistent metadata index."""
+    try:
+        return record_index.list_invocations(
+            workspace,
+            limit=limit,
+            offset=offset,
+            agent_name=agent_name,
+            status=status,
+            start_at=start_at,
+            end_at=end_at,
+        )
+    except Exception:
+        logger.exception("Failed to query invocation index; falling back to JSON scan")
+        return _list_invocation_records_from_files(
+            workspace,
+            limit=limit,
+            offset=offset,
+            agent_name=agent_name,
+            status=status,
+            start_at=start_at,
+            end_at=end_at,
+        )
+
+
 def count_invocation_records(
     workspace: str | Path | None = None,
     *,
@@ -339,17 +387,27 @@ def count_invocation_records(
     end_at: float | None = None,
 ) -> int:
     """Count invocation records after applying filters."""
-    return len(
-        list_invocation_records(
-            workspace=workspace,
-            limit=1_000_000,
-            offset=0,
+    try:
+        return record_index.count_invocations(
+            workspace,
             agent_name=agent_name,
             status=status,
             start_at=start_at,
             end_at=end_at,
         )
-    )
+    except Exception:
+        logger.exception("Failed to count invocation index; falling back to JSON scan")
+        return len(
+            _list_invocation_records_from_files(
+                workspace=workspace,
+                limit=1_000_000,
+                offset=0,
+                agent_name=agent_name,
+                status=status,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        )
 
 
 def load_invocation_record(workspace: str | Path | None, invocation_id: str) -> dict[str, Any] | None:
@@ -408,7 +466,10 @@ def delete_latest_for_session_key(workspace: str | Path | None, session_key: str
     return True
 
 
-def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list[dict[str, Any]]:
+def _list_snapshots_from_files(
+    workspace: str | Path | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
     session_dir = get_session_dir(workspace)
     sessions: list[dict[str, Any]] = []
     for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -438,6 +499,52 @@ def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list
         if len(sessions) >= limit:
             break
     return sessions
+
+
+def list_snapshots(
+    workspace: str | Path | None = None,
+    limit: int = 20,
+    *,
+    include_remote: bool | None = None,
+    channel: str | None = None,
+    exclude_channel: str | None = None,
+    agent_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """List session summaries from the persistent metadata index."""
+    try:
+        return record_index.list_sessions(
+            workspace,
+            limit=limit,
+            include_remote=include_remote,
+            channel=channel,
+            exclude_channel=exclude_channel,
+            agent_name=agent_name,
+        )
+    except Exception:
+        logger.exception("Failed to query session index; falling back to JSON scan")
+        scan_limit = limit if not any((channel, exclude_channel, agent_name)) else 1_000_000
+        snapshots = _list_snapshots_from_files(workspace, limit=scan_limit)
+        if include_remote is False:
+            snapshots = [item for item in snapshots if not item.get("session_key")]
+        if channel:
+            snapshots = [item for item in snapshots if item.get("channel") == channel]
+        if exclude_channel:
+            snapshots = [item for item in snapshots if item.get("channel") != exclude_channel]
+        if agent_name:
+            snapshots = [
+                item
+                for item in snapshots
+                if matches_agent_filter(item.get("agent_name"), agent_name)
+            ]
+        return snapshots[:limit]
+
+
+def delete_session_index(workspace: str | Path | None, session_id: str) -> None:
+    """Remove a deleted session from the metadata index."""
+    try:
+        record_index.delete_session(workspace, session_id)
+    except Exception:
+        logger.exception("Failed to delete session %s from record index", session_id)
 
 
 def load_by_id(workspace: str | Path | None, session_id: str) -> dict[str, Any] | None:

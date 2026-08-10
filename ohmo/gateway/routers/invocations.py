@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -46,9 +47,9 @@ async def list_invocations(
     """List invocation logs that were persisted outside chat sessions."""
     resolved_page_size = limit or page_size
     offset = (page - 1) * resolved_page_size
-    items = [
-        _summary_from_record(record)
-        for record in list_invocation_records(
+
+    def load_page() -> tuple[list[dict], int]:
+        records = list_invocation_records(
             workspace=runtime.workspace,
             limit=resolved_page_size,
             offset=offset,
@@ -57,14 +58,17 @@ async def list_invocations(
             start_at=start_at,
             end_at=end_at,
         )
-    ]
-    total = count_invocation_records(
-        workspace=runtime.workspace,
-        agent_name=agent_name,
-        status=status_filter,
-        start_at=start_at,
-        end_at=end_at,
-    )
+        total_count = count_invocation_records(
+            workspace=runtime.workspace,
+            agent_name=agent_name,
+            status=status_filter,
+            start_at=start_at,
+            end_at=end_at,
+        )
+        return records, total_count
+
+    records, total = await asyncio.to_thread(load_page)
+    items = [_summary_from_record(record) for record in records]
     return InvocationPage(items=items, total=total, page=page, page_size=resolved_page_size)
 
 
@@ -75,7 +79,7 @@ async def get_invocation(
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Return one invocation log with full messages and tool calls."""
-    record = load_invocation_record(runtime.workspace, invocation_id)
+    record = await asyncio.to_thread(load_invocation_record, runtime.workspace, invocation_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invocation not found")
     summary = _summary_from_record(
