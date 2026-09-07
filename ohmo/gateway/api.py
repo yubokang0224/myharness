@@ -9,6 +9,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from ohmo.gateway.config import validate_mes_workspace_config
 from ohmo.gateway.dependencies import get_runtime
 from ohmo.gateway.routers import (
     agents,
@@ -77,10 +78,17 @@ def create_app(
     """Create and configure the FastAPI application."""
     runtime = get_runtime()
     runtime.workspace = str(initialize_workspace(workspace))
+    mes_config = validate_mes_workspace_config(runtime.workspace)
+    if mes_config.enabled:
+        logger.info(
+            "MES workspace authentication enabled issuer=%s permission=%s",
+            mes_config.issuer,
+            mes_config.required_permission or "authenticated-users",
+        )
 
     app = FastAPI(
-        title="OpenHarness Agent API",
-        description="HTTP API for the openharness AI agent framework",
+        title="小锦智能体 API",
+        description="HTTP API for the Xiaojin AI agent platform",
         version="0.1.0",
         lifespan=_lifespan,
         docs_url="/docs",

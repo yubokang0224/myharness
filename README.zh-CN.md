@@ -1,11 +1,11 @@
-# <img src="assets/logo.png" alt="OpenHarness" width="40" style="vertical-align: middle;"> `oh` — OpenHarness 中文说明
+# <img src="assets/logo.png" alt="小锦智能体平台" width="40" style="vertical-align: middle;"> `oh` — 小锦智能体平台中文说明
 
 <p align="center">
   <a href="README.md"><strong>English</strong></a> ·
   <a href="README.zh-CN.md"><strong>简体中文</strong></a>
 </p>
 
-**OpenHarness** 是一个面向开源社区的 Agent Harness。它提供轻量、可扩展、可检查的 Agent 基础设施，包括：
+**小锦智能体平台（Xiaojin AI）** 提供轻量、可扩展、可检查的 Agent 基础设施，包括：
 
 - Agent loop
 - tools / skills / plugins
@@ -41,7 +41,7 @@
 ### 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yubokang0224/myharness/main/scripts/install.sh | bash
 ```
 
 常用安装参数：
@@ -52,14 +52,14 @@ curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/inst
 例如：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash -s -- --from-source --with-channels
+curl -fsSL https://raw.githubusercontent.com/yubokang0224/myharness/main/scripts/install.sh | bash -s -- --from-source --with-channels
 ```
 
 ### 本地运行
 
 ```bash
-git clone https://github.com/HKUDS/OpenHarness.git
-cd OpenHarness
+git clone https://github.com/yubokang0224/myharness.git
+cd myharness
 uv sync --extra dev
 uv run oh
 ```
@@ -177,7 +177,7 @@ oh -p "Fix the bug" --output-format stream-json
 
 ### Dry-run 安全预览
 
-如果你想先看 OpenHarness **会怎么跑**，但又不想真的执行模型或工具，可以用：
+如果你想先看小锦智能体平台**会怎么跑**，但又不想真的执行模型或工具，可以用：
 
 ```bash
 # 预览交互会话本身
@@ -217,7 +217,7 @@ Dry-run 输出里的 `next actions` 会直接给出下一步建议，例如：
 
 ## Provider 兼容性概览
 
-OpenHarness 现在把 provider 视为 **workflow + profile**，而不是只暴露底层协议名。
+小锦智能体平台现在把 provider 视为 **workflow + profile**，而不是只暴露底层协议名。
 
 | Workflow | 说明 |
 |----------|------|
@@ -239,7 +239,7 @@ oh provider use <profile>
 
 ## `ohmo` Personal Agent
 
-`ohmo` 是基于 OpenHarness 的 personal-agent app，不是 core 的一个 mode。
+`ohmo` 是小锦智能体平台的 personal-agent app，不是 core 的一个 mode。
 
 ### 初始化
 
@@ -306,7 +306,7 @@ ohmo gateway restart
 
 ---
 
-## OpenHarness 的核心能力
+## 小锦智能体平台的核心能力
 
 ### Agent Loop
 
@@ -398,8 +398,8 @@ python scripts/test_real_skills_plugins.py
 开发环境：
 
 ```bash
-git clone https://github.com/HKUDS/OpenHarness.git
-cd OpenHarness
+git clone https://github.com/yubokang0224/myharness.git
+cd myharness
 uv sync --extra dev
 uv run pytest -q
 ```

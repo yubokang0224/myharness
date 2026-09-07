@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from openharness.config.settings import Settings, load_settings
 
@@ -37,7 +37,12 @@ def resolve_hsjm_user_token(
 
 
 def resolve_internal_api_url(url: str, settings: Settings | None = None) -> str:
-    """Resolve relative internal API paths against the configured base URL."""
+    """Resolve relative API paths against the configured service origin.
+
+    Agent gateway routes use ``internal_api.agent_api_base_url``.  The agent
+    target is deliberately independent from the C# API target so deployments
+    cannot silently write through a gateway in another environment.
+    """
     raw = url.strip()
     if not raw:
         return raw
@@ -46,10 +51,21 @@ def resolve_internal_api_url(url: str, settings: Settings | None = None) -> str:
         return raw
 
     resolved_settings = settings or load_settings()
-    base_url = resolved_settings.internal_api.base_url.strip()
+    if _is_agent_api_path(raw):
+        base_url = resolve_agent_api_base_url(resolved_settings)
+        relative_path = _agent_api_relative_path(raw, base_url)
+    else:
+        base_url = resolved_settings.internal_api.base_url.strip()
+        relative_path = raw.lstrip("/")
     if not base_url:
         return raw
-    return urljoin(base_url.rstrip("/") + "/", raw.lstrip("/"))
+    return _join_internal_path(base_url, relative_path)
+
+
+def resolve_agent_api_base_url(settings: Settings | None = None) -> str:
+    """Return the explicitly configured agent gateway base URL."""
+    resolved_settings = settings or load_settings()
+    return resolved_settings.internal_api.agent_api_base_url.strip().rstrip("/")
 
 
 def is_internal_api_url(url: str, settings: Settings | None = None) -> bool:
@@ -60,11 +76,58 @@ def is_internal_api_url(url: str, settings: Settings | None = None) -> bool:
         return False
     allowlist = {
         origin
-        for item in resolved_settings.internal_api.allowlist
+        for item in [
+            *resolved_settings.internal_api.allowlist,
+            resolve_agent_api_base_url(resolved_settings),
+        ]
         for origin in [normalized_origin(item)]
         if origin is not None
     }
     return target_origin in allowlist
+
+
+def _is_agent_api_path(url: str) -> bool:
+    path = _decoded_path(url).lower()
+    return path == "/agent/api" or path.startswith("/agent/api/")
+
+
+def _agent_api_relative_path(raw: str, base_url: str) -> str:
+    """Avoid duplicating /agent/api/v1 when the configured base includes it."""
+    normalized = raw.lstrip("/")
+    base_path = urlparse(base_url).path.lower().rstrip("/")
+    prefix = "agent/api/v1"
+    if base_path.endswith(f"/{prefix}") or base_path == prefix:
+        if normalized.lower() == prefix:
+            return ""
+        if normalized.lower().startswith(prefix + "/"):
+            return normalized[len(prefix) + 1 :]
+    return normalized
+
+
+def _join_internal_path(base_url: str, relative_path: str) -> str:
+    """Join an internal path without letting URL-like suffixes replace the origin."""
+    parsed_base = urlparse(base_url)
+    without_fragment, fragment_separator, fragment = relative_path.partition("#")
+    suffix, query_separator, query = without_fragment.partition("?")
+    base_path = parsed_base.path.rstrip("/")
+    suffix_path = suffix.lstrip("/").replace("\\", "/")
+    combined_path = f"{base_path}/{suffix_path}" if suffix_path else base_path or "/"
+    return parsed_base._replace(
+        path=combined_path,
+        params="",
+        query=query if query_separator else "",
+        fragment=fragment if fragment_separator else "",
+    ).geturl()
+
+
+def _decoded_path(url: str) -> str:
+    path = urlparse(url).path
+    for _ in range(3):
+        decoded = unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    return path
 
 
 def apply_internal_api_auth(

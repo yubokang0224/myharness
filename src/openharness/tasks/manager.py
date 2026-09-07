@@ -19,7 +19,7 @@ from openharness.utils.shell import create_shell_subprocess
 from openharness.utils.internal_api_auth import USER_BEARER_TOKEN_ENV
 
 log = logging.getLogger(__name__)
-_TASK_RESTART_NOTICE = "[OpenHarness] Agent task restarted; prior interactive context was not preserved.\n"
+_TASK_RESTART_NOTICE = "[Xiaojin AI] Agent task restarted; prior interactive context was not preserved.\n"
 
 
 def _encode_task_worker_payload(data: str) -> bytes:

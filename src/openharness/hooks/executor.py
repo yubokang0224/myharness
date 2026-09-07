@@ -176,7 +176,7 @@ class HookExecutor:
     ) -> HookResult:
         prompt = _inject_arguments(hook.prompt, payload)
         prefix = (
-            "You are validating whether a hook condition passes in OpenHarness. "
+            "You are validating whether a hook condition passes in Xiaojin AI. "
             "Return strict JSON: {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}."
         )
         if agent_mode:

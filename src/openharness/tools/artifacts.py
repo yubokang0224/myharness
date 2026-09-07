@@ -104,7 +104,11 @@ TRACKED_ARTIFACT_EXTENSIONS = TEXT_EXTENSIONS | {
     ".png",
     ".ppt",
     ".pptx",
+    ".ods",
     ".webp",
+    ".xls",
+    ".xlsm",
+    ".xlsx",
 }
 
 

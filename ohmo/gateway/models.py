@@ -20,6 +20,33 @@ class AlertingConfig(BaseModel):
     cooldown_minutes: int = 30
 
 
+class MesWorkspaceConfig(BaseModel):
+    """Persistent MES workspace integration settings.
+
+    The JWT signing secret is intentionally stored in the Xiaojin AI
+    credential store instead of this JSON-serializable model.
+    """
+
+    enabled: bool = False
+    issuer: str = ""
+    audience: str = ""
+    algorithm: str = "HS256"
+    required_permission: str = "report.ai"
+    api_base_url: str = ""
+    permission_url: str = ""
+    allow_anonymous_api: bool = False
+
+
+class BoardRecognitionConfig(BaseModel):
+    """Background whiteboard image recognition settings."""
+
+    enabled: bool = False
+    poll_seconds: float = 30
+    lease_seconds: int = 600
+    worker_id: str = ""
+    request_timeout_seconds: float = 60
+
+
 class GatewayConfig(BaseModel):
     """Persistent gateway configuration."""
 
@@ -35,6 +62,8 @@ class GatewayConfig(BaseModel):
     log_level: str = "INFO"
     channel_configs: dict[str, dict] = Field(default_factory=dict)
     alerting: AlertingConfig = Field(default_factory=AlertingConfig)
+    mes: MesWorkspaceConfig = Field(default_factory=MesWorkspaceConfig)
+    board_recognition: BoardRecognitionConfig = Field(default_factory=BoardRecognitionConfig)
 
 
 class GatewayState(BaseModel):

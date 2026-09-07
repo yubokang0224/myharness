@@ -1,7 +1,7 @@
 ---
 name: skill-creator
 description: >
-  Create, update, validate, package, and improve OpenHarness-compatible Agent Skills.
+  Create, update, validate, package, and improve Xiaojin AI-compatible Agent Skills.
   Use when asked to design or generate a skill, SKILL.md, .openharness/skills
   entry, or Claude/Anthropic-style skill; also use when adapting a skill from
   anthropics/skills for this agent.
@@ -9,7 +9,7 @@ description: >
 
 # skill-creator
 
-Create concise, reusable skills for OpenHarness while staying compatible with the
+Create concise, reusable skills for Xiaojin AI while staying compatible with the
 public Agent Skills directory format.
 
 ## Resource loading
@@ -62,7 +62,7 @@ characters; make the directory name match it. The `description` is the activatio
 surface, so include concrete trigger words and contexts there, not only in the
 body.
 
-## OpenHarness Location
+## Xiaojin AI Location
 
 Create runtime skills in one canonical location:
 
@@ -104,7 +104,7 @@ agent prompts.
      reliability.
 5. Validate.
    - Run `scripts/quick_validate.py <path-to-skill>` for directory skills.
-   - For OpenHarness repository changes, run focused pytest coverage around
+   - For Xiaojin AI repository changes, run focused pytest coverage around
      skill loading, such as `python -m pytest tests/test_skills/test_loader.py`.
    - For `.openharness/skills` skills, load the registry or use the UI/API skill list to
      confirm the intended name and description appear.
@@ -128,7 +128,7 @@ agent prompts.
 - Preserve user changes and existing project style when updating an existing
   skill.
 
-## OpenHarness gotchas
+## Xiaojin AI gotchas
 
 - For this product, create skills under `.openharness/skills/`.
 - The runtime may still support other locations for compatibility, but do not

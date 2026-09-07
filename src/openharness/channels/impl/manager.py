@@ -193,6 +193,9 @@ class ChannelManager:
                     client_secret=config.client_secret,
                     robot_code=config.robot_code,
                     default_agent=config.default_agent,
+                    defer_board_images=config.defer_board_images,
+                    board_business_domain=config.board_business_domain,
+                    board_batch_quiet_seconds=config.board_batch_quiet_seconds,
                 )
             ]
         return []

@@ -94,7 +94,7 @@ success "Virtual environment ready: ${VENV_DIR}"
 
 step "Installing current checkout in editable mode"
 python -m pip install -e "$REPO_ROOT" --quiet
-success "Installed OpenHarness from ${REPO_ROOT}"
+success "Installed Xiaojin AI from ${REPO_ROOT}"
 
 if [ "$WITH_CHANNELS" = true ]; then
     step "Channel dependencies"
@@ -130,7 +130,7 @@ ensure_path_in_file() {
     [ -f "$rc_file" ] || return 0
     if ! grep -qF "$line" "$rc_file" 2>/dev/null; then
         echo "" >> "$rc_file"
-        echo "# OpenHarness dev" >> "$rc_file"
+        echo "# Xiaojin AI dev" >> "$rc_file"
         echo "$line" >> "$rc_file"
         success "Added ${BIN_DIR} to PATH in $(basename "$rc_file")"
     fi
@@ -146,7 +146,7 @@ if [ -f "$HOME/.config/fish/config.fish" ]; then
     if ! grep -qF "$BIN_DIR" "$HOME/.config/fish/config.fish" 2>/dev/null; then
         {
             echo ""
-            echo "# OpenHarness dev"
+            echo "# Xiaojin AI dev"
             echo "if not contains -- \"$BIN_DIR\" \$PATH"
             echo "    set -gx PATH \"$BIN_DIR\" \$PATH"
             echo "end"
@@ -155,7 +155,7 @@ if [ -f "$HOME/.config/fish/config.fish" ]; then
     fi
 else
     cat > "$HOME/.config/fish/config.fish" <<EOF
-# OpenHarness dev
+# Xiaojin AI dev
 if not contains -- "$BIN_DIR" \$PATH
     set -gx PATH "$BIN_DIR" \$PATH
 end

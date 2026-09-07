@@ -1,4 +1,4 @@
-"""Validate an OpenHarness-compatible skill.
+"""Validate a Xiaojin AI-compatible skill.
 
 Usage:
     python quick_validate.py path/to/skill-dir

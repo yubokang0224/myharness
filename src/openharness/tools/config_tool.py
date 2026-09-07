@@ -17,10 +17,10 @@ class ConfigToolInput(BaseModel):
 
 
 class ConfigTool(BaseTool):
-    """Read or update OpenHarness settings."""
+    """Read or update Xiaojin AI settings."""
 
     name = "config"
-    description = "Read or update OpenHarness settings."
+    description = "Read or update Xiaojin AI settings."
     input_model = ConfigToolInput
 
     async def execute(self, arguments: ConfigToolInput, context: ToolExecutionContext) -> ToolResult:

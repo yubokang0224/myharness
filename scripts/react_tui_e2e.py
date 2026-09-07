@@ -68,7 +68,7 @@ def _run_permission_file_io() -> None:
     child = _spawn_oh(env=env)
     try:
         print("[react_tui_permission_file_io] waiting for app shell")
-        child.expect("OpenHarness")
+        child.expect("小锦智能体平台")
         child.expect("model: kimi-k2.5")
         _submit(
             child,
@@ -93,7 +93,7 @@ def _run_question_flow() -> None:
     temp_dir, env = _isolated_env()
     child = _spawn_oh(env=env)
     try:
-        child.expect("OpenHarness")
+        child.expect("小锦智能体平台")
         child.expect("model: kimi-k2.5")
         _submit(
             child,
@@ -127,7 +127,7 @@ def _run_command_flow() -> None:
     child = _spawn_oh(env=env)
     try:
         print("[react_tui_command_flow] waiting for app shell")
-        child.expect("OpenHarness")
+        child.expect("小锦智能体平台")
         child.expect("model: kimi-k2.5")
         print("[react_tui_command_flow] waiting for plan mode indicator")
         child.expect("PLAN MODE")

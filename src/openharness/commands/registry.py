@@ -297,7 +297,7 @@ def create_default_command_registry(
             version = importlib.metadata.version("openharness")
         except importlib.metadata.PackageNotFoundError:
             version = "0.1.7"
-        return CommandResult(message=f"OpenHarness {version}")
+        return CommandResult(message=f"Xiaojin AI {version}")
 
     async def _context_handler(_: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
@@ -655,7 +655,7 @@ def create_default_command_registry(
         if not claudemd.exists():
             claudemd.write_text(
                 "# Project Instructions\n\n"
-                "- Use OpenHarness tools deliberately.\n"
+                "- Use Xiaojin AI tools deliberately.\n"
                 "- Keep changes minimal and verify with tests when possible.\n",
                 encoding="utf-8",
             )
@@ -664,7 +664,7 @@ def create_default_command_registry(
         for relative, content in (
             (
                 project_dir / "README.md",
-                "# Project OpenHarness Config\n\nThis directory stores project-specific OpenHarness state.\n",
+                "# Project Xiaojin AI Config\n\nThis directory stores project-specific Xiaojin AI state.\n",
             ),
             (
                 project_dir / "memory" / "MEMORY.md",
@@ -685,7 +685,7 @@ def create_default_command_registry(
                 created.append(str(relative.relative_to(Path(context.cwd))))
 
         if not created:
-            return CommandResult(message="Project already initialized for OpenHarness.")
+            return CommandResult(message="Project already initialized for Xiaojin AI.")
         return CommandResult(message="Initialized project files:\n" + "\n".join(f"- {item}" for item in created))
 
     async def _bridge_handler(args: str, context: CommandContext) -> CommandResult:
@@ -842,7 +842,7 @@ def create_default_command_registry(
         del context
         return CommandResult(
             message=(
-                "OpenHarness quickstart:\n"
+                "Xiaojin AI quickstart:\n"
                 "1. Ask for a coding task in plain language.\n"
                 "2. Use /help to inspect commands.\n"
                 "3. Use /doctor to inspect runtime state.\n"
@@ -1958,10 +1958,10 @@ def create_default_command_registry(
 
     registry.register(SlashCommand("help", "Show available commands", _help_handler))
     registry.register(
-        SlashCommand("exit", "Exit OpenHarness", _exit_handler, aliases=("quit",))
+        SlashCommand("exit", "Exit Xiaojin AI", _exit_handler, aliases=("quit",))
     )
     registry.register(SlashCommand("clear", "Clear conversation history", _clear_handler))
-    registry.register(SlashCommand("version", "Show the installed OpenHarness version", _version_handler))
+    registry.register(SlashCommand("version", "Show the installed Xiaojin AI version", _version_handler))
     registry.register(SlashCommand("status", "Show session status", _status_handler))
     registry.register(SlashCommand("context", "Show the active runtime system prompt", _context_handler))
     registry.register(SlashCommand("summary", "Summarize conversation history", _summary_handler))
@@ -1979,7 +1979,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("tag", "Create a named snapshot of the current session", _tag_handler))
     registry.register(SlashCommand("rewind", "Remove the latest conversation turn(s)", _rewind_handler))
     registry.register(SlashCommand("files", "List files in the current workspace", _files_handler))
-    registry.register(SlashCommand("init", "Initialize project OpenHarness files", _init_handler))
+    registry.register(SlashCommand("init", "Initialize project Xiaojin AI files", _init_handler))
     registry.register(
         SlashCommand(
             "bridge",
@@ -2053,7 +2053,7 @@ def create_default_command_registry(
     registry.register(SlashCommand("pr_comments", "Show or update project PR comments context", _pr_comments_handler))
     registry.register(SlashCommand("privacy-settings", "Show local privacy and storage settings", _privacy_settings_handler))
     registry.register(SlashCommand("rate-limit-options", "Show ways to reduce provider rate pressure", _rate_limit_options_handler))
-    registry.register(SlashCommand("release-notes", "Show recent OpenHarness release notes", _release_notes_handler))
+    registry.register(SlashCommand("release-notes", "Show recent Xiaojin AI release notes", _release_notes_handler))
     registry.register(SlashCommand("upgrade", "Show upgrade instructions", _upgrade_handler))
     registry.register(SlashCommand("agents", "List or inspect agent and teammate tasks", _agents_handler))
     registry.register(SlashCommand("subagents", "Show subagent usage and inspect worker tasks", _agents_handler))
@@ -2124,7 +2124,7 @@ def _memory_backend_for_context(context: CommandContext) -> MemoryCommandBackend
         return context.memory_backend
     cwd = context.cwd
     return MemoryCommandBackend(
-        label="OpenHarness project memory",
+        label="Xiaojin AI project memory",
         get_memory_dir=lambda: get_project_memory_dir(cwd),
         get_entrypoint=lambda: get_memory_entrypoint(cwd),
         list_files=lambda: list_memory_files(cwd),

@@ -46,7 +46,10 @@ CREATE TABLE IF NOT EXISTS invocations (
     trace_id TEXT,
     duration_ms INTEGER,
     input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL
+    output_tokens INTEGER NOT NULL,
+    owner_source TEXT,
+    owner_subject TEXT,
+    owner_account TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_invocations_created_at
@@ -76,7 +79,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT NOT NULL,
     created_at REAL NOT NULL,
     input_tokens INTEGER NOT NULL,
-    output_tokens INTEGER NOT NULL
+    output_tokens INTEGER NOT NULL,
+    owner_source TEXT,
+    owner_subject TEXT,
+    owner_account TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_created_at
@@ -86,6 +92,37 @@ CREATE INDEX IF NOT EXISTS idx_sessions_agent_created_at
 CREATE INDEX IF NOT EXISTS idx_sessions_channel_created_at
     ON sessions(channel, created_at DESC);
 """
+
+_OWNER_COLUMNS = (
+    ("owner_source", "TEXT"),
+    ("owner_subject", "TEXT"),
+    ("owner_account", "TEXT"),
+)
+
+
+def _migrate_owner_columns(connection: sqlite3.Connection) -> None:
+    """Add ownership columns to databases created before the MES integration.
+
+    ``CREATE TABLE IF NOT EXISTS`` does not change an existing SQLite table, so
+    this intentionally uses idempotent ``ALTER TABLE`` statements.
+    """
+
+    for table in ("sessions", "invocations"):
+        existing = {
+            str(row["name"])
+            for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, column_type in _OWNER_COLUMNS:
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_owner_created_at "
+        "ON sessions(owner_source, owner_subject, created_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_invocations_owner_created_at "
+        "ON invocations(owner_source, owner_subject, created_at DESC)"
+    )
 
 
 def _index_path(workspace: str | Path | None) -> Path:
@@ -105,6 +142,7 @@ def _connect(workspace: str | Path | None) -> sqlite3.Connection:
             if path not in _initialized_indexes:
                 connection.execute("PRAGMA journal_mode = WAL")
                 connection.executescript(_SCHEMA)
+                _migrate_owner_columns(connection)
                 _initialized_indexes.add(path)
     return connection
 
@@ -188,8 +226,8 @@ def _upsert_invocation(
             invocation_id, source_path, session_id, agent_name, channel, platform,
             model, status, request_content, response_text, error, created_at,
             message_count, tool_call_count, trace_id, duration_ms,
-            input_tokens, output_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            input_tokens, output_tokens, owner_source, owner_subject, owner_account
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(invocation_id) DO UPDATE SET
             source_path = excluded.source_path,
             session_id = excluded.session_id,
@@ -207,7 +245,10 @@ def _upsert_invocation(
             trace_id = excluded.trace_id,
             duration_ms = excluded.duration_ms,
             input_tokens = excluded.input_tokens,
-            output_tokens = excluded.output_tokens
+            output_tokens = excluded.output_tokens,
+            owner_source = excluded.owner_source,
+            owner_subject = excluded.owner_subject,
+            owner_account = excluded.owner_account
         """,
         (
             invocation_id,
@@ -228,6 +269,9 @@ def _upsert_invocation(
             int(duration) if isinstance(duration, (int, float)) and duration >= 0 else None,
             input_tokens,
             output_tokens,
+            data.get("owner_source"),
+            data.get("owner_subject"),
+            data.get("owner_account"),
         ),
     )
 
@@ -250,8 +294,8 @@ def _upsert_session(
             session_id, source_path, session_key, conversation_id, channel,
             platform, bot_name, agent_name, chat_id, sender_id, sender_name,
             summary, response_text, message_count, model, created_at,
-            input_tokens, output_tokens
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            input_tokens, output_tokens, owner_source, owner_subject, owner_account
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET
             source_path = excluded.source_path,
             session_key = excluded.session_key,
@@ -269,7 +313,10 @@ def _upsert_session(
             model = excluded.model,
             created_at = excluded.created_at,
             input_tokens = excluded.input_tokens,
-            output_tokens = excluded.output_tokens
+            output_tokens = excluded.output_tokens,
+            owner_source = excluded.owner_source,
+            owner_subject = excluded.owner_subject,
+            owner_account = excluded.owner_account
         """,
         (
             session_id,
@@ -290,6 +337,9 @@ def _upsert_session(
             float(data.get("created_at", path.stat().st_mtime) or 0.0),
             input_tokens,
             output_tokens,
+            data.get("owner_source"),
+            data.get("owner_subject"),
+            data.get("owner_account"),
         ),
     )
 
@@ -398,7 +448,7 @@ WITH combined AS (
         invocation_id, session_id, agent_name, channel, platform, model,
         status, request_content, response_text, error, created_at,
         message_count, tool_call_count, trace_id, duration_ms,
-        input_tokens, output_tokens
+        input_tokens, output_tokens, owner_source, owner_subject, owner_account
     FROM invocations
     UNION ALL
     SELECT
@@ -418,7 +468,10 @@ WITH combined AS (
         NULL AS trace_id,
         NULL AS duration_ms,
         sessions.input_tokens,
-        sessions.output_tokens
+        sessions.output_tokens,
+        sessions.owner_source,
+        sessions.owner_subject,
+        sessions.owner_account
     FROM sessions
     WHERE sessions.channel = 'api'
       AND NOT EXISTS (
@@ -485,6 +538,9 @@ def list_sessions(
     channel: str | None = None,
     exclude_channel: str | None = None,
     agent_name: str | None = None,
+    owner_source: str | None = None,
+    owner_subject: str | None = None,
+    include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     ensure_index(workspace)
     sql = "SELECT * FROM sessions WHERE 1 = 1"
@@ -500,6 +556,19 @@ def list_sessions(
     agent_sql, agent_params = _agent_filter_sql(agent_name)
     sql += agent_sql
     params.extend(agent_params)
+    if owner_source is not None or owner_subject is not None:
+        if not owner_source or not owner_subject:
+            return []
+        if include_legacy:
+            sql += (
+                " AND ((owner_source = ? AND owner_subject = ?)"
+                " OR owner_source IS NULL OR owner_subject IS NULL)"
+            )
+        else:
+            sql += " AND owner_source = ? AND owner_subject = ?"
+        params.extend([owner_source, owner_subject])
+    if not include_legacy:
+        sql += " AND owner_source IS NOT NULL AND owner_subject IS NOT NULL"
     sql += " ORDER BY created_at DESC, session_id DESC LIMIT ?"
     params.append(max(1, limit))
     with _connect(workspace) as connection:

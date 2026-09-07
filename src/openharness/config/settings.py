@@ -518,8 +518,9 @@ class InternalApiSettings(BaseModel):
     """Backend API targets that may receive the current HSJM user token."""
 
     base_url: str = ""
+    agent_api_base_url: str = ""
     allowlist: list[str] = Field(default_factory=list)
-    dingtalk_token: str = "123"
+    dingtalk_token: str = ""
 
 
 class KbAgentAccess(BaseModel):
@@ -963,16 +964,22 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         updates["api_key"] = api_key
 
     internal_base_url = os.environ.get("OHMO_INTERNAL_API_BASE_URL")
+    internal_agent_base_url = os.environ.get("OHMO_AGENT_API_BASE_URL")
     internal_allowlist = os.environ.get("OHMO_INTERNAL_API_ALLOWLIST")
+    internal_dingtalk_token = os.environ.get("OHMO_INTERNAL_API_DINGTALK_TOKEN")
     internal_updates: dict[str, Any] = {}
     if internal_base_url is not None:
         internal_updates["base_url"] = internal_base_url.strip()
+    if internal_agent_base_url is not None:
+        internal_updates["agent_api_base_url"] = internal_agent_base_url.strip()
     if internal_allowlist is not None:
         internal_updates["allowlist"] = [
             item.strip()
             for item in internal_allowlist.split(",")
             if item.strip()
         ]
+    if internal_dingtalk_token is not None:
+        internal_updates["dingtalk_token"] = internal_dingtalk_token.strip()
     if internal_updates:
         updates["internal_api"] = settings.internal_api.model_copy(update=internal_updates)
 

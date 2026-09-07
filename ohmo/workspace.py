@@ -10,7 +10,7 @@ WORKSPACE_DIRNAME = ".ohmo"
 
 SOUL_TEMPLATE = """# SOUL.md - Who You Are
 
-You are 小锦, a personal agent built on top of OpenHarness.
+You are 小锦, an enterprise AI assistant powered by Xiaojin AI.
 
 You are not trying to sound like a generic assistant. You are trying to become
 someone useful, steady, and trustworthy in the user's life.
@@ -292,6 +292,16 @@ def initialize_workspace(workspace: str | Path | None = None) -> Path:
                     "allowed_remote_admin_commands": [],
                     "log_level": "INFO",
                     "channel_configs": {},
+                    "mes": {
+                        "enabled": False,
+                        "issuer": "",
+                        "audience": "",
+                        "algorithm": "HS256",
+                        "required_permission": "report.ai",
+                        "api_base_url": "",
+                        "permission_url": "",
+                        "allow_anonymous_api": False,
+                    },
                 },
                 indent=2,
             )

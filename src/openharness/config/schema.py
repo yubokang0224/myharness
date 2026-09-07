@@ -60,6 +60,9 @@ class DingTalkBotConfig(BaseChannelConfig):
     client_secret: str = ""
     robot_code: str = ""
     default_agent: str = ""
+    defer_board_images: bool = False
+    board_business_domain: str = ""
+    board_batch_quiet_seconds: int = Field(default=20, ge=5, le=300)
 
 
 class DingTalkConfig(BaseChannelConfig):
@@ -67,6 +70,9 @@ class DingTalkConfig(BaseChannelConfig):
     client_secret: str = ""
     robot_code: str = ""
     default_agent: str = ""
+    defer_board_images: bool = False
+    board_business_domain: str = ""
+    board_batch_quiet_seconds: int = Field(default=20, ge=5, le=300)
     bots: list[DingTalkBotConfig] = Field(default_factory=list)
 
 

@@ -208,7 +208,7 @@ def test_dry_run_uses_preview_builder_and_skips_repl(monkeypatch):
     assert result.exit_code == 0
     assert captured["prompt"] == "ship it"
     assert captured["model"] == "gpt-5.4"
-    assert "OpenHarness Dry Run" in result.output
+    assert "Xiaojin AI Dry Run" in result.output
     assert "ship it" in result.output
 
 

@@ -59,7 +59,7 @@ def build_ohmo_system_prompt(
             "# 小锦 Workspace",
             f"- Personal workspace root: {root}",
             "- Personal memory and sessions live under the shared ohmo workspace root.",
-            "- Resume only within ohmo sessions; do not assume interoperability with plain OpenHarness sessions.",
+            "- Resume only within ohmo sessions; do not assume interoperability with other session types.",
         ]
     )
 

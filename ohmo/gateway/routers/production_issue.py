@@ -7,7 +7,7 @@ import logging
 import mimetypes
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import urljoin
+from urllib.parse import unquote, urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 _SOURCE_CHANNEL_HEADER = "x-ohmo-source-channel"
+_SOURCE_SENDER_NAME_HEADER = "x-ohmo-source-sender-name"
+_DINGTALK_READ_ACTIONS = {"GetListPaged", "Get"}
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _FILE_EXTENSIONS = {
     ".jpg",
@@ -110,6 +112,16 @@ async def _forward_production_issue(
 
     body = await request.body()
     source_channel = _source_channel(request, body)
+    source_sender_name = _source_sender_name(request)
+    if (
+        source_channel == "dingtalk"
+        and action in _DINGTALK_READ_ACTIONS
+        and not source_sender_name
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Current DingTalk sender name is required for production issue queries",
+        )
     body = _body_with_source_channel(body, source_channel)
     upstream_url = urljoin(upstream_base_url.rstrip("/") + "/", f"ProductionIssue/{action}")
     headers = _forward_headers(request)
@@ -127,11 +139,99 @@ async def _forward_production_issue(
         upstream_response = await client.request(
             request.method,
             upstream_url,
-            params=dict(request.query_params),
+            params=_query_params_for_upstream(
+                request,
+                action=action,
+                source_channel=source_channel,
+                source_sender_name=source_sender_name,
+            ),
             headers=headers,
             content=body,
         )
 
+    return _response_scoped_to_sender(
+        upstream_response,
+        action=action,
+        source_channel=source_channel,
+        source_sender_name=source_sender_name,
+    )
+
+
+def _response_scoped_to_sender(
+    upstream_response: httpx.Response,
+    *,
+    action: str,
+    source_channel: str,
+    source_sender_name: str,
+) -> Response:
+    if (
+        source_channel != "dingtalk"
+        or action not in _DINGTALK_READ_ACTIONS
+        or upstream_response.status_code >= 400
+    ):
+        return _upstream_response(upstream_response)
+
+    try:
+        payload = json.loads(upstream_response.content)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return Response(
+            content=b'{"detail":"Unable to verify production issue ownership"}',
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            media_type="application/json",
+        )
+    if not isinstance(payload, dict):
+        return Response(
+            content=b'{"detail":"Unable to verify production issue ownership"}',
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            media_type="application/json",
+        )
+
+    if action == "GetListPaged":
+        data_key = "data" if "data" in payload else "Data" if "Data" in payload else None
+        if data_key is None:
+            return _upstream_response(upstream_response)
+        items = payload.get(data_key)
+        if not isinstance(items, list):
+            return Response(
+                content=b'{"detail":"Unable to verify production issue ownership"}',
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                media_type="application/json",
+            )
+        filtered = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and _item_sender_name(item) == source_sender_name
+        ]
+        payload[data_key] = filtered
+        total_key = "total" if "total" in payload else "Total" if "Total" in payload else None
+        if total_key is not None and len(filtered) != len(items):
+            payload[total_key] = len(filtered)
+        return _json_response(payload, upstream_response.status_code)
+
+    result = payload.get("backResult", payload.get("BackResult"))
+    if isinstance(result, dict) and _item_sender_name(result) != source_sender_name:
+        return Response(
+            content=b'{"detail":"Production issue not found"}',
+            status_code=status.HTTP_404_NOT_FOUND,
+            media_type="application/json",
+        )
+    return _upstream_response(upstream_response)
+
+
+def _item_sender_name(item: dict[str, object]) -> str:
+    return _text(item.get("sourceSenderName") or item.get("SourceSenderName"))
+
+
+def _json_response(payload: dict[str, object], status_code: int) -> Response:
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
+
+def _upstream_response(upstream_response: httpx.Response) -> Response:
     return Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
@@ -164,6 +264,28 @@ def _source_channel(request: Request, body: bytes) -> str:
         return query_channel
     body_channel = _source_channel_from_json_body(body)
     return body_channel.strip().lower()
+
+
+def _source_sender_name(request: Request) -> str:
+    encoded = (request.headers.get(_SOURCE_SENDER_NAME_HEADER) or "").strip()
+    return unquote(encoded).strip()
+
+
+def _query_params_for_upstream(
+    request: Request,
+    *,
+    action: str,
+    source_channel: str,
+    source_sender_name: str,
+) -> dict[str, str]:
+    params = dict(request.query_params)
+    if source_channel != "dingtalk" or action not in _DINGTALK_READ_ACTIONS:
+        return params
+    for key in list(params):
+        if key.replace("_", "").lower() in {"sourcesenderid", "sourcesendername"}:
+            params.pop(key, None)
+    params["sourceSenderName"] = source_sender_name
+    return params
 
 
 def _body_with_source_channel(body: bytes, source_channel: str) -> bytes:
@@ -423,7 +545,11 @@ def _forward_headers(request: Request) -> dict[str, str]:
     headers: dict[str, str] = {}
     for key, value in request.headers.items():
         lower_key = key.lower()
-        if lower_key in _HOP_BY_HOP_HEADERS or lower_key == "authorization" or lower_key == _SOURCE_CHANNEL_HEADER:
+        if (
+            lower_key in _HOP_BY_HOP_HEADERS
+            or lower_key == "authorization"
+            or lower_key in {_SOURCE_CHANNEL_HEADER, _SOURCE_SENDER_NAME_HEADER}
+        ):
             continue
         headers[key] = value
     return headers

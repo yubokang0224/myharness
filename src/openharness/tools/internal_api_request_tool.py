@@ -6,7 +6,7 @@ import json
 import mimetypes
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urljoin
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +15,8 @@ from openharness.config.settings import load_settings
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
 from openharness.utils.internal_api_auth import (
     apply_internal_api_auth,
+    normalized_origin,
+    resolve_agent_api_base_url,
     resolve_hsjm_user_token,
     resolve_internal_api_url,
 )
@@ -43,7 +45,8 @@ class InternalApiRequestTool(BaseTool):
 
     name = "internal_api_request"
     description = (
-        "Call an HTTP API. Relative paths use the configured internal_api.base_url. "
+        "Call an HTTP API. Relative /agent/api paths use internal_api.agent_api_base_url; "
+        "other relative paths use internal_api.base_url. "
         "Allowlisted internal origins automatically receive the current user's Bearer token; "
         "other URLs are requested without that token."
     )
@@ -55,6 +58,30 @@ class InternalApiRequestTool(BaseTool):
         context: ToolExecutionContext,
     ) -> ToolResult:
         url = resolve_internal_api_url(arguments.url)
+        if _requires_agent_gateway(url) and not _is_allowed_agent_gateway_target(url):
+            return ToolResult(
+                output=(
+                    "internal_api_request failed: agent API calls may only target "
+                    "the configured internal_api.agent_api_base_url"
+                ),
+                is_error=True,
+            )
+        if _is_board_memo_url(url) and not _is_allowed_board_memo_target(url):
+            return ToolResult(
+                output=(
+                    "internal_api_request failed: BoardMemo calls may only target "
+                    "a supported action on the configured agent API"
+                ),
+                is_error=True,
+            )
+        if _is_async_board_context(context.metadata) and not _is_allowed_async_board_target(url):
+            return ToolResult(
+                output=(
+                    "internal_api_request failed: async board recognition may only call "
+                    "the configured internal BoardMemo GetProfiles/Insert endpoints"
+                ),
+                is_error=True,
+            )
         try:
             validate_http_url(url)
         except NetworkGuardError as exc:
@@ -69,6 +96,11 @@ class InternalApiRequestTool(BaseTool):
                 metadata=context.metadata,
             )
             await _upload_local_attachments_in_place(json_body, url, context.metadata)
+            params = _params_with_channel_context(
+                url,
+                arguments.params,
+                metadata=context.metadata,
+            )
             headers = _headers_with_channel_context(
                 arguments.headers,
                 metadata=context.metadata,
@@ -76,7 +108,7 @@ class InternalApiRequestTool(BaseTool):
             response, auth_attached = await _request_with_auth_per_redirect(
                 method=method,
                 url=url,
-                params=arguments.params,
+                params=params,
                 headers=headers,
                 json_body=json_body,
                 timeout=arguments.timeout,
@@ -121,6 +153,20 @@ async def _request_with_auth_per_redirect(
     async with httpx.AsyncClient(follow_redirects=False, timeout=timeout, trust_env=False) as client:
         for redirect_count in range(MAX_REDIRECTS + 1):
             validate_http_url(current_url)
+            if _requires_agent_gateway(current_url) and not _is_allowed_agent_gateway_target(
+                current_url
+            ):
+                raise NetworkGuardError(
+                    "agent API request left internal_api.agent_api_base_url"
+                )
+            if _is_board_memo_url(current_url) and not _is_allowed_board_memo_target(current_url):
+                raise NetworkGuardError(
+                    "BoardMemo request left the configured supported actions"
+                )
+            if _is_async_board_context(metadata) and not _is_allowed_async_board_target(current_url):
+                raise NetworkGuardError(
+                    "async board recognition redirect left the configured BoardMemo endpoints"
+                )
             request_url, request_headers, attached = apply_internal_api_auth(
                 current_url,
                 headers,
@@ -153,17 +199,60 @@ def _headers_with_channel_context(
     metadata: dict[str, Any] | None,
 ) -> dict[str, str]:
     next_headers = dict(headers or {})
-    if any(key.lower() == "x-ohmo-source-channel" for key in next_headers):
-        return next_headers
     if not isinstance(metadata, dict):
         return next_headers
     channel_context = metadata.get("channel_context")
     if not isinstance(channel_context, dict):
         return next_headers
-    channel = channel_context.get("channel")
-    if isinstance(channel, str) and channel.strip():
-        next_headers["X-OHMO-Source-Channel"] = channel.strip()
+    channel = _metadata_text(channel_context.get("channel"))
+    if not channel:
+        return next_headers
+
+    protected_headers = {
+        "x-ohmo-source-channel",
+        "x-ohmo-source-sender-name",
+    }
+    for key in list(next_headers):
+        if key.lower() in protected_headers:
+            next_headers.pop(key, None)
+    next_headers["X-OHMO-Source-Channel"] = channel
+    sender_name = _metadata_text(channel_context.get("sender_name"))
+    if channel.lower() == "dingtalk" and sender_name:
+        next_headers["X-OHMO-Source-Sender-Name"] = quote(sender_name, safe="")
     return next_headers
+
+
+def _params_with_channel_context(
+    url: str,
+    params: dict[str, str | int | float | bool] | None,
+    *,
+    metadata: dict[str, Any] | None,
+) -> dict[str, str | int | float | bool] | None:
+    """Force DingTalk issue reads to the current sender's display name."""
+    if not _is_production_issue_read_url(url) or not isinstance(metadata, dict):
+        return params
+    channel_context = metadata.get("channel_context")
+    if not isinstance(channel_context, dict):
+        return params
+    channel = _metadata_text(channel_context.get("channel")).lower()
+    sender_name = _metadata_text(channel_context.get("sender_name"))
+    if channel != "dingtalk":
+        return params
+    if not sender_name:
+        raise NetworkGuardError(
+            "ProductionIssue query denied: current DingTalk sender name is unavailable"
+        )
+
+    next_params = dict(params or {})
+    sender_filter_keys = [
+        key
+        for key in next_params
+        if str(key).replace("_", "").lower() in {"sourcesenderid", "sourcesendername"}
+    ]
+    for key in sender_filter_keys:
+        next_params.pop(key, None)
+    next_params["sourceSenderName"] = sender_name
+    return next_params
 
 
 def _coerce_json_body(json_body: Any, body: Any) -> Any:
@@ -220,14 +309,18 @@ def _json_body_with_channel_context(
     _set_production_issue_idempotency_key(next_body, url, channel_context)
 
     body_attachments = next_body.get("attachments")
+    supports_attachment_fallback = (
+        _is_board_memo_insert_url(url) or _is_production_issue_write_url(url)
+    )
     needs_attachments = not body_attachments
-    if _is_board_memo_insert_url(url) and not _has_usable_attachment(body_attachments):
-        # 模型可能带了只剩 fileName 的空壳附件（拿不到本地路径时），一并视为缺失
+    if supports_attachment_fallback and not _has_usable_attachment(body_attachments):
+        # 模型可能带了只剩 fileName 的空壳附件（拿不到本地路径时），一并视为缺失。
         needs_attachments = True
     if needs_attachments:
         attachment_paths = channel_context.get("attachment_paths")
-        if _is_board_memo_insert_url(url) and not _paths_present(attachment_paths):
-            # 确认消息本身不带附件：回退到本会话最近一次带图消息（白板首图）
+        if supports_attachment_fallback and not _paths_present(attachment_paths):
+            # 确认消息本身通常不带附件：回退到本会话最近一次带图消息。
+            # BoardMemo 需要白板首图；ProductionIssue 需要最初上报或补录时的现场图片。
             attachment_paths = channel_context.get("last_attachment_paths")
         if isinstance(attachment_paths, list):
             attachments = [
@@ -244,7 +337,74 @@ def _json_body_with_channel_context(
 
     _set_board_memo_insert_idempotency_key(next_body, channel_context, url)
 
+    # A durable board-recognition job is pre-authorized to create a draft only.
+    # Enforce the scheduler-owned key and already-uploaded attachments here so a
+    # model response cannot accidentally confirm the memo or upload duplicates.
+    if _is_board_memo_insert_url(url) and channel_context.get("async_board_recognition") is True:
+        next_body["status"] = "draft"
+        business_domain = _metadata_text(channel_context.get("board_business_domain"))
+        if business_domain:
+            next_body["businessDomain"] = business_domain
+        idempotency_key = _metadata_text(channel_context.get("board_idempotency_key"))
+        if idempotency_key:
+            next_body["idempotencyKey"] = idempotency_key
+            next_body.pop("idempotency_key", None)
+        persisted_attachments = _persisted_board_attachments(
+            channel_context.get("attachment_urls"),
+            source_type=channel,
+        )
+        if persisted_attachments:
+            next_body["attachments"] = persisted_attachments
+        _force_async_board_source_fields(next_body, channel_context)
+
     return next_body
+
+
+def _persisted_board_attachments(value: Any, *, source_type: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    attachments: list[dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        file_url = _metadata_text(entry.get("fileUrl") or entry.get("file_url"))
+        if not file_url:
+            continue
+        item: dict[str, Any] = {
+            "fileName": _metadata_text(entry.get("fileName") or entry.get("file_name"))
+            or Path(file_url).name,
+            "fileUrl": file_url,
+            "sourceType": source_type,
+        }
+        content_type = _metadata_text(
+            entry.get("contentType") or entry.get("content_type") or entry.get("mimeType")
+        )
+        if content_type:
+            item["mimeType"] = content_type
+        size = entry.get("sizeBytes", entry.get("size_bytes", entry.get("fileSize")))
+        if isinstance(size, int) and size >= 0:
+            item["fileSize"] = size
+        attachments.append(item)
+    return attachments
+
+
+def _force_async_board_source_fields(
+    body: dict[str, Any],
+    channel_context: dict[str, Any],
+) -> None:
+    field_map = {
+        "sourceChannel": "channel",
+        "sourceChatId": "chat_id",
+        "sourceSenderId": "source_sender_id",
+        "sourceSenderName": "sender_name",
+        "sourceMessageId": "message_id",
+        "sourceConversationId": "conversation_id",
+        "sourceSessionKey": "session_key",
+    }
+    for body_key, context_key in field_map.items():
+        value = _metadata_text(channel_context.get(context_key))
+        if value:
+            body[body_key] = value
 
 
 _IMAGE_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -261,7 +421,9 @@ async def _upload_local_attachments_in_place(
     因此凡本机存在的 sourceLocalPath 先直传 Common/Upload* 换成 fileUrl 再转发；
     带 fileUrl 的附件下游中转会原样放行。上传失败时保留原路径，交由中转兜底。
     """
-    if not _is_board_memo_insert_url(url) or not isinstance(json_body, dict):
+    if not (
+        _is_board_memo_insert_url(url) or _is_production_issue_write_url(url)
+    ) or not isinstance(json_body, dict):
         return
     attachments = json_body.get("attachments")
     if not isinstance(attachments, list):
@@ -344,7 +506,132 @@ def _has_usable_attachment(attachments: Any) -> bool:
 
 
 def _is_board_memo_insert_url(url: str) -> bool:
-    return url.lower().rstrip("/").endswith("/boardmemo/insert")
+    return _normalized_url_path(url).endswith("/boardmemo/insert")
+
+
+def _is_async_board_context(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    channel_context = metadata.get("channel_context")
+    return isinstance(channel_context, dict) and channel_context.get("async_board_recognition") is True
+
+
+def _is_allowed_async_board_target(url: str) -> bool:
+    return _is_allowed_board_memo_target(url, allowed_actions={"getprofiles", "insert"})
+
+
+_BOARD_MEMO_ACTIONS = {
+    "insert",
+    "appenditem",
+    "updateitem",
+    "update",
+    "delete",
+    "deleteitem",
+    "getlistpaged",
+    "getsummarylistpaged",
+    "getitemlistpaged",
+    "get",
+    "getprofiles",
+}
+
+
+def _is_allowed_board_memo_target(
+    url: str,
+    *,
+    allowed_actions: set[str] | None = None,
+) -> bool:
+    if not _is_allowed_agent_gateway_target(url):
+        return False
+
+    try:
+        settings = load_settings()
+    except Exception:
+        return False
+    configured_base = resolve_agent_api_base_url(settings)
+    base_path = _decoded_url_path(configured_base).lower().rstrip("/")
+    if base_path.endswith("/agent/api/v1"):
+        board_prefix = f"{base_path}/boardmemo/"
+    else:
+        board_prefix = f"{base_path}/agent/api/v1/boardmemo/"
+    target_path = _decoded_url_path(url).lower().rstrip("/")
+    if not target_path.startswith(board_prefix):
+        return False
+    action = target_path[len(board_prefix) :]
+    permitted = allowed_actions if allowed_actions is not None else _BOARD_MEMO_ACTIONS
+    return "/" not in action and action in permitted
+
+
+def _is_allowed_agent_gateway_target(url: str) -> bool:
+    """Require the exact configured gateway origin and base path for agent routes."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.fragment:
+        return False
+    try:
+        settings = load_settings()
+    except Exception:
+        return False
+    configured_base = resolve_agent_api_base_url(settings)
+    if not configured_base or not _is_valid_agent_api_base_url(configured_base):
+        return False
+    try:
+        target_origin = normalized_origin(url)
+        configured_origin = normalized_origin(configured_base)
+    except ValueError:
+        return False
+    if target_origin != configured_origin:
+        return False
+    base_path = _decoded_url_path(configured_base).lower().rstrip("/")
+    if base_path.endswith("/agent/api/v1"):
+        required_prefix = base_path
+    else:
+        required_prefix = f"{base_path}/agent/api/v1"
+    target_path = _decoded_url_path(url).lower().rstrip("/")
+    if not _is_canonical_decoded_path(target_path):
+        return False
+    return target_path == required_prefix or target_path.startswith(required_prefix + "/")
+
+
+def _is_valid_agent_api_base_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    return _is_canonical_decoded_path(_decoded_url_path(url))
+
+
+def _is_canonical_decoded_path(path: str) -> bool:
+    if "\\" in path:
+        return False
+    return all(segment not in {".", ".."} for segment in path.split("/"))
+
+
+def _requires_agent_gateway(url: str) -> bool:
+    path = _decoded_url_path(url).lower()
+    return "/agent/api" in path or "/boardmemo" in path
+
+
+def _decoded_url_path(url: str) -> str:
+    path = urlsplit(url).path
+    for _ in range(3):
+        decoded = unquote(path)
+        if decoded == path:
+            break
+        path = decoded
+    return path
+
+
+def _normalized_url_path(url: str) -> str:
+    return _decoded_url_path(url).lower().rstrip("/")
 
 
 def _set_board_memo_insert_idempotency_key(
@@ -377,6 +664,13 @@ def _is_production_issue_write_url(url: str) -> bool:
             "/productionissue/appendprocess",
             "/productionissue/updatestatus",
         )
+    )
+
+
+def _is_production_issue_read_url(url: str) -> bool:
+    normalized = _normalized_url_path(url)
+    return normalized.endswith(
+        ("/productionissue/getlistpaged", "/productionissue/get")
     )
 
 
@@ -417,11 +711,11 @@ def _is_kb_write_url(url: str) -> bool:
 
 
 def _is_board_memo_url(url: str) -> bool:
-    return "/boardmemo/" in url.lower()
+    return "/boardmemo/" in _normalized_url_path(url)
 
 
 def _is_board_memo_write_url(url: str) -> bool:
-    normalized = url.lower().rstrip("/")
+    normalized = _normalized_url_path(url)
     return any(
         normalized.endswith(path)
         for path in (

@@ -9,12 +9,12 @@ Directory skills use this shape:
   SKILL.md
 ```
 
-`SKILL.md` must begin with YAML frontmatter. OpenHarness reads at least:
+`SKILL.md` must begin with YAML frontmatter. Xiaojin AI reads at least:
 
 - `name`: skill identifier
 - `description`: trigger text shown to the model before the body is loaded
 
-Keep frontmatter minimal. Extra fields may be ignored by OpenHarness and may not
+Keep frontmatter minimal. Extra fields may be ignored by Xiaojin AI and may not
 be portable across runtimes.
 
 ## Naming
@@ -60,7 +60,7 @@ loaded, activation already happened.
 Keep resources one level from `SKILL.md` and name them clearly. If a resource is
 large, include a table of contents at the top.
 
-## OpenHarness Target Location
+## Xiaojin AI Target Location
 
 For this product, create and update local skills here:
 
@@ -81,7 +81,7 @@ If the skill includes resources, put them next to `SKILL.md`:
 
 Repository built-in skills are an implementation detail. Only edit
 `src/openharness/skills/bundled/content/` when the user explicitly asks to change
-the built-in skills shipped with OpenHarness.
+the built-in skills shipped with Xiaojin AI.
 
 The loader registers skills by name. If the same name appears more than once,
 the later registration wins in the registry.

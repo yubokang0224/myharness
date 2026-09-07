@@ -55,7 +55,7 @@ def _build_delegation_section() -> str:
         [
             "# Delegation And Subagents",
             "",
-            "OpenHarness can delegate background work with the `agent` tool.",
+            "Xiaojin AI can delegate background work with the `agent` tool.",
             "Use it when the user explicitly asks for a subagent, background worker, or parallel investigation, "
             "or when the task clearly benefits from splitting off a focused worker.",
             "",

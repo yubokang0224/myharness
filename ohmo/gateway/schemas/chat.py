@@ -39,6 +39,7 @@ class KbPreference(BaseModel):
 class MessageRequest(BaseModel):
     content: str
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    run_id: str | None = Field(default=None, max_length=128)
     response_format: Literal["text", "json"] = "text"
     persist_mode: Literal["session", "log", "none"] | None = None
     kb: KbPreference | None = None

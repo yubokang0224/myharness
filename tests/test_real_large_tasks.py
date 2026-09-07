@@ -1,4 +1,4 @@
-"""Real large tasks that exercise multiple OpenHarness features together.
+"""Real large tasks that exercise multiple Xiaojin AI features together.
 
 Each task is a realistic multi-turn scenario that combines 3+ features,
 running on the AutoAgent codebase (an unfamiliar project) with real Kimi K2.5 API.

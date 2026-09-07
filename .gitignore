@@ -29,6 +29,7 @@ frontend/terminal/node_modules/
 
 # User data (never commit API keys or session data)
 .openharness/
+.ohmo/
 react_tui_smoke.txt
 
 # OS
@@ -43,4 +44,10 @@ deploy-procurement-bot/gateway.json钉钉配置片段.json
 deploy-procurement-bot/部署步骤.md
 docs/可观测性与运维指南.md
 
-tests/
+tests/*
+!tests/test_dingtalk_board_images.py
+!tests/test_ohmo/
+tests/test_ohmo/*
+!tests/test_ohmo/test_mes_agent_mvp_security.py
+!tests/test_ohmo/test_board_image_recognition_worker.py
+docs/

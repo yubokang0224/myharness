@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# OpenHarness one-click installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash
+# Xiaojin AI one-click installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/yubokang0224/myharness/main/scripts/install.sh | bash
 #        bash scripts/install.sh [--from-source] [--with-channels]
 
 set -euo pipefail
@@ -57,7 +57,7 @@ done
 echo ""
 echo -e "${BOLD}${CYAN}  ██████╗ ██╗  ██╗${RESET}"
 echo -e "${BOLD}${CYAN} ██╔═══██╗██║  ██║${RESET}"
-echo -e "${BOLD}${CYAN} ██║   ██║███████║${RESET}   OpenHarness Installer"
+echo -e "${BOLD}${CYAN} ██║   ██║███████║${RESET}   Xiaojin AI Installer"
 echo -e "${BOLD}${CYAN} ██║   ██║██╔══██║${RESET}   Open Agent Harness"
 echo -e "${BOLD}${CYAN} ╚██████╔╝██║  ██║${RESET}"
 echo -e "${BOLD}${CYAN}  ╚═════╝ ╚═╝  ╚═╝${RESET}"
@@ -179,11 +179,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Install OpenHarness
+# Step 4: Install Xiaojin AI
 # ---------------------------------------------------------------------------
-step "Installing OpenHarness"
+step "Installing Xiaojin AI"
 
-REPO_URL="https://github.com/HKUDS/OpenHarness.git"
+REPO_URL="https://github.com/yubokang0224/myharness.git"
 INSTALL_DIR="$HOME/.openharness-src"
 VENV_DIR="$HOME/.openharness-venv"
 BIN_DIR="$HOME/.local/bin"
@@ -215,7 +215,7 @@ if [ "$FROM_SOURCE" = true ]; then
             info "Source directory exists, pulling latest changes..."
             git -C "$INSTALL_DIR" pull --ff-only
         else
-            info "Cloning OpenHarness into ${INSTALL_DIR}..."
+            info "Cloning Xiaojin AI into ${INSTALL_DIR}..."
             git clone "$REPO_URL" "$INSTALL_DIR"
         fi
     else
@@ -235,7 +235,7 @@ else
     $PIP_CMD install openharness-ai --quiet --upgrade
 fi
 
-success "OpenHarness package installed"
+success "Xiaojin AI package installed"
 
 # ---------------------------------------------------------------------------
 # Step 5: Channel dependencies
@@ -267,9 +267,9 @@ if [ "$NODE_OK" = true ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 7: Create OpenHarness config directory
+# Step 7: Create Xiaojin AI config directory
 # ---------------------------------------------------------------------------
-step "Setting up OpenHarness config directory"
+step "Setting up Xiaojin AI config directory"
 
 mkdir -p "$HOME/.openharness"
 mkdir -p "$HOME/.openharness/skills"
@@ -320,7 +320,7 @@ step "Setting up shell integration"
 ACTIVATION_LINE="export PATH=\"$BIN_DIR:\$PATH\""
 FISH_CONFIG="$HOME/.config/fish/config.fish"
 FISH_BLOCK=$(cat <<EOF
-# OpenHarness
+# Xiaojin AI
 if not contains -- "$BIN_DIR" \$PATH
     set -gx PATH "$BIN_DIR" \$PATH
 end
@@ -340,7 +340,7 @@ append_shell_path() {
         return
     fi
     echo "" >> "$rc_file"
-    echo "# OpenHarness" >> "$rc_file"
+    echo "# Xiaojin AI" >> "$rc_file"
     echo "$ACTIVATION_LINE" >> "$rc_file"
     success "Added $BIN_DIR to PATH in $(basename "$rc_file")"
     configured_any=true
@@ -370,7 +370,7 @@ fi
 # Done
 # ---------------------------------------------------------------------------
 echo ""
-echo -e "${BOLD}${GREEN}OpenHarness is installed!${RESET}"
+echo -e "${BOLD}${GREEN}Xiaojin AI is installed!${RESET}"
 echo ""
 echo "  Next steps:"
 echo "    1. Restart shell, or reload your shell config:"
@@ -379,7 +379,7 @@ echo "         fish:     source ~/.config/fish/config.fish"
 echo "    2. Set your API key:        export ANTHROPIC_API_KEY=your_key"
 echo "    3. Launch:                  oh"
 echo "    4. Launch ohmo:             ohmo"
-echo "    5. Docs:                    https://github.com/HKUDS/OpenHarness"
+echo "    5. Docs:                    https://github.com/yubokang0224/myharness"
 echo ""
 echo "  Notes:"
 echo "    - Commands are linked into: ${BIN_DIR}"

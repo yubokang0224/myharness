@@ -376,7 +376,7 @@ def test_openai_client_translates_empty_timeout_error():
 
     assert isinstance(err, RequestFailure)
     assert "timed out" in str(err).lower()
-    assert "OPENHARNESS_TIMEOUT" in str(err)
+    assert "configured model-response timeout" in str(err)
 
 
 def test_openai_client_uses_bearer_authorization_header():

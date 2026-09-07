@@ -12,7 +12,12 @@ import typer
 from openharness.auth.manager import AuthManager
 from openharness.config import load_settings
 
-from ohmo.gateway.config import load_gateway_config, save_gateway_config
+from ohmo.gateway.config import (
+    configure_mes_workspace_from_appsettings,
+    load_gateway_config,
+    resolve_mes_workspace_config,
+    save_gateway_config,
+)
 from ohmo.gateway.models import GatewayConfig
 from ohmo.gateway.service import (
     OhmoGatewayService,
@@ -36,7 +41,7 @@ from ohmo.workspace import (
 
 app = typer.Typer(
     name="ohmo",
-    help="ohmo: a personal-agent app built on top of OpenHarness.",
+    help="ohmo: the Xiaojin AI personal-agent application.",
     invoke_without_command=True,
     add_completion=False,
 )
@@ -44,6 +49,7 @@ memory_app = typer.Typer(name="memory", help="Manage .ohmo memory")
 soul_app = typer.Typer(name="soul", help="Inspect or edit soul.md")
 user_app = typer.Typer(name="user", help="Inspect or edit user.md")
 gateway_app = typer.Typer(name="gateway", help="Run the ohmo gateway")
+mes_app = typer.Typer(name="mes", help="Configure the MES native AI workspace")
 failures_app = typer.Typer(name="failures", help="Aggregate failure signals into review reports")
 eval_app = typer.Typer(name="eval", help="Regression evaluation for prompt/skill changes")
 
@@ -51,6 +57,7 @@ app.add_typer(memory_app)
 app.add_typer(soul_app)
 app.add_typer(user_app)
 app.add_typer(gateway_app)
+app.add_typer(mes_app)
 app.add_typer(failures_app)
 app.add_typer(eval_app)
 
@@ -654,6 +661,75 @@ def gateway_status_cmd(
     print(state.model_dump_json(indent=2))
 
 
+@mes_app.command("configure")
+def mes_configure_cmd(
+    appsettings: Path = typer.Option(
+        ...,
+        "--appsettings",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="MES appsettings.<Environment>.json to import",
+    ),
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+    api_base_url: str | None = typer.Option(
+        None,
+        "--api-base-url",
+        help="MES API base URL; inferred from appsettings urls when omitted",
+    ),
+    required_permission: str = typer.Option(
+        "report.ai",
+        "--permission",
+        help="Existing MES RouterName.Code permission assigned through roles",
+    ),
+    allow_anonymous_api: bool = typer.Option(
+        False,
+        "--allow-anonymous-api",
+        help="Keep legacy anonymous chat API enabled (not recommended)",
+    ),
+) -> None:
+    """Import MES JWT trust settings once; normal starts need no env variables."""
+
+    root = initialize_workspace(workspace)
+    try:
+        config_path = configure_mes_workspace_from_appsettings(
+            appsettings,
+            workspace=root,
+            api_base_url=api_base_url,
+            required_permission=required_permission,
+            allow_anonymous_api=allow_anonymous_api,
+        )
+        config = resolve_mes_workspace_config(root)
+    except ValueError as exc:
+        print(f"MES configuration failed: {exc}")
+        raise typer.Exit(1) from exc
+    print(f"MES workspace configuration saved: {config_path}")
+    print(f"  issuer: {config.issuer}")
+    print(f"  audience: {config.audience}")
+    print(f"  MES API: {config.api_base_url}")
+    print(f"  permission: {config.required_permission or 'all authenticated MES users'}")
+    print("  JWT secret: imported into credential storage")
+    print(f"  anonymous API: {'enabled' if config.allow_anonymous_api else 'disabled'}")
+
+
+@mes_app.command("status")
+def mes_status_cmd(
+    workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
+) -> None:
+    """Show the effective MES integration status without exposing secrets."""
+
+    config = resolve_mes_workspace_config(workspace)
+    print(f"enabled: {config.enabled}")
+    print(f"issuer: {config.issuer or '-'}")
+    print(f"audience: {config.audience or '-'}")
+    print(f"MES API: {config.api_base_url or '-'}")
+    print(f"permission: {config.required_permission or 'all authenticated MES users'}")
+    print(f"JWT secret: {'configured' if config.secret_key else 'missing'}")
+    print(f"anonymous API: {'enabled' if config.allow_anonymous_api else 'disabled'}")
+
+
 @failures_app.command("report")
 def failures_report_cmd(
     days: int = typer.Option(7, "--days", help="Look-back window in days"),
@@ -755,7 +831,7 @@ def serve_cmd(
     reload: bool = typer.Option(False, "--reload", help="Enable hot-reload (development only)"),
     cors_origins: list[str] = typer.Option([], "--cors-origin", help="Allowed CORS origins (repeatable)"),
 ) -> None:
-    """Start the OpenHarness Agent HTTP API server (FastAPI + uvicorn)."""
+    """Start the Xiaojin AI HTTP API server (FastAPI + uvicorn)."""
     try:
         import uvicorn
     except ImportError:
@@ -778,7 +854,7 @@ def serve_cmd(
         workspace=effective_workspace,
     )
 
-    print(f"Starting OpenHarness Agent API on http://{host}:{port}")
+    print(f"Starting Xiaojin AI API on http://{host}:{port}")
     print(f"  OpenAPI docs: http://{host}:{port}/docs")
 
     uvicorn.run(

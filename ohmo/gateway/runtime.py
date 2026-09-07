@@ -74,6 +74,12 @@ _IMAGE_FALLBACK_NOTE_PREFIX = (
 _IMAGE_FALLBACK_NOTE_GUIDANCE = (
     " Ask the user to resend the image as text or switch to a vision-capable model."
 )
+_INVALID_IMAGE_FALLBACK_NOTE_PREFIX = (
+    "[Image attachment omitted because the image data could not be decoded"
+)
+_INVALID_IMAGE_FALLBACK_NOTE_GUIDANCE = (
+    " Ask the user to resend the original image as a JPG or PNG file."
+)
 
 
 @dataclass(frozen=True)
@@ -191,12 +197,18 @@ class OhmoSessionRuntimePool:
     async def stream_message(self, message: InboundMessage, session_key: str):
         """Submit an inbound channel message and yield progress + final reply updates."""
         self._session_metadata[session_key] = self._session_metadata_for_message(message)
-        user_message = _build_inbound_user_message(message, session_key=session_key)
+        agent_name = self._agent_name_for_message(message)
+        agent_def = self._resolve_agent_definition(agent_name)
+        user_message = _build_inbound_user_message(
+            message,
+            session_key=session_key,
+            image_attachments_only=_agent_stores_images_as_attachments(agent_def),
+        )
         user_prompt = user_message.text
         bundle = await self.get_bundle(
             session_key,
             latest_user_prompt=user_prompt,
-            agent_name=self._agent_name_for_message(message),
+            agent_name=agent_name,
         )
         _apply_channel_context_metadata(bundle, message, session_key)
         logger.info(
@@ -223,7 +235,7 @@ class OhmoSessionRuntimePool:
                 )
             if not remote_allowed:
                 result = CommandResult(
-                    message=f"/{command.name} is only available in the local OpenHarness UI."
+                    message=f"/{command.name} is only available in the local Xiaojin AI UI."
                 )
                 async for update in self._stream_command_result(
                     bundle=bundle,
@@ -395,27 +407,43 @@ class OhmoSessionRuntimePool:
         )
         try:
             async for event in bundle.engine.submit_message(user_message):
-                if isinstance(event, ErrorEvent) and _should_retry_without_image_input(
-                    event.message,
-                    bundle.engine.messages,
-                ):
+                image_retry_reason = (
+                    _image_input_retry_reason(event.message, bundle.engine.messages)
+                    if isinstance(event, ErrorEvent)
+                    else None
+                )
+                if image_retry_reason is not None:
                     logger.warning(
-                        "ohmo runtime image input rejected; retrying without image blocks session_key=%s session_id=%s message=%r",
+                        "ohmo runtime image input rejected; retrying without image blocks "
+                        "session_key=%s session_id=%s reason=%s message=%r",
                         session_key,
                         bundle.session_id,
+                        image_retry_reason,
                         _content_snippet(event.message),
                     )
-                    _strip_image_blocks_from_engine_history(bundle.engine)
+                    _strip_image_blocks_from_engine_history(
+                        bundle.engine,
+                        reason=image_retry_reason,
+                    )
                     yield GatewayStreamUpdate(
                         kind="progress",
                         text=_format_channel_progress(
                             channel=message.channel,
-                            kind="image_fallback",
+                            kind=(
+                                "invalid_image_fallback"
+                                if image_retry_reason == "invalid"
+                                else "image_fallback"
+                            ),
                             text=event.message,
                             session_key=session_key,
                             content=user_prompt,
                         ),
-                        metadata={"_progress": True, "_session_key": session_key, "_image_fallback": True},
+                        metadata={
+                            "_progress": True,
+                            "_session_key": session_key,
+                            "_image_fallback": True,
+                            "_image_fallback_reason": image_retry_reason,
+                        },
                     )
                     async for retry_event in bundle.engine.continue_pending(max_turns=bundle.engine.max_turns):
                         async for update in self._convert_stream_event(
@@ -868,7 +896,7 @@ def _apply_channel_context_metadata(
     else:
         last_attachment_paths = list(previous_context.get("last_attachment_paths") or [])
         last_attachment_message_id = _optional_str(previous_context.get("last_attachment_message_id"))
-    metadata["channel_context"] = {
+    channel_context = {
         "channel": message.channel.split(":", 1)[0],
         "raw_channel": message.channel,
         "chat_id": message.chat_id,
@@ -883,6 +911,22 @@ def _apply_channel_context_metadata(
         "last_attachment_paths": last_attachment_paths,
         "last_attachment_message_id": last_attachment_message_id,
     }
+    if message.metadata.get("async_board_recognition") is True:
+        channel_context["async_board_recognition"] = True
+        channel_context["board_batch_id"] = _optional_str(message.metadata.get("board_batch_id"))
+        channel_context["board_image_id"] = _optional_str(message.metadata.get("board_image_id"))
+        channel_context["board_idempotency_key"] = _optional_str(
+            message.metadata.get("board_idempotency_key")
+        )
+        channel_context["board_business_domain"] = _optional_str(
+            message.metadata.get("board_business_domain")
+        )
+        attachment_urls = message.metadata.get("attachment_urls")
+        if isinstance(attachment_urls, list):
+            channel_context["attachment_urls"] = [
+                dict(item) for item in attachment_urls if isinstance(item, dict)
+            ]
+    metadata["channel_context"] = channel_context
 
 
 def _content_snippet(text: str, *, limit: int = 160) -> str:
@@ -1009,6 +1053,10 @@ def _format_channel_progress(
         if prefers_chinese:
             return "🖼️ 当前模型不支持图片输入，我先改用附件路径和摘要继续。"
         return "🖼️ The active model does not support image input. I’ll retry with attachment paths and summaries."
+    if kind == "invalid_image_fallback":
+        if prefers_chinese:
+            return "🖼️ 图片文件无法正常读取，我先移除损坏的图片并继续处理。"
+        return "🖼️ The image file could not be decoded. I’ll remove the invalid image and continue."
     if kind == "status":
         normalized = text.strip()
         if normalized == "Auto-compacting conversation memory to keep things fast and focused.":
@@ -1060,7 +1108,12 @@ def _format_channel_progress(
     return text
 
 
-def _build_inbound_user_message(message: InboundMessage, *, session_key: str | None = None) -> ConversationMessage:
+def _build_inbound_user_message(
+    message: InboundMessage,
+    *,
+    session_key: str | None = None,
+    image_attachments_only: bool = False,
+) -> ConversationMessage:
     """Convert an inbound channel message into user content blocks."""
     content: list[TextBlock | ImageBlock] = []
     speaker_context = _build_speaker_context(message)
@@ -1076,22 +1129,94 @@ def _build_inbound_user_message(message: InboundMessage, *, session_key: str | N
         prefix = "\n\n" if content else ""
         content.append(TextBlock(text=prefix + attachment_notes))
 
+    if image_attachments_only:
+        image_count = sum(1 for path in message.media if _is_image_attachment(path))
+        if image_count:
+            prefix = "\n\n" if content else ""
+            noun = "attachments" if image_count != 1 else "attachment"
+            content.append(
+                TextBlock(
+                    text=(
+                        f"{prefix}[Channel image attachments]\n"
+                        f"{image_count} image {noun} retained for storage only. "
+                        "Do not inspect, transcribe, summarize, or infer facts from image content. "
+                        "Attachment metadata is hidden and will be added automatically only when "
+                        "a ProductionIssue write is confirmed. Do not request or invent attachment "
+                        "paths, and do not include this channel note in rawInput."
+                    )
+                )
+            )
+
+    invalid_image_names: list[str] = []
     for media_path in message.media:
         if not _is_image_attachment(media_path):
+            continue
+        if image_attachments_only:
             continue
         try:
             content.append(ImageBlock.from_path(media_path))
         except Exception:
             logger.exception("ohmo runtime failed to encode image attachment path=%s", media_path)
+            invalid_image_names.append(os.path.basename(media_path) or "image")
+
+    if invalid_image_names:
+        prefix = "\n\n" if content else ""
+        names = ", ".join(invalid_image_names)
+        content.append(
+            TextBlock(
+                text=(
+                    prefix
+                    + "[Image attachment could not be decoded: "
+                    + names
+                    + ". Ask the user to resend the original image as a JPG or PNG file.]"
+                )
+            )
+        )
 
     return ConversationMessage.from_user_content(content)
 
 
-def _should_retry_without_image_input(error_message: str, messages: list[ConversationMessage]) -> bool:
-    """Return True when a provider rejects image input and history contains images."""
-    if not _history_has_image_blocks(messages):
+def _agent_stores_images_as_attachments(agent_def: AgentDefinition | None) -> bool:
+    """Keep images out of vision input for production-issue collection agents."""
+    if agent_def is None:
         return False
+    return any(
+        str(skill).strip().lower() == "production-site-issue"
+        for skill in (agent_def.skills or [])
+    )
+
+
+def _should_retry_without_image_input(
+    error_message: str,
+    messages: list[ConversationMessage],
+) -> bool:
+    """Return True when a provider rejects image input and history contains images."""
+    return _image_input_retry_reason(error_message, messages) is not None
+
+
+def _image_input_retry_reason(
+    error_message: str,
+    messages: list[ConversationMessage],
+) -> str | None:
+    """Classify retryable provider failures involving image content."""
+    if not _history_has_image_blocks(messages):
+        return None
     normalized = error_message.lower()
+    invalid_image_signal = any(
+        phrase in normalized
+        for phrase in (
+            "cannot identify image file",
+            "could not identify image file",
+            "invalid image",
+            "corrupt image",
+            "corrupted image",
+            "failed to decode image",
+            "unable to decode image",
+            "image decode error",
+        )
+    )
+    if invalid_image_signal:
+        return "invalid"
     image_signal = any(
         phrase in normalized
         for phrase in (
@@ -1113,22 +1238,29 @@ def _should_retry_without_image_input(error_message: str, messages: list[Convers
             "can't support",
         )
     )
-    return image_signal and rejection_signal
+    return "unsupported" if image_signal and rejection_signal else None
 
 
 def _history_has_image_blocks(messages: list[ConversationMessage]) -> bool:
-    return any(any(isinstance(block, ImageBlock) for block in message.content) for message in messages)
+    return any(
+        any(isinstance(block, ImageBlock) for block in message.content)
+        for message in messages
+    )
 
 
-def _strip_image_blocks_from_engine_history(engine) -> None:
-    messages = _strip_image_blocks_from_messages(list(engine.messages))
+def _strip_image_blocks_from_engine_history(engine, *, reason: str = "unsupported") -> None:
+    messages = _strip_image_blocks_from_messages(list(engine.messages), reason=reason)
     if hasattr(engine, "load_messages"):
         engine.load_messages(messages)
     else:
         engine.messages = messages
 
 
-def _strip_image_blocks_from_messages(messages: list[ConversationMessage]) -> list[ConversationMessage]:
+def _strip_image_blocks_from_messages(
+    messages: list[ConversationMessage],
+    *,
+    reason: str = "unsupported",
+) -> list[ConversationMessage]:
     # The resend/switch-model guidance is only appended to the most recent
     # image-bearing message; earlier stripped messages keep a compact marker so
     # a long history is not flooded with repeated instructions.
@@ -1141,7 +1273,11 @@ def _strip_image_blocks_from_messages(messages: list[ConversationMessage]) -> li
         default=-1,
     )
     return [
-        _strip_image_blocks_from_message(message, include_guidance=index == last_image_index)
+        _strip_image_blocks_from_message(
+            message,
+            include_guidance=index == last_image_index,
+            reason=reason,
+        )
         for index, message in enumerate(messages)
     ]
 
@@ -1150,27 +1286,42 @@ def _strip_image_blocks_from_message(
     message: ConversationMessage,
     *,
     include_guidance: bool = True,
+    reason: str = "unsupported",
 ) -> ConversationMessage:
     stripped = [block for block in message.content if isinstance(block, ImageBlock)]
     if not stripped:
         return message
     content = [block for block in message.content if not isinstance(block, ImageBlock)]
     has_text = any(isinstance(block, TextBlock) and block.text.strip() for block in content)
-    note = _image_fallback_note(stripped, include_guidance=include_guidance)
+    note = _image_fallback_note(
+        stripped,
+        include_guidance=include_guidance,
+        reason=reason,
+    )
     # Provider clients join adjacent text blocks without a separator, so pad
     # the note when the message keeps its own text.
     content.append(TextBlock(text="\n\n" + note if has_text else note))
     return message.model_copy(update={"content": content})
 
 
-def _image_fallback_note(stripped: list[ImageBlock], *, include_guidance: bool) -> str:
+def _image_fallback_note(
+    stripped: list[ImageBlock],
+    *,
+    include_guidance: bool,
+    reason: str,
+) -> str:
     sources = ", ".join(
         block.source_path or f"<{block.media_type or 'image'}>" for block in stripped
     )
-    note = _IMAGE_FALLBACK_NOTE_PREFIX
+    invalid = reason == "invalid"
+    note = _INVALID_IMAGE_FALLBACK_NOTE_PREFIX if invalid else _IMAGE_FALLBACK_NOTE_PREFIX
     note += f": {sources}." if sources else "."
     if include_guidance:
-        note += _IMAGE_FALLBACK_NOTE_GUIDANCE
+        note += (
+            _INVALID_IMAGE_FALLBACK_NOTE_GUIDANCE
+            if invalid
+            else _IMAGE_FALLBACK_NOTE_GUIDANCE
+        )
     return note + "]"
 
 

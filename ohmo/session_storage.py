@@ -115,6 +115,9 @@ def save_session_snapshot(
     chat_id: str | None = None,
     sender_id: str | None = None,
     sender_name: str | None = None,
+    owner_source: str | None = None,
+    owner_subject: str | None = None,
+    owner_account: str | None = None,
     tool_metadata: dict[str, object] | None = None,
 ) -> Path:
     """Persist the latest ohmo session snapshot."""
@@ -144,6 +147,9 @@ def save_session_snapshot(
         "chat_id": chat_id if chat_id is not None else remote_metadata.get("chat_id"),
         "sender_id": sender_id if sender_id is not None else remote_metadata.get("sender_id"),
         "sender_name": sender_name,
+        "owner_source": owner_source,
+        "owner_subject": owner_subject,
+        "owner_account": owner_account,
         "cwd": str(Path(cwd).resolve()),
         "model": model,
         "system_prompt": system_prompt,
@@ -193,6 +199,9 @@ def save_invocation_record(
     tool_metadata: dict[str, object] | None = None,
     trace_id: str | None = None,
     duration_ms: int | None = None,
+    owner_source: str | None = None,
+    owner_subject: str | None = None,
+    owner_account: str | None = None,
 ) -> Path:
     """Persist a non-conversation API invocation record."""
     invocation_dir = get_invocation_dir(workspace)
@@ -214,6 +223,9 @@ def save_invocation_record(
         "status": status,
         "trace_id": trace_id,
         "duration_ms": duration_ms,
+        "owner_source": owner_source,
+        "owner_subject": owner_subject,
+        "owner_account": owner_account,
         "messages": [message.model_dump(mode="json") for message in messages],
         "usage": usage.model_dump(),
         "tool_calls": tool_calls or [],
@@ -469,6 +481,10 @@ def delete_latest_for_session_key(workspace: str | Path | None, session_key: str
 def _list_snapshots_from_files(
     workspace: str | Path | None = None,
     limit: int = 20,
+    *,
+    owner_source: str | None = None,
+    owner_subject: str | None = None,
+    include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     session_dir = get_session_dir(workspace)
     sessions: list[dict[str, Any]] = []
@@ -476,6 +492,20 @@ def _list_snapshots_from_files(
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
+            continue
+        record_owner_source = data.get("owner_source")
+        record_owner_subject = data.get("owner_subject")
+        if owner_source is not None or owner_subject is not None:
+            matches_owner = bool(
+                owner_source
+                and owner_subject
+                and record_owner_source == owner_source
+                and record_owner_subject == owner_subject
+            )
+            is_legacy = not record_owner_source or not record_owner_subject
+            if not matches_owner and not (include_legacy and is_legacy):
+                continue
+        if not include_legacy and (not record_owner_source or not record_owner_subject):
             continue
         sessions.append(
             {
@@ -490,6 +520,9 @@ def _list_snapshots_from_files(
                 "chat_id": data.get("chat_id"),
                 "sender_id": data.get("sender_id"),
                 "sender_name": data.get("sender_name"),
+                "owner_source": record_owner_source,
+                "owner_subject": record_owner_subject,
+                "owner_account": data.get("owner_account"),
                 "summary": data.get("summary", ""),
                 "message_count": data.get("message_count", len(data.get("messages", []))),
                 "model": data.get("model", ""),
@@ -509,6 +542,9 @@ def list_snapshots(
     channel: str | None = None,
     exclude_channel: str | None = None,
     agent_name: str | None = None,
+    owner_source: str | None = None,
+    owner_subject: str | None = None,
+    include_legacy: bool = True,
 ) -> list[dict[str, Any]]:
     """List session summaries from the persistent metadata index."""
     try:
@@ -519,11 +555,25 @@ def list_snapshots(
             channel=channel,
             exclude_channel=exclude_channel,
             agent_name=agent_name,
+            owner_source=owner_source,
+            owner_subject=owner_subject,
+            include_legacy=include_legacy,
         )
     except Exception:
         logger.exception("Failed to query session index; falling back to JSON scan")
-        scan_limit = limit if not any((channel, exclude_channel, agent_name)) else 1_000_000
-        snapshots = _list_snapshots_from_files(workspace, limit=scan_limit)
+        scan_limit = (
+            limit
+            if not any((channel, exclude_channel, agent_name, owner_source, owner_subject))
+            and include_legacy
+            else 1_000_000
+        )
+        snapshots = _list_snapshots_from_files(
+            workspace,
+            limit=scan_limit,
+            owner_source=owner_source,
+            owner_subject=owner_subject,
+            include_legacy=include_legacy,
+        )
         if include_remote is False:
             snapshots = [item for item in snapshots if not item.get("session_key")]
         if channel:
@@ -601,6 +651,9 @@ class OhmoSessionBackend(SessionBackend):
         chat_id: str | None = None,
         sender_id: str | None = None,
         sender_name: str | None = None,
+        owner_source: str | None = None,
+        owner_subject: str | None = None,
+        owner_account: str | None = None,
         tool_metadata: dict[str, object] | None = None,
     ) -> Path:
         return save_session_snapshot(
@@ -620,6 +673,9 @@ class OhmoSessionBackend(SessionBackend):
             chat_id=chat_id,
             sender_id=sender_id,
             sender_name=sender_name,
+            owner_source=owner_source,
+            owner_subject=owner_subject,
+            owner_account=owner_account,
             tool_metadata=tool_metadata,
         )
 

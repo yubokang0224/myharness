@@ -1,6 +1,6 @@
-# Contributing to OpenHarness
+# Contributing to Xiaojin AI
 
-OpenHarness is an open-source agent harness focused on clarity, hackability, and compatibility with Claude-style workflows.
+Xiaojin AI is an agent platform focused on clarity, hackability, and compatibility with Claude-style workflows.
 
 ## Ways to contribute
 
@@ -13,8 +13,8 @@ OpenHarness is an open-source agent harness focused on clarity, hackability, and
 ## Development setup
 
 ```bash
-git clone https://github.com/HKUDS/OpenHarness.git
-cd OpenHarness
+git clone https://github.com/yubokang0224/myharness.git
+cd myharness
 uv sync --extra dev
 ```
 
@@ -53,7 +53,7 @@ npx tsc --noEmit
 
 ## Documentation and community contributions
 
-Issue [#7](https://github.com/HKUDS/OpenHarness/issues/7) surfaced several high-value docs needs. Useful contributions in that area include:
+A prior upstream issue surfaced several high-value docs needs. Useful contributions in that area include:
 
 - README accuracy improvements and compatibility notes.
 - Short, reproducible examples for common workflows.

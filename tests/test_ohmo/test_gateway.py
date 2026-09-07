@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from datetime import datetime
 import json
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -20,7 +21,13 @@ from openharness.commands.registry import SlashCommand, create_default_command_r
 from openharness.config.schema import Config, DingTalkBotConfig, DingTalkConfig
 from openharness.config.settings import Settings
 from openharness.coordinator.agent_definitions import AgentDefinition
-from openharness.engine.messages import ConversationMessage, ImageBlock, TextBlock, ToolResultBlock, ToolUseBlock
+from openharness.engine.messages import (
+    ConversationMessage,
+    ImageBlock,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from openharness.engine.stream_events import (
     AssistantTextDelta,
     AssistantTurnComplete,
@@ -33,7 +40,7 @@ from openharness.memory import add_memory_entry as add_project_memory_entry
 from openharness.memory import list_memory_files as list_project_memory_files
 from openharness.channels.impl.manager import ChannelManager
 
-from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error
+from ohmo.gateway.bridge import OhmoGatewayBridge, _format_gateway_error, _format_stream_error
 from ohmo.gateway.api import create_app
 from ohmo.gateway.config import build_channel_manager_config, save_gateway_config
 from ohmo.gateway.dependencies import AuthContext
@@ -49,12 +56,13 @@ from ohmo.gateway.routers.chat import (
     send_message_sync,
 )
 from ohmo.gateway.routers.agents import list_agent_tools, update_agent
-from ohmo.gateway.routers import production_issue
+from ohmo.gateway.routers import board_memo, production_issue
 from ohmo.gateway.routers.skills import list_mcp_servers
 from ohmo.gateway.schemas.agents import UpdateAgentRequest
 from ohmo.gateway.schemas.chat import CreateSessionRequest, MessageRequest
 from ohmo.gateway.runtime import (
     OhmoSessionRuntimePool,
+    _apply_channel_context_metadata,
     _build_inbound_user_message,
     _format_channel_progress,
     _strip_image_blocks_from_messages,
@@ -348,6 +356,105 @@ def test_gateway_app_mounts_production_issue_proxy(tmp_path):
     assert "/agent/api/v1/ProductionIssue/UpdateStatus" in paths
 
 
+def test_gateway_app_mounts_board_memo_summary_proxy(tmp_path):
+    app = create_app(workspace=str(tmp_path))
+    paths = set(app.openapi()["paths"])
+
+    assert "/agent/api/v1/BoardMemo/GetSummaryListPaged" in paths
+
+
+def test_board_memo_summary_proxy_forwards_filters_and_dingtalk_token(monkeypatch):
+    monkeypatch.setattr(
+        board_memo,
+        "load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "service-token",
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = b'{"total":1,"data":[]}'
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured.update(method=method, url=url, request_kwargs=kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr(board_memo.httpx, "AsyncClient", FakeAsyncClient)
+    app = FastAPI()
+    app.include_router(board_memo.router, prefix="/agent/api/v1")
+    response = TestClient(app).get(
+        "/agent/api/v1/BoardMemo/GetSummaryListPaged",
+        headers={"X-OHMO-Source-Channel": "dingtalk"},
+        params={
+            "page": 2,
+            "limit": 50,
+            "submitterName": "李明",
+            "createdFrom": "2099-01-02",
+            "createdTo": "2099-01-02",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["method"] == "GET"
+    assert captured["url"] == "http://api.internal:5000/BoardMemo/GetSummaryListPaged"
+    request_kwargs = captured["request_kwargs"]
+    assert request_kwargs["params"]["submitterName"] == "李明"
+    assert request_kwargs["params"]["createdFrom"] == "2099-01-02"
+    assert request_kwargs["headers"]["Authorization"] == "Bearer service-token"
+
+
+def test_board_memo_skill_query_contract_uses_summary_and_full_pagination():
+    repo_root = Path(__file__).resolve().parents[4]
+    skill_text = (repo_root / ".agents" / "skills" / "board-memo" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    query_section = skill_text.split("## 查询纪要（必须取全量）", 1)[1]
+
+    assert "/agent/api/v1/BoardMemo/GetSummaryListPaged" in query_section
+    assert '"submitterName"' in query_section
+    assert '"createdFrom"' in query_section
+    assert '"createdTo"' in query_section
+    assert "/agent/api/v1/BoardMemo/GetItemListPaged" in query_section
+    assert '"ownerName"' in query_section
+    assert "不得把人名塞进 `keyword`" in query_section
+    assert "基于返回的 `total` 自动翻页" in query_section
+    assert "`...[truncated]`" in query_section
+    assert '"max_chars": 50000' in query_section
+    assert "当前会话/系统配置的时区" in query_section
+    assert "只有用户需要某一条纪要" in query_section
+    assert '"/agent/api/v1/BoardMemo/GetListPaged"' not in query_section
+    assert "2026-07-02" not in query_section
+
+
+def test_production_issue_contract_requires_project_number_and_attachment_only_images():
+    repo_root = Path(__file__).resolve().parents[4]
+    skill_text = (
+        repo_root / ".agents" / "skills" / "production-site-issue" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+
+    assert '"projectNo": "必填' in skill_text
+    assert '"projectNo": "PJ-2026-001"' in skill_text
+    assert "缺少项目编号时先追问" in skill_text
+    assert "禁止查看、识别、OCR" in skill_text
+    assert '"attachments": []' in skill_text
+
+
 def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "ohmo.gateway.routers.production_issue.load_settings",
@@ -400,6 +507,144 @@ def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkey
     forwarded_body = json.loads(captured["kwargs"]["content"])
     assert forwarded_body["title"]
     assert forwarded_body["sourceChannel"] == "dingtalk"
+
+
+def test_production_issue_proxy_requires_dingtalk_sender_name_for_queries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.get(
+        "/agent/api/v1/ProductionIssue/GetListPaged?page=1&limit=10",
+        headers={"X-OHMO-Source-Channel": "dingtalk"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_production_issue_proxy_forces_and_verifies_current_dingtalk_sender(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        content = json.dumps(
+            {
+                "total": 2,
+                "data": [
+                    {"id": 1, "sourceSenderName": "俞晨", "title": "本人问题"},
+                    {"id": 2, "sourceSenderName": "俞晨同名", "title": "他人问题"},
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured["params"] = kwargs["params"]
+            captured["headers"] = kwargs["headers"]
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.httpx.AsyncClient",
+        lambda *a, **k: FakeAsyncClient(),
+    )
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.get(
+        "/agent/api/v1/ProductionIssue/GetListPaged",
+        params={"page": 1, "limit": 10, "sourceSenderName": "张三"},
+        headers={
+            "X-OHMO-Source-Channel": "dingtalk",
+            "X-OHMO-Source-Sender-Name": quote("俞晨", safe=""),
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["params"]["sourceSenderName"] == "俞晨"
+    assert "X-OHMO-Source-Sender-Name" not in captured["headers"]
+    assert response.json() == {
+        "total": 1,
+        "data": [{"id": 1, "sourceSenderName": "俞晨", "title": "本人问题"}],
+    }
+
+
+def test_production_issue_proxy_denies_other_users_detail(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.load_settings",
+        lambda: Settings(
+            internal_api={
+                "base_url": "http://api.internal:5000",
+                "dingtalk_token": "settings-dingtalk-token",
+            }
+        ),
+    )
+
+    class FakeResponse:
+        status_code = 200
+        content = json.dumps(
+            {"isSuccess": True, "backResult": {"id": 2, "sourceSenderName": "张三"}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {"content-type": "application/json"}
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "ohmo.gateway.routers.production_issue.httpx.AsyncClient",
+        lambda *a, **k: FakeAsyncClient(),
+    )
+
+    app = FastAPI()
+    app.include_router(production_issue.router, prefix="/agent/api/v1")
+    client = TestClient(app)
+    response = client.get(
+        "/agent/api/v1/ProductionIssue/Get?id=2",
+        headers={
+            "X-OHMO-Source-Channel": "dingtalk",
+            "X-OHMO-Source-Sender-Name": quote("俞晨", safe=""),
+        },
+    )
+
+    assert response.status_code == 404
 
 
 def test_production_issue_proxy_detects_dingtalk_source_from_body(tmp_path, monkeypatch):
@@ -1049,7 +1294,12 @@ async def test_sync_message_passes_model_token_settings_to_query_engine(tmp_path
     monkeypatch.setattr("openharness.utils.internal_api_auth.make_hsjm_auth_metadata", lambda token: None)
     monkeypatch.setattr(
         "ohmo.gateway.routers.chat.load_by_id",
-        lambda **_kwargs: {"agent_name": "limited-agent"},
+        lambda **_kwargs: {
+            "agent_name": "limited-agent",
+            "channel": "api",
+            "owner_source": "anonymous",
+            "owner_subject": "api:session-1",
+        },
     )
     monkeypatch.setattr(
         "openharness.coordinator.agent_definitions.get_agent_definition",
@@ -1248,6 +1498,28 @@ def test_channel_manager_keeps_legacy_single_dingtalk_config(monkeypatch):
     assert channel.config.allow_from == ["u1"]
 
 
+def test_channel_manager_preserves_legacy_deferred_board_settings(monkeypatch):
+    monkeypatch.setattr(ChannelManager, "_agent_exists", staticmethod(lambda _name: True))
+    config = Config()
+    config.channels.dingtalk = DingTalkConfig(
+        enabled=True,
+        client_id="legacy-id",
+        client_secret="legacy-secret",
+        default_agent="project-agent",
+        allow_from=["u1"],
+        defer_board_images=True,
+        board_business_domain="project",
+        board_batch_quiet_seconds=35,
+    )
+
+    manager = ChannelManager(config, MessageBus())
+
+    channel = manager.channels["dingtalk:default"]
+    assert channel.config.defer_board_images is True
+    assert channel.config.board_business_domain == "project"
+    assert channel.config.board_batch_quiet_seconds == 35
+
+
 @pytest.mark.asyncio
 async def test_dingtalk_channel_inbound_uses_instance_channel_and_agent_metadata():
     from openharness.channels.impl.dingtalk import DingTalkChannel
@@ -1338,6 +1610,22 @@ def test_gateway_error_formats_claude_refresh_failure():
 def test_gateway_error_formats_generic_auth_failure():
     exc = ValueError("API key missing for current profile")
     assert "Authentication failed" in _format_gateway_error(exc)
+
+
+def test_dingtalk_stream_error_hides_provider_image_details():
+    raw = (
+        "API error: HTTP 400; cannot identify image file <_io.BytesIO object>; "
+        "http://model.internal/v1/chat/completions"
+    )
+
+    rendered = _format_stream_error(raw, channel="dingtalk:production")
+
+    assert rendered == (
+        "图片读取失败，可能是格式不兼容或下载不完整。"
+        "请将原图另存为 JPG/PNG 后重新发送。"
+    )
+    assert "http://" not in rendered
+    assert "BytesIO" not in rendered
 
 
 def test_compact_progress_formats_reactive_channel_hint_in_chinese():
@@ -1765,8 +2053,45 @@ async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_pat
         "conversation_id": "conv-1",
         "session_key": "dingtalk:ops-bot:ops-agent:c1:u1",
         "attachment_paths": ["/tmp/photo.png"],
+        "last_attachment_paths": ["/tmp/photo.png"],
+        "last_attachment_message_id": "msg-1",
     }
     assert captured["hsjm_auth"] is None
+
+
+def test_async_board_recognition_context_keeps_scheduler_guards():
+    bundle = SimpleNamespace(engine=SimpleNamespace(tool_metadata={}))
+    message = InboundMessage(
+        channel="dingtalk:project",
+        sender_id="staff-1",
+        chat_id="staff-1",
+        content="[系统异步白板识别任务]",
+        media=["/tmp/board.jpg"],
+        metadata={
+            "source_sender_id": "staff-1",
+            "message_id": "msg-1",
+            "async_board_recognition": True,
+            "board_batch_id": "101",
+            "board_image_id": "202",
+            "board_business_domain": "project",
+            "board_idempotency_key": "board-image-recognition:202:insert",
+            "attachment_urls": [
+                {"fileUrl": "/WebUp_Files/images/one.jpg", "fileName": "one.jpg"}
+            ],
+        },
+    )
+
+    _apply_channel_context_metadata(bundle, message, "board-recognition:101:202")
+
+    context = bundle.engine.tool_metadata["channel_context"]
+    assert context["async_board_recognition"] is True
+    assert context["board_batch_id"] == "101"
+    assert context["board_image_id"] == "202"
+    assert context["board_business_domain"] == "project"
+    assert context["board_idempotency_key"] == "board-image-recognition:202:insert"
+    assert context["attachment_urls"] == [
+        {"fileUrl": "/WebUp_Files/images/one.jpg", "fileName": "one.jpg"}
+    ]
 
 
 @pytest.mark.asyncio
@@ -1866,9 +2191,9 @@ async def test_runtime_pool_checkpoints_user_message_before_tool_results(tmp_pat
     assert snapshot["message_count"] == 1
     assert snapshot["messages"][0]["role"] == "user"
     texts = [block["text"] for block in snapshot["messages"][0]["content"]]
-    assert texts[0].startswith("[Channel metadata for API recording]")
-    assert '"chatId": "c1"' in texts[0]
-    assert texts[-1] == "OP020 OEE"
+    # Channel metadata is kept in tool_metadata, never persisted into the
+    # model-visible user prompt or conversation snapshot.
+    assert texts == ["OP020 OEE"]
 
 
 @pytest.mark.asyncio
@@ -2074,7 +2399,7 @@ async def test_runtime_pool_blocks_local_only_commands_from_remote_messages(tmp_
 
     assert handler_called is False
     assert updates[-1].kind == "final"
-    assert updates[-1].text == "/permissions is only available in the local OpenHarness UI."
+    assert updates[-1].text == "/permissions is only available in the local Xiaojin AI UI."
 
 
 @pytest.mark.asyncio
@@ -2122,7 +2447,7 @@ async def test_runtime_pool_blocks_bridge_spawn_from_remote_messages(tmp_path, m
 
     assert handler_called is False
     assert updates[-1].kind == "final"
-    assert updates[-1].text == "/bridge is only available in the local OpenHarness UI."
+    assert updates[-1].text == "/bridge is only available in the local Xiaojin AI UI."
 
 
 @pytest.mark.asyncio
@@ -2167,7 +2492,7 @@ async def test_runtime_pool_blocks_registered_bridge_spawn_without_shelling_out(
     updates = [u async for u in pool.stream_message(message, "feishu:c1")]
 
     assert updates[-1].kind == "final"
-    assert updates[-1].text == "/bridge is only available in the local OpenHarness UI."
+    assert updates[-1].text == "/bridge is only available in the local Xiaojin AI UI."
     assert {session.session_id for session in get_bridge_manager().list_sessions()} == existing_bridge_sessions
     assert marker.exists() is False
 
@@ -2396,7 +2721,124 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_images(tmp_path, monkeypatch):
+async def test_production_issue_agent_keeps_images_as_hidden_attachments(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    image_path = tmp_path / "evidence.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01"
+        b"\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_build_runtime(**kwargs):
+        class FakeEngine:
+            messages = []
+            total_usage = UsageSnapshot()
+            tool_metadata: dict[str, object] = {}
+
+            def set_system_prompt(self, prompt):
+                return None
+
+            async def submit_message(self, content):
+                captured["content"] = content
+                yield AssistantTextDelta(text="done")
+
+        bundle = SimpleNamespace(
+            engine=FakeEngine(),
+            session_id="sess123",
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+        )
+        captured["bundle"] = bundle
+        return bundle
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    monkeypatch.setattr(
+        "ohmo.gateway.runtime.get_agent_definition",
+        lambda name: AgentDefinition(
+            name=name,
+            description="production issue collector",
+            skills=["production-site-issue"],
+        ),
+    )
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    message = InboundMessage(
+        channel="dingtalk:production",
+        sender_id="u1",
+        chat_id="c1",
+        content="项目 PJ-001 的设备异常",
+        media=[str(image_path)],
+        metadata={"default_agent": "生产助手", "message_id": "msg-1"},
+    )
+    updates = [u async for u in pool.stream_message(message, "dingtalk:production:u1")]
+
+    assert updates[-1].text == "done"
+    submitted = captured["content"]
+    assert isinstance(submitted, ConversationMessage)
+    assert not any(isinstance(block, ImageBlock) for block in submitted.content)
+    assert "retained for storage only" in submitted.text
+    assert "evidence.png" not in submitted.text
+
+    bundle = captured["bundle"]
+    context = bundle.engine.tool_metadata["channel_context"]
+    assert context["attachment_paths"] == [str(image_path)]
+
+
+def test_inbound_image_with_non_image_bytes_is_not_sent_to_model(tmp_path):
+    image_path = tmp_path / "broken.png"
+    image_path.write_bytes(b'{"error":"temporary download failure"}')
+
+    built = _build_inbound_user_message(
+        InboundMessage(
+            channel="dingtalk:production",
+            sender_id="u1",
+            chat_id="c1",
+            content="[attachment message]",
+            media=[str(image_path)],
+        )
+    )
+
+    assert not any(isinstance(block, ImageBlock) for block in built.content)
+    assert "Image attachment could not be decoded: broken.png" in built.text
+    assert "JPG or PNG" in built.text
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_reason", "expected_note", "expected_guidance"),
+    [
+        (
+            "API error: Error code: 404 - {'error': {'message': "
+            "'No endpoints found that support image input', 'code': 404}}",
+            "unsupported",
+            "[Image attachment omitted because the active model does not support image input",
+            "Ask the user to resend the image as text",
+        ),
+        (
+            "API error: HTTP 400; cannot identify image file <_io.BytesIO object>",
+            "invalid",
+            "[Image attachment omitted because the image data could not be decoded",
+            "Ask the user to resend the original image as a JPG or PNG file",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_images(
+    tmp_path,
+    monkeypatch,
+    provider_error,
+    expected_reason,
+    expected_note,
+    expected_guidance,
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     image_path = tmp_path / "example.png"
@@ -2424,12 +2866,7 @@ async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_imag
 
             async def submit_message(self, content):
                 self.messages.append(content)
-                yield ErrorEvent(
-                    message=(
-                        "API error: Error code: 404 - {'error': {'message': "
-                        "'No endpoints found that support image input', 'code': 404}}"
-                    )
-                )
+                yield ErrorEvent(message=provider_error)
 
             async def continue_pending(self, *, max_turns=None):
                 captured["retry_messages"] = list(self.messages)
@@ -2462,6 +2899,10 @@ async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_imag
     assert updates[-1].text == "done"
     assert not any(update.kind == "error" for update in updates)
     assert any(update.metadata.get("_image_fallback") for update in updates)
+    assert any(
+        update.metadata.get("_image_fallback_reason") == expected_reason
+        for update in updates
+    )
     retry_messages = captured["retry_messages"]
     assert all(
         not isinstance(block, ImageBlock)
@@ -2477,10 +2918,10 @@ async def test_runtime_pool_retries_without_image_blocks_when_model_rejects_imag
     # The retry keeps the user text and appends a fallback note naming the
     # omitted image so the model knows an attachment was dropped.
     assert "帮我看这个图片" in text
-    assert "[Image attachment omitted because the active model does not support image input" in text
+    assert expected_note in text
     assert "example.png" in text
-    assert "Ask the user to resend the image as text" in text
-    assert text.index("帮我看这个图片") < text.index("[Image attachment omitted")
+    assert expected_guidance in text
+    assert text.index("帮我看这个图片") < text.index(expected_note)
     assert "[Channel attachments]" not in text
 
 

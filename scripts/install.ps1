@@ -1,5 +1,5 @@
-# OpenHarness Windows Installer (PowerShell)
-# Usage: iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.ps1')
+# Xiaojin AI Windows Installer (PowerShell)
+# Usage: iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/yubokang0224/myharness/main/scripts/install.ps1')
 #        or: powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 
 param(
@@ -22,7 +22,7 @@ function Write-Step { Write-Host ""; Write-Host "==>$args" -ForegroundColor Blue
 # ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host "  ==============================" -ForegroundColor Cyan
-Write-Host "    OpenHarness Installer" -ForegroundColor Cyan
+Write-Host "    Xiaojin AI Installer" -ForegroundColor Cyan
 Write-Host "    Windows Native Setup" -ForegroundColor Cyan
 Write-Host "  ==============================" -ForegroundColor Cyan
 Write-Host ""
@@ -122,11 +122,11 @@ if ($NodePath) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: Install OpenHarness
+# Step 4: Install Xiaojin AI
 # ---------------------------------------------------------------------------
-Write-Step "Installing OpenHarness"
+Write-Step "Installing Xiaojin AI"
 
-$RepoUrl = "https://github.com/HKUDS/OpenHarness.git"
+$RepoUrl = "https://github.com/yubokang0224/myharness.git"
 $InstallDir = "$env:USERPROFILE\.openharness-src"
 $VenvDir = "$env:USERPROFILE\.openharness-venv"
 
@@ -154,7 +154,7 @@ Write-Info "Activating virtual environment..."
 
 Write-Success "Virtual environment ready: $VenvDir"
 
-# Install OpenHarness
+# Install Xiaojin AI
 if ($FromSource) {
     Write-Info "Mode: -FromSource (git clone + pip install -e .)"
     
@@ -173,7 +173,7 @@ if ($FromSource) {
         git pull --ff-only
         Pop-Location
     } else {
-        Write-Info "Cloning OpenHarness into $InstallDir..."
+        Write-Info "Cloning Xiaojin AI into $InstallDir..."
         git clone $RepoUrl $InstallDir
         if (-not (Test-Path $InstallDir)) {
             Write-Error "Failed to clone repository"
@@ -188,7 +188,7 @@ if ($FromSource) {
     pip install openharness-ai --quiet --upgrade
 }
 
-Write-Success "OpenHarness package installed"
+Write-Success "Xiaojin AI package installed"
 
 # ---------------------------------------------------------------------------
 # Step 5: Install frontend/terminal npm dependencies
@@ -221,9 +221,9 @@ if ($NodeOk) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 6: Create OpenHarness config directory
+# Step 6: Create Xiaojin AI config directory
 # ---------------------------------------------------------------------------
-Write-Step "Setting up OpenHarness config directory"
+Write-Step "Setting up Xiaojin AI config directory"
 
 $ConfigDir = "$env:USERPROFILE\.openharness"
 $SkillsDir = "$ConfigDir\skills"
@@ -308,7 +308,7 @@ if ($LauncherExe -and (Test-Path $OhmoPath)) {
 # Done
 # ---------------------------------------------------------------------------
 Write-Host ""
-Write-Host "OpenHarness is installed!" -ForegroundColor Green -BackgroundColor White
+Write-Host "Xiaojin AI is installed!" -ForegroundColor Green -BackgroundColor White
 Write-Host ""
 Write-Host "  Next steps:"
 Write-Host "    1. Restart terminal, or run: refreshenv (if using Chocolatey)"
@@ -325,5 +325,5 @@ if ($Launcher -eq "openharness") {
     Write-Host "       Note: 'oh' may collide with the built-in Out-Host alias in PowerShell."
 }
 Write-Host "    4. Launch ohmo:             ohmo"
-Write-Host "    5. Docs:                    https://github.com/HKUDS/OpenHarness"
+Write-Host "    5. Docs:                    https://github.com/yubokang0224/myharness"
 Write-Host ""

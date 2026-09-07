@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run real end-to-end OpenHarness scenarios against an Anthropic-compatible API."""
+"""Run real end-to-end Xiaojin AI scenarios against an Anthropic-compatible API."""
 
 from __future__ import annotations
 
@@ -200,7 +200,7 @@ def _setup_worktree_flow(cwd: Path, _: Path) -> None:
         text=True,
     )
     subprocess.run(
-        ["git", "config", "user.name", "OpenHarness Tests"],
+        ["git", "config", "user.name", "Xiaojin AI Tests"],
         cwd=cwd,
         check=True,
         capture_output=True,
@@ -416,7 +416,7 @@ SCENARIOS: dict[str, Scenario] = {
     "file_io": Scenario(
         name="file_io",
         prompt=(
-            "You are running an OpenHarness smoke test. "
+            "You are running a Xiaojin AI smoke test. "
             "You must use tools. "
             "1. Use write_file to create smoke.txt with the exact content OPENHARNESS_E2E_OK. "
             "2. Use read_file to verify the file content. "
@@ -429,7 +429,7 @@ SCENARIOS: dict[str, Scenario] = {
     "search_edit": Scenario(
         name="search_edit",
         prompt=(
-            "You are running an OpenHarness search and edit test. "
+            "You are running a Xiaojin AI search and edit test. "
             "You must use tools. "
             "1. Use write_file to create src/demo.py with two lines: alpha and beta. "
             "2. Use glob to find the python file. "
@@ -445,7 +445,7 @@ SCENARIOS: dict[str, Scenario] = {
     "phase48": Scenario(
         name="phase48",
         prompt=(
-            "You are running an OpenHarness Phase 4-8 smoke test. "
+            "You are running a Xiaojin AI Phase 4-8 smoke test. "
             "You must use tools. "
             "1. Use tool_search to find the todo tool. "
             "2. Use todo_write to append a TODO item with the exact text phase48 smoke item. "
@@ -459,7 +459,7 @@ SCENARIOS: dict[str, Scenario] = {
     "task_flow": Scenario(
         name="task_flow",
         prompt=(
-            "You are running an OpenHarness background task test. "
+            "You are running a Xiaojin AI background task test. "
             "You must use tools. "
             "1. Use task_create with type local_bash and command printf 'TASK_FLOW_OK'. "
             "2. Use sleep for 0.2 seconds. "
@@ -473,7 +473,7 @@ SCENARIOS: dict[str, Scenario] = {
     "skill_flow": Scenario(
         name="skill_flow",
         prompt=(
-            "You are running an OpenHarness skill loading test. "
+            "You are running a Xiaojin AI skill loading test. "
             "You must use tools. "
             "1. Use the skill tool to read the Pytest skill. "
             "2. Verify it mentions fixtures. "
@@ -487,7 +487,7 @@ SCENARIOS: dict[str, Scenario] = {
     "mcp_model": Scenario(
         name="mcp_model",
         prompt=(
-            "You are running an OpenHarness MCP integration test. "
+            "You are running a Xiaojin AI MCP integration test. "
             "You must use tools. "
             "1. Use mcp__fixture__hello with the argument name='kimi'. "
             "2. Verify the tool result contains fixture-hello:kimi. "
@@ -501,7 +501,7 @@ SCENARIOS: dict[str, Scenario] = {
     "mcp_resource": Scenario(
         name="mcp_resource",
         prompt=(
-            "You are running an OpenHarness MCP resource test. "
+            "You are running a Xiaojin AI MCP resource test. "
             "You must use tools. "
             "1. Use list_mcp_resources. "
             "2. Use read_mcp_resource to read fixture://readme from server fixture. "
@@ -529,7 +529,7 @@ SCENARIOS: dict[str, Scenario] = {
     "agent_flow": Scenario(
         name="agent_flow",
         prompt=(
-            "You are running an OpenHarness agent delegation test. "
+            "You are running a Xiaojin AI agent delegation test. "
             "You must use tools. "
             "1. Use the agent tool with description 'echo agent' and prompt 'ready'. "
             "Set command to exactly: while read line; do echo AGENT_ECHO:$line; break; done "
@@ -546,7 +546,7 @@ SCENARIOS: dict[str, Scenario] = {
     "remote_agent_flow": Scenario(
         name="remote_agent_flow",
         prompt=(
-            "You are running an OpenHarness remote-agent mode test. "
+            "You are running a Xiaojin AI remote-agent mode test. "
             "You must use tools. "
             "1. Use the agent tool with mode remote_agent, description 'remote echo agent', and prompt 'ready'. "
             "Set command to exactly: while read line; do echo AGENT_ECHO:$line; break; done "
@@ -563,7 +563,7 @@ SCENARIOS: dict[str, Scenario] = {
     "plugin_combo": Scenario(
         name="plugin_combo",
         prompt=(
-            "You are running an OpenHarness plugin combo test. "
+            "You are running a Xiaojin AI plugin combo test. "
             "You must use tools. "
             "1. Use the skill tool to read FixtureSkill and verify it says COMBO_SKILL_OK. "
             "2. Use mcp__fixture-plugin_fixture__hello with name='combo'. "
@@ -577,7 +577,7 @@ SCENARIOS: dict[str, Scenario] = {
     "ask_user_flow": Scenario(
         name="ask_user_flow",
         prompt=(
-            "You are running an OpenHarness ask-user test. "
+            "You are running a Xiaojin AI ask-user test. "
             "You must use tools. "
             "1. Use ask_user_question to ask exactly What color should answer.txt contain? "
             "2. Use write_file to create answer.txt with the returned answer and nothing else. "
@@ -592,7 +592,7 @@ SCENARIOS: dict[str, Scenario] = {
     "task_update_flow": Scenario(
         name="task_update_flow",
         prompt=(
-            "You are running an OpenHarness task update test. "
+            "You are running a Xiaojin AI task update test. "
             "You must use tools. "
             "1. Use task_create with type local_bash and command printf 'TASK_UPDATE_OK'. "
             "2. Use task_update to set progress to 75 and status_note to waiting on review. "
@@ -606,7 +606,7 @@ SCENARIOS: dict[str, Scenario] = {
     "notebook_flow": Scenario(
         name="notebook_flow",
         prompt=(
-            "You are running an OpenHarness notebook test. "
+            "You are running a Xiaojin AI notebook test. "
             "You must use tools. "
             "1. Use notebook_edit to create analysis.ipynb and set cell 0 to exactly print('NB_OK'). "
             "2. Use read_file to verify the notebook JSON contains NB_OK. "
@@ -619,7 +619,7 @@ SCENARIOS: dict[str, Scenario] = {
     "lsp_flow": Scenario(
         name="lsp_flow",
         prompt=(
-            "You are running an OpenHarness LSP test. "
+            "You are running a Xiaojin AI LSP test. "
             "You must use tools. "
             "1. Use lsp on pkg/app.py to find the definition of greet. "
             "2. Use lsp hover on greet to confirm the docstring says Return a greeting. "
@@ -633,7 +633,7 @@ SCENARIOS: dict[str, Scenario] = {
     "cron_flow": Scenario(
         name="cron_flow",
         prompt=(
-            "You are running an OpenHarness cron test. "
+            "You are running a Xiaojin AI cron test. "
             "You must use tools. "
             "1. Use cron_create with name smoke-cron, schedule daily, and command printf 'CRON_SMOKE_OK'. "
             "2. Use cron_list to verify smoke-cron exists. "
@@ -648,7 +648,7 @@ SCENARIOS: dict[str, Scenario] = {
     "worktree_flow": Scenario(
         name="worktree_flow",
         prompt=(
-            "You are running an OpenHarness worktree test. "
+            "You are running a Xiaojin AI worktree test. "
             "You must use tools. "
             "1. Use enter_worktree with branch smoke/worktree. "
             "2. Use read_file to read demo.txt inside the returned worktree path and verify it contains WORKTREE_OK. "
@@ -676,7 +676,7 @@ SCENARIOS: dict[str, Scenario] = {
     "mcp_auth_flow": Scenario(
         name="mcp_auth_flow",
         prompt=(
-            "You are running an OpenHarness MCP auth reconfiguration test. "
+            "You are running a Xiaojin AI MCP auth reconfiguration test. "
             "You must use tools. "
             "1. Use mcp_auth on server fixture with mode bearer and value token-smoke. "
             "2. Use mcp__fixture__hello with name='auth'. "

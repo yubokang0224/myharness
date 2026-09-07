@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 if sys.platform == "win32":
     import ctypes
@@ -19,7 +20,9 @@ if sys.platform == "win32":
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.manager import ChannelManager
+from openharness.config import load_settings
 
+from ohmo.gateway.board_image_recognition_worker import BoardImageRecognitionWorker
 from ohmo.gateway.bridge import OhmoGatewayBridge
 from ohmo.gateway.config import build_channel_manager_config, load_gateway_config
 from ohmo.gateway.models import GatewayState
@@ -155,6 +158,18 @@ class OhmoGatewayService:
             path.unlink(missing_ok=True)
 
     async def run_foreground(self) -> int:
+        board_recognition_worker: BoardImageRecognitionWorker | None = None
+        if self._config.board_recognition.enabled:
+            settings = load_settings()
+            _validate_board_recognition_settings(settings.internal_api)
+            board_recognition_worker = BoardImageRecognitionWorker(
+                config=self._config.board_recognition,
+                upstream_base_url=settings.internal_api.base_url,
+                dingtalk_token=settings.internal_api.dingtalk_token,
+                workspace=self._workspace,
+                runtime_pool=self._runtime_pool,
+                bus=self._bus,
+            )
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         self.write_state(running=True)
         bridge_task = asyncio.create_task(self._bridge.run(), name="ohmo-gateway-bridge")
@@ -163,6 +178,12 @@ class OhmoGatewayService:
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
         )
+        board_recognition_task: asyncio.Task[None] | None = None
+        if board_recognition_worker is not None:
+            board_recognition_task = asyncio.create_task(
+                board_recognition_worker.run(),
+                name="ohmo-board-image-recognition",
+            )
         stop_event = asyncio.Event()
         self._stop_event = stop_event
         self._restart_requested = False
@@ -181,10 +202,15 @@ class OhmoGatewayService:
             self._bridge.stop()
             bridge_task.cancel()
             manager_task.cancel()
+            if board_recognition_task is not None:
+                board_recognition_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await bridge_task
             with contextlib.suppress(asyncio.CancelledError):
                 await manager_task
+            if board_recognition_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await board_recognition_task
             if not restart_notice_task.done():
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -196,6 +222,48 @@ class OhmoGatewayService:
         if self._restart_requested:
             self._exec_restart()
         return 0
+
+
+def _validate_board_recognition_settings(internal_api: object) -> None:
+    """Fail startup before polling when durable recognition cannot authenticate."""
+    upstream = str(getattr(internal_api, "base_url", "") or "").strip()
+    agent_api = str(getattr(internal_api, "agent_api_base_url", "") or "").strip()
+    token = str(getattr(internal_api, "dingtalk_token", "") or "").strip()
+    missing: list[str] = []
+    if not upstream:
+        missing.append("internal_api.base_url")
+    if not agent_api:
+        missing.append("internal_api.agent_api_base_url")
+    if not token or token.lower() == "bearer":
+        missing.append("internal_api.dingtalk_token")
+    if missing:
+        raise ValueError(
+            "board recognition is enabled but required settings are missing: "
+            + ", ".join(missing)
+        )
+    _validate_http_base_url(upstream, name="internal_api.base_url")
+    _validate_http_base_url(agent_api, name="internal_api.agent_api_base_url")
+
+
+def _validate_http_base_url(value: str, *, name: str) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{name} is not a valid HTTP(S) URL") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port is None and ":" in parsed.netloc.rsplit("]", 1)[-1]
+    ):
+        raise ValueError(f"{name} must be an HTTP(S) base URL without credentials, query, or fragment")
+    decoded_segments = [segment for segment in unquote(parsed.path).split("/") if segment]
+    if any(segment in {".", ".."} for segment in decoded_segments):
+        raise ValueError(f"{name} must not contain dot path segments")
 
 
 def start_gateway_process(cwd: str | Path | None = None, workspace: str | Path | None = None) -> int:

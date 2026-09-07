@@ -55,6 +55,32 @@ def _is_dingtalk_channel(channel: str) -> bool:
     return channel == "dingtalk" or channel.startswith("dingtalk:")
 
 
+def _format_stream_error(message: str, *, channel: str) -> str:
+    """Hide provider internals from chat users and give a useful next step."""
+    if not _is_dingtalk_channel(channel):
+        return message
+    lowered = message.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "cannot identify image file",
+            "invalid image",
+            "corrupt image",
+            "failed to decode image",
+            "unable to decode image",
+        )
+    ):
+        return (
+            "图片读取失败，可能是格式不兼容或下载不完整。"
+            "请将原图另存为 JPG/PNG 后重新发送。"
+        )
+    if "network error" in lowered or "timeout" in lowered or "connect" in lowered:
+        return "生产助手暂时无法连接模型服务，请稍后重试。"
+    if "api error" in lowered or "http " in lowered or "error code" in lowered:
+        return "生产助手暂时处理失败，请稍后重试；如连续出现，请联系管理员并提供发送时间。"
+    return "生产助手处理消息时遇到异常，请稍后重试。"
+
+
 class OhmoGatewayBridge:
     """Consume inbound messages and publish assistant replies."""
 
@@ -241,19 +267,24 @@ class OhmoGatewayBridge:
                         update.kind,
                     )
                     continue
+                update_text = (
+                    _format_stream_error(update.text, channel=message.channel)
+                    if update.kind == "error"
+                    else update.text
+                )
                 logger.info(
                     "ohmo outbound update channel=%s chat_id=%s session_key=%s kind=%s content=%r",
                     message.channel,
                     message.chat_id,
                     session_key,
                     update.kind,
-                    _content_snippet(update.text),
+                    _content_snippet(update_text),
                 )
                 await self._bus.publish_outbound(
                     OutboundMessage(
                         channel=message.channel,
                         chat_id=message.chat_id,
-                        content=update.text,
+                        content=update_text,
                         metadata={**inbound_meta, **(update.metadata or {})},
                     )
                 )

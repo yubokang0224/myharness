@@ -5,15 +5,7 @@ import {useTheme} from '../theme/ThemeContext.js';
 
 const VERSION = '0.1.0';
 
-// prettier-ignore
-const LOGO = [
-	' ██████╗ ██╗  ██╗    ███╗   ███╗██╗   ██╗    ██╗  ██╗ █████╗ ██████╗ ███╗   ██╗███████╗███████╗███████╗██╗',
-	'██╔═══██╗██║  ██║    ████╗ ████║╚██╗ ██╔╝    ██║  ██║██╔══██╗██╔══██╗████╗  ██║██╔════╝██╔════╝██╔════╝██║',
-	'██║   ██║███████║    ██╔████╔██║ ╚████╔╝     ███████║███████║██████╔╝██╔██╗ ██║█████╗  ███████╗███████╗██║',
-	'██║   ██║██╔══██║    ██║╚██╔╝██║  ╚██╔╝      ██╔══██║██╔══██║██╔══██╗██║╚██╗██║██╔══╝  ╚════██║╚════██║╚═╝',
-	'╚██████╔╝██║  ██║    ██║ ╚═╝ ██║   ██║       ██║  ██║██║  ██║██║  ██║██║ ╚████║███████╗███████║███████║██╗',
-	' ╚═════╝ ╚═╝  ╚═╝    ╚═╝     ╚═╝   ╚═╝       ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝╚══════╝╚═╝',
-];
+const LOGO = ['小锦智能体平台'];
 
 export function WelcomeBanner(): React.JSX.Element {
 	const {theme} = useTheme();
@@ -26,7 +18,7 @@ export function WelcomeBanner(): React.JSX.Element {
 				))}
 				<Text> </Text>
 				<Text>
-					<Text dimColor> An AI-powered coding assistant</Text>
+					<Text dimColor> 企业级 AI 智能助手</Text>
 					<Text dimColor>{'  '}v{VERSION}</Text>
 				</Text>
 				<Text> </Text>

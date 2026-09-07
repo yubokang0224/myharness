@@ -599,7 +599,7 @@ class RepoAutopilotStore:
                 title=f"Evaluate claude-code {label}: {name}",
                 body=(
                     f"Borrow candidate from {path}. "
-                    "Review whether this should be aligned, adapted, or ignored for OpenHarness."
+                    "Review whether this should be aligned, adapted, or ignored for Xiaojin AI."
                 ),
                 metadata={"path": str(path)},
             )
@@ -1454,8 +1454,8 @@ class RepoAutopilotStore:
 
     def _comment_started(self, card: RepoTaskCard, attempt_count: int) -> str:
         return _bilingual_lines(
-            f"OpenHarness autopilot 已开始处理 `{card.id}`，当前第 {attempt_count} 轮执行。",
-            f"OpenHarness autopilot started processing `{card.id}`. Attempt {attempt_count} is now running.",
+            f"小锦自动任务已开始处理 `{card.id}`，当前第 {attempt_count} 轮执行。",
+            f"Xiaojin AI autopilot started processing `{card.id}`. Attempt {attempt_count} is now running.",
         )
 
     def _comment_pr_opened(self, pr_number: int, pr_url: str) -> str:
@@ -1834,7 +1834,7 @@ class RepoAutopilotStore:
         directory, so local ``snapshot.json`` generation still works
         without a Node.js toolchain.
         """
-        repo_name = escape(_safe_text(snapshot.get("repo_name")) or "OpenHarness")
+        repo_name = escape(_safe_text(snapshot.get("repo_name")) or "Xiaojin AI")
         generated = time.strftime(
             "%Y-%m-%d %H:%M:%S UTC",
             time.gmtime(float(snapshot.get("generated_at") or time.time())),

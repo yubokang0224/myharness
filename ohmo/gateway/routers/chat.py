@@ -7,8 +7,10 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import re
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator
@@ -21,13 +23,14 @@ from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_data_dir
 from openharness.tools.artifacts import IGNORED_ARTIFACT_DIRS, preview_kind_for_path
 from openharness.utils.trace import set_trace_id
+from ohmo.gateway.config import resolve_mes_workspace_config
 from ohmo.gateway.dependencies import (
     AuthContext,
-    get_auth_context,
-    get_current_user,
-    get_optional_auth_context,
-    get_optional_user,
+    Principal,
+    get_optional_workspace_auth_context,
     get_runtime,
+    get_workspace_auth_context,
+    principal_from_user_claims,
     _RuntimeState,
 )
 from ohmo.gateway.schemas.chat import (
@@ -72,7 +75,11 @@ _AUTH_CONFIG_ERROR_MESSAGE = (
 # ---------------------------------------------------------------------------
 # In-process abort registry
 # ---------------------------------------------------------------------------
-_abort_events: dict[str, asyncio.Event] = {}
+# The optional client run id prevents a delayed abort for an earlier stream
+# from stopping a newer generation in the same session. Legacy OS clients do
+# not send a run id and retain the original session-scoped abort behavior.
+_abort_events: dict[str, tuple[str | None, asyncio.Event]] = {}
+_attachment_upload_locks: dict[str, asyncio.Lock] = {}
 
 # ---------------------------------------------------------------------------
 # In-process permission approval registry (keyed by request_id)
@@ -84,6 +91,28 @@ class PermissionApproval:
 
 
 _pending_approvals: dict[str, "asyncio.Future[PermissionApproval]"] = {}
+_pending_approval_sessions: dict[str, str] = {}
+
+
+@router.get("/available-agents")
+async def list_available_agents(
+    _auth: Annotated[AuthContext, Depends(get_workspace_auth_context)],
+):
+    """Expose only the safe, read-only agent fields needed by chat clients."""
+
+    from ohmo.gateway.routers.agents import list_agents
+
+    definitions = await list_agents({})
+    return [
+        {
+            "id": definition.name,
+            "name": definition.name,
+            "description": definition.description,
+            "color": definition.color,
+            "status": "idle",
+        }
+        for definition in definitions
+    ]
 _session_allowed_tools: dict[str, set[str]] = {}
 
 _EMPTY_ASSISTANT_MESSAGE = (
@@ -118,6 +147,322 @@ _FILE_LINK_GUIDANCE = (
 def _safe_attachment_filename(filename: str | None) -> str:
     name = Path(filename or "attachment.bin").name.strip() or "attachment.bin"
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", name)
+
+
+_MES_ATTACHMENT_EXTENSIONS = {
+    ".bmp", ".csv", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".md",
+    ".ods", ".pdf", ".png", ".ppt", ".pptx", ".txt", ".webp", ".xls",
+    ".xlsx",
+}
+_MES_ZIP_DOCUMENT_EXTENSIONS = {".docx", ".ods", ".pptx", ".xlsx"}
+_MES_OLE_DOCUMENT_EXTENSIONS = {".doc", ".ppt", ".xls"}
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _validate_mes_attachment_content(
+    path: Path,
+    filename: str,
+    *,
+    max_expanded_bytes: int,
+) -> None:
+    """Reject unsupported or misleading MES uploads before tools can read them.
+
+    This is deliberately scoped to MES. The existing OS Web historically
+    uploads additional file types and keeps its compatibility contract.
+    """
+
+    extension = Path(filename).suffix.lower()
+    if extension not in _MES_ATTACHMENT_EXTENSIONS:
+        raise HTTPException(status_code=415, detail="Unsupported attachment type")
+
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(8192)
+    except OSError:
+        raise HTTPException(status_code=500, detail="Failed to inspect attachment") from None
+
+    valid = True
+    if extension == ".pdf":
+        valid = b"%PDF-" in header[:1024]
+    elif extension == ".png":
+        valid = header.startswith(b"\x89PNG\r\n\x1a\n")
+    elif extension in {".jpg", ".jpeg"}:
+        valid = header.startswith(b"\xff\xd8\xff")
+    elif extension == ".gif":
+        valid = header.startswith((b"GIF87a", b"GIF89a"))
+    elif extension == ".webp":
+        valid = len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    elif extension == ".bmp":
+        valid = header.startswith(b"BM")
+    elif extension in _MES_OLE_DOCUMENT_EXTENSIONS:
+        valid = header.startswith(_OLE_MAGIC)
+    elif extension in {".csv", ".md", ".txt"}:
+        valid = b"\x00" not in header and not header.startswith((b"MZ", b"\x7fELF"))
+    elif extension in _MES_ZIP_DOCUMENT_EXTENSIONS:
+        try:
+            with zipfile.ZipFile(path) as archive:
+                entries = archive.infolist()
+                names = {entry.filename.replace("\\", "/").lower() for entry in entries}
+                expanded_bytes = sum(max(0, entry.file_size) for entry in entries)
+                if any(entry.flag_bits & 0x1 for entry in entries):
+                    raise HTTPException(status_code=415, detail="Encrypted Office files are not supported")
+                if max_expanded_bytes > 0 and expanded_bytes > max_expanded_bytes:
+                    raise HTTPException(status_code=413, detail="Expanded attachment exceeds size limit")
+                if any(name.endswith("/vbaproject.bin") or name == "vbaproject.bin" for name in names):
+                    raise HTTPException(status_code=415, detail="Macro-enabled Office files are not supported")
+                if extension == ".docx":
+                    valid = "[content_types].xml" in names and any(name.startswith("word/") for name in names)
+                elif extension == ".xlsx":
+                    valid = "[content_types].xml" in names and any(name.startswith("xl/") for name in names)
+                elif extension == ".pptx":
+                    valid = "[content_types].xml" in names and any(name.startswith("ppt/") for name in names)
+                else:
+                    valid = "content.xml" in names or "mimetype" in names
+        except zipfile.BadZipFile:
+            valid = False
+
+    if not valid:
+        raise HTTPException(status_code=415, detail="Attachment content does not match its file type")
+
+
+def _principal_for_auth(auth: AuthContext | dict[str, Any]) -> Principal:
+    if isinstance(auth, dict):
+        # Router functions were historically called directly with claim dicts
+        # by the test suite and a few in-process integrations. HTTP requests now
+        # receive AuthContext, so this compatibility branch cannot bypass the
+        # FastAPI bearer dependency. Treat direct legacy calls as administrators
+        # so ownerless fixtures remain readable without weakening web requests.
+        try:
+            direct = principal_from_user_claims(auth)
+        except HTTPException:
+            direct = Principal(source="direct", subject="legacy-direct")
+        return Principal(
+            source=direct.source,
+            subject=direct.subject,
+            account=direct.account,
+            name=direct.name,
+            is_admin=True,
+        )
+    if auth.principal is not None:
+        return auth.principal
+    return principal_from_user_claims(auth.user)
+
+
+def _owner_namespace(principal: Principal) -> str:
+    """Return the current identity namespace.
+
+    OS and MES currently use independent user databases, so equal numeric user
+    IDs must never be merged. A future unified identity rollout requires an
+    explicit ownership migration rather than an unsafe source alias.
+    """
+
+    return principal.source
+
+
+def _owner_source_matches(principal: Principal, stored_source: object) -> bool:
+    value = str(stored_source or "")
+    return value == _owner_namespace(principal)
+
+
+def _owner_fields(principal: Principal | None) -> dict[str, str | None]:
+    return {
+        "owner_source": _owner_namespace(principal) if principal else None,
+        "owner_subject": principal.subject if principal else None,
+        "owner_account": principal.account if principal else None,
+    }
+
+
+def _record_owner_fields(
+    principal: Principal,
+    snap: dict[str, Any] | None,
+) -> dict[str, str | None]:
+    if snap and snap.get("owner_source") and snap.get("owner_subject"):
+        return {
+            "owner_source": str(snap["owner_source"]),
+            "owner_subject": str(snap["owner_subject"]),
+            "owner_account": (
+                str(snap["owner_account"]) if snap.get("owner_account") is not None else None
+            ),
+        }
+    # OS Web historically operates on ownerless records. Do not silently turn
+    # a shared legacy record into the current user's personal conversation.
+    return _owner_fields(
+        None if snap and (principal.is_admin or principal.source == "os") else principal
+    )
+
+
+def _anonymous_api_enabled(workspace: str | Path | None = None) -> bool:
+    """Return the anonymous policy for the workspace serving this request."""
+
+    return resolve_mes_workspace_config(workspace).allow_anonymous_api
+
+
+def _anonymous_principal(session_id: str) -> Principal:
+    return Principal(source="anonymous", subject=f"api:{session_id}")
+
+
+def _can_access_snapshot(principal: Principal, snap: dict[str, Any] | None) -> bool:
+    if snap is None:
+        return False
+    if principal.is_admin:
+        return True
+    owner_source = snap.get("owner_source")
+    owner_subject = snap.get("owner_subject")
+    if not owner_source or not owner_subject:
+        return principal.source == "os"
+    return bool(
+        _owner_source_matches(principal, owner_source)
+        and str(owner_subject) == principal.subject
+    )
+
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    if session_id == "latest" or not _SESSION_ID_RE.fullmatch(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session_id
+
+
+def _load_authorized_session(
+    runtime: _RuntimeState,
+    session_id: str,
+    principal: Principal,
+    *,
+    allow_missing_for_os: bool = False,
+) -> dict[str, Any] | None:
+    _validate_session_id(session_id)
+    try:
+        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+    except Exception:
+        snap = None
+    if snap is None and allow_missing_for_os and principal.source == "os":
+        return None
+    if snap is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not _can_access_snapshot(principal, snap):
+        # Avoid revealing whether another user's session exists.
+        raise HTTPException(status_code=404, detail="Session not found")
+    return snap
+
+
+def _load_session_for_message(
+    runtime: _RuntimeState,
+    session_id: str,
+    principal: Principal,
+) -> dict[str, Any] | None:
+    """Load an existing owned session, while preserving direct-send creation.
+
+    The historical message endpoints accepted a caller-provided new session ID.
+    A missing record may therefore start a new owner-bound conversation, but an
+    existing record owned by somebody else remains indistinguishable from 404.
+    """
+
+    _validate_session_id(session_id)
+    try:
+        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
+    except Exception:
+        snap = None
+    if snap is not None and not _can_access_snapshot(principal, snap):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return snap
+
+
+def _attachment_manifest_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.owner.json")
+
+
+def _read_attachment_manifest(path: Path) -> dict[str, Any] | None:
+    manifest_path = _attachment_manifest_path(path)
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _attachment_from_manifest(
+    attachment: dict[str, Any],
+    *,
+    principal: Principal,
+    workspace: str | None,
+) -> Path | None:
+    attachment_id = attachment.get("attachment_id") or attachment.get("attachmentId")
+    raw_path = attachment.get("path") or attachment.get("filePath")
+    if not attachment_id and not raw_path:
+        return None
+
+    attachments_root = get_attachments_dir(workspace).resolve()
+    candidate: Path | None = None
+    if raw_path:
+        try:
+            possible = Path(str(raw_path)).expanduser().resolve()
+            possible.relative_to(attachments_root)
+            candidate = possible
+        except (OSError, ValueError):
+            return None
+    if candidate is None and attachment_id:
+        safe_id = re.sub(r"[^A-Za-z0-9_-]+", "", str(attachment_id))
+        if not safe_id:
+            return None
+        matches = [
+            path
+            for path in attachments_root.glob(f"*/*-{safe_id}-*")
+            if path.is_file() and not path.name.endswith(".owner.json")
+        ]
+        if len(matches) != 1:
+            return None
+        candidate = matches[0].resolve()
+
+    if candidate is None or not candidate.is_file():
+        return None
+    manifest = _read_attachment_manifest(candidate)
+    if manifest is None:
+        return None
+    if attachment_id and str(manifest.get("attachment_id")) != str(attachment_id):
+        return None
+    if principal.is_admin:
+        return candidate
+    if (
+        not _owner_source_matches(principal, manifest.get("owner_source"))
+        or str(manifest.get("owner_subject") or "") != principal.subject
+    ):
+        return None
+    return candidate
+
+
+def _validate_attachments(
+    attachments: list[dict[str, Any]],
+    *,
+    principal: Principal,
+    workspace: str | None,
+) -> list[dict[str, Any]]:
+    validated: list[dict[str, Any]] = []
+    for attachment in attachments:
+        # Preserve the old OS Web/API contract for URL, fileId and external
+        # path metadata. MES clients must use an owner-bound upload handle.
+        if principal.source == "os" and not (
+            attachment.get("attachment_id") or attachment.get("attachmentId")
+        ):
+            validated.append(dict(attachment))
+            continue
+        path = _attachment_from_manifest(
+            attachment,
+            principal=principal,
+            workspace=workspace,
+        )
+        if path is None:
+            raise HTTPException(status_code=400, detail="Invalid or unauthorized attachment")
+        item = dict(attachment)
+        item["path"] = str(path)
+        manifest = _read_attachment_manifest(path) or {}
+        attachment_id = manifest.get("attachment_id")
+        if attachment_id:
+            item["attachment_id"] = attachment_id
+            item.setdefault("uid", attachment_id)
+        validated.append(item)
+    return validated
 
 
 def _sse_line(payload: Any) -> str:
@@ -585,13 +930,19 @@ _SESSION_LIST_SCAN_LIMIT = 500
 
 @router.get("", response_model=list[SessionInfo])
 async def list_sessions(
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
     include_remote: bool = Query(False, description="Include sessions created by remote channels."),
     channel: str | None = Query(None, description="Filter sessions by channel, e.g. web or dingtalk."),
     agent_name: str | None = Query(None, description="Filter sessions by agent name."),
 ):
     """List all persisted sessions."""
+    principal = _principal_for_auth(_user)
+    if not principal.is_admin and principal.source != "os":
+        include_remote = False
+        if channel == "api":
+            # Invocation/API records are managed from the admin surface only.
+            return []
     try:
         snapshots = await asyncio.to_thread(
             list_snapshots,
@@ -601,6 +952,9 @@ async def list_sessions(
             channel=channel,
             exclude_channel="api" if channel != "api" else None,
             agent_name=agent_name,
+            owner_source=None if principal.is_admin else _owner_namespace(principal),
+            owner_subject=None if principal.is_admin else principal.subject,
+            include_legacy=principal.is_admin or principal.source == "os",
         )
     except Exception:
         snapshots = []
@@ -638,7 +992,7 @@ async def list_sessions(
 @router.post("", response_model=SessionInfo, status_code=status.HTTP_201_CREATED)
 async def create_session(
     body: CreateSessionRequest,
-    _user: Annotated[dict | None, Depends(get_optional_user)],
+    _user: Annotated[AuthContext | None, Depends(get_optional_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Create a new chat session."""
@@ -646,6 +1000,11 @@ async def create_session(
     now = time.time()
     persist_mode = body.persist_mode or "log"
     channel = "web" if persist_mode == "session" else "api"
+    if _user is None and not _anonymous_api_enabled(runtime.workspace):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if _user is None and persist_mode == "session":
+        raise HTTPException(status_code=401, detail="Authentication required for web sessions")
+    principal = _principal_for_auth(_user) if _user is not None else _anonymous_principal(session_id)
     if persist_mode != "none":
         try:
             save_session_snapshot(
@@ -660,6 +1019,7 @@ async def create_session(
                 agent_name=body.agent_name,
                 channel=channel,
                 platform=channel,
+                **_owner_fields(principal),
             )
         except Exception:
             logger.exception("Failed to create initial session snapshot for %s", session_id)
@@ -679,30 +1039,40 @@ async def create_session(
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_session(
     session_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Delete a session and its persisted snapshot."""
-    session_dir = get_session_dir(runtime.workspace)
-    for path in session_dir.glob(f"*{session_id}*"):
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    principal = _principal_for_auth(_user)
+    _load_authorized_session(
+        runtime,
+        session_id,
+        principal,
+        allow_missing_for_os=True,
+    )
+    session_dir = get_session_dir(runtime.workspace).resolve()
+    path = (session_dir / f"session-{_validate_session_id(session_id)}.json").resolve()
+    try:
+        path.relative_to(session_dir)
+        path.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        logger.exception("Failed to delete session snapshot %s", session_id)
     delete_session_index(runtime.workspace, session_id)
 
 
 @router.get("/{session_id}/messages", response_model=list[MessageInfo])
 async def get_messages(
     session_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Return conversation history for a session."""
-    try:
-        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-    except Exception:
-        return []
+    snap = _load_authorized_session(
+        runtime,
+        session_id,
+        _principal_for_auth(_user),
+        allow_missing_for_os=True,
+    )
     if snap is None:
         return []
 
@@ -767,10 +1137,16 @@ async def get_messages(
 @router.get("/{session_id}/memory", response_model=MemoryInfo)
 async def get_memory(
     session_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Return memory entries and files relevant to a session."""
+    _load_authorized_session(
+        runtime,
+        session_id,
+        _principal_for_auth(_user),
+        allow_missing_for_os=True,
+    )
     try:
         from openharness.memory import list_memory_files, scan_memory_files
 
@@ -789,14 +1165,16 @@ async def get_memory(
 @router.get("/{session_id}/artifacts", response_model=list[ArtifactInfo])
 async def list_artifacts(
     session_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Return files generated by AI tool execution in a session."""
-    try:
-        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-    except Exception:
-        return []
+    snap = _load_authorized_session(
+        runtime,
+        session_id,
+        _principal_for_auth(_user),
+        allow_missing_for_os=True,
+    )
     if snap is None:
         return []
     return _collect_artifacts_from_snapshot(snap, runtime)
@@ -806,16 +1184,11 @@ async def list_artifacts(
 async def get_artifact_content(
     session_id: str,
     artifact_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Return a generated artifact's content after session-scoped validation."""
-    try:
-        snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-    except Exception:
-        snap = None
-    if snap is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+    snap = _load_authorized_session(runtime, session_id, _principal_for_auth(_user))
 
     artifact = next(
         (item for item in _collect_artifacts_from_snapshot(snap, runtime) if item.id == artifact_id),
@@ -843,31 +1216,132 @@ async def get_artifact_content(
 @router.post("/attachments")
 async def upload_attachment(
     file: Annotated[UploadFile, File(...)],
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Persist a browser-selected attachment so local tools can read it."""
     safe_name = _safe_attachment_filename(file.filename)
-    target_dir = get_attachments_dir(runtime.workspace) / time.strftime("%Y%m%d")
+    principal = _principal_for_auth(_user)
+    attachments_root = get_attachments_dir(runtime.workspace).resolve()
+    target_dir = attachments_root / time.strftime("%Y%m%d")
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = (target_dir / f"{uuid4().hex[:12]}-{safe_name}").resolve()
+    attachment_id = uuid4().hex[:16]
+    target_path = (target_dir / f"attachment-{attachment_id}-{safe_name}").resolve()
 
     try:
+        max_bytes = int(os.getenv("OHMO_ATTACHMENT_MAX_BYTES", str(50 * 1024 * 1024)))
+    except ValueError:
+        max_bytes = 50 * 1024 * 1024
+    try:
+        owner_quota = int(os.getenv("OHMO_ATTACHMENT_OWNER_QUOTA_BYTES", str(2 * 1024**3)))
+    except ValueError:
+        owner_quota = 2 * 1024**3
+    try:
+        ttl_seconds = int(os.getenv("OHMO_ATTACHMENT_TTL_SECONDS", "0"))
+    except ValueError:
+        ttl_seconds = 0
+    try:
+        max_expanded_bytes = int(
+            os.getenv("OHMO_ATTACHMENT_MAX_EXPANDED_BYTES", str(500 * 1024 * 1024))
+        )
+    except ValueError:
+        max_expanded_bytes = 500 * 1024 * 1024
+
+    owner_key = f"{_owner_namespace(principal)}:{principal.subject}"
+    upload_lock = _attachment_upload_locks.setdefault(owner_key, asyncio.Lock())
+    await upload_lock.acquire()
+    try:
+        used_bytes = 0
+        now = time.time()
+        for manifest_path in attachments_root.glob("*/*.owner.json"):
+            manifest = _read_attachment_manifest(
+                manifest_path.with_name(manifest_path.name.removesuffix(".owner.json"))
+            )
+            if not manifest or (
+                not _owner_source_matches(principal, manifest.get("owner_source"))
+                or str(manifest.get("owner_subject") or "") != principal.subject
+            ):
+                continue
+            data_path = manifest_path.with_name(manifest_path.name.removesuffix(".owner.json"))
+            created_at = float(manifest.get("created_at") or 0)
+            if ttl_seconds > 0 and created_at > 0 and now - created_at > ttl_seconds:
+                data_path.unlink(missing_ok=True)
+                manifest_path.unlink(missing_ok=True)
+                continue
+            try:
+                used_bytes += data_path.stat().st_size
+            except OSError:
+                manifest_path.unlink(missing_ok=True)
+
         size = 0
         with target_path.open("wb") as stream:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(status_code=413, detail="Attachment exceeds size limit")
+                if owner_quota > 0 and used_bytes + size > owner_quota:
+                    raise HTTPException(status_code=413, detail="Attachment storage quota exceeded")
                 stream.write(chunk)
+        if principal.source == "mes":
+            _validate_mes_attachment_content(
+                target_path,
+                safe_name,
+                max_expanded_bytes=max_expanded_bytes,
+            )
+        manifest = {
+            "attachment_id": attachment_id,
+            "name": safe_name,
+            "path": str(target_path),
+            "fileSize": size,
+            "fileType": file.content_type,
+            "owner_source": _owner_namespace(principal),
+            "owner_subject": principal.subject,
+            "owner_account": principal.account,
+            "created_at": time.time(),
+        }
+        _attachment_manifest_path(target_path).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "uid": attachment_id,
+            "attachment_id": attachment_id,
+            "name": safe_name,
+            "path": str(target_path),
+            "fileSize": size,
+            "fileType": file.content_type,
+        }
+    except HTTPException:
+        target_path.unlink(missing_ok=True)
+        _attachment_manifest_path(target_path).unlink(missing_ok=True)
+        raise
+    except OSError:
+        target_path.unlink(missing_ok=True)
+        _attachment_manifest_path(target_path).unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Failed to persist attachment") from None
     finally:
+        upload_lock.release()
         await file.close()
 
-    return {
-        "uid": uuid4().hex[:12],
-        "name": safe_name,
-        "path": str(target_path),
-        "fileSize": size,
-        "fileType": file.content_type,
-    }
+
+@router.delete("/attachments/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_attachment(
+    attachment_id: str,
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+):
+    """Delete an unneeded upload through its owner-bound opaque handle."""
+
+    principal = _principal_for_auth(_user)
+    path = _attachment_from_manifest(
+        {"attachment_id": attachment_id},
+        principal=principal,
+        workspace=runtime.workspace,
+    )
+    if path is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path.unlink(missing_ok=True)
+    _attachment_manifest_path(path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -878,18 +1352,32 @@ async def upload_attachment(
 async def send_message(
     session_id: str,
     body: MessageRequest,
-    auth: Annotated[AuthContext, Depends(get_auth_context)],
+    auth: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Send a user message and receive an SSE stream of assistant events."""
+    principal = _principal_for_auth(auth)
+    persist_mode = _resolve_persist_mode(
+        body,
+        _default_persist_mode_for_session(runtime.workspace, session_id),
+    )
+    session_snapshot = _load_session_for_message(runtime, session_id, principal)
+    if session_snapshot is None and persist_mode == "session" and principal.source == "mes":
+        # Bind persistent browser conversations through POST /sessions before
+        # asynchronous work starts; this closes the custom-ID owner race.
+        raise HTTPException(status_code=404, detail="Session not found")
+    body.attachments = _validate_attachments(
+        body.attachments,
+        principal=principal,
+        workspace=runtime.workspace,
+    )
     trace_id = set_trace_id()
     start_monotonic = time.monotonic()
     abort_event = asyncio.Event()
-    _abort_events[session_id] = abort_event
+    _abort_events[session_id] = (body.run_id, abort_event)
 
     # SSE event queue: str items are serialised SSE lines, None signals end-of-stream
     sse_queue: asyncio.Queue[str | None] = asyncio.Queue()
-    persist_mode = _resolve_persist_mode(body, _default_persist_mode_for_session(runtime.workspace, session_id))
     engine_holder: dict[str, Any] = {}
     settings_holder: dict[str, Any] = {}
 
@@ -903,6 +1391,7 @@ async def send_message(
         loop = asyncio.get_running_loop()
         future: asyncio.Future[PermissionApproval] = loop.create_future()
         _pending_approvals[req_id] = future
+        _pending_approval_sessions[req_id] = session_id
         await sse_queue.put(
             _sse_line(SSEPermissionRequest(tool_name=tool_name, reason=reason, request_id=req_id))
         )
@@ -929,6 +1418,7 @@ async def send_message(
             return False
         finally:
             _pending_approvals.pop(req_id, None)
+            _pending_approval_sessions.pop(req_id, None)
 
     # ------------------------------------------------------------------
     # Engine coroutine — runs in a background Task so that the SSE
@@ -961,13 +1451,11 @@ async def send_message(
             settings = load_settings()
             agent_def = None
             agent_name: str | None = None
-            snap = None
-            try:
-                snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-                if snap:
-                    agent_name = snap.get("agent_name")
-            except Exception:
-                snap = None
+            snap = _load_session_for_message(runtime, session_id, principal)
+            if session_snapshot is not None and snap is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            if snap:
+                agent_name = snap.get("agent_name")
             if agent_name:
                 try:
                     from openharness.coordinator.agent_definitions import get_agent_definition
@@ -1198,6 +1686,7 @@ async def send_message(
                                 agent_name=agent_name,
                                 channel="web",
                                 platform="web",
+                                **_record_owner_fields(principal, session_snapshot),
                             )
                             # Also record the turn as an invocation so web chats
                             # (including the default agent) show up in metrics.
@@ -1221,6 +1710,7 @@ async def send_message(
                                 status_messages=status_messages,
                                 trace_id=trace_id,
                                 duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                                **_record_owner_fields(principal, session_snapshot),
                             )
                             turn_recorded = True
                         elif persist_mode == "log":
@@ -1241,6 +1731,7 @@ async def send_message(
                                 tool_metadata=tool_metadata,
                                 trace_id=trace_id,
                                 duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                                **_record_owner_fields(principal, session_snapshot),
                             )
                             turn_recorded = True
                     except Exception:
@@ -1279,6 +1770,7 @@ async def send_message(
                                     error=event.message,
                                     trace_id=trace_id,
                                     duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                                    **_record_owner_fields(principal, session_snapshot),
                                 )
                                 turn_recorded = True
                             except Exception:
@@ -1310,7 +1802,9 @@ async def send_message(
                     await mcp_manager.close()
                 except Exception:
                     pass
-            _abort_events.pop(session_id, None)
+            active_abort = _abort_events.get(session_id)
+            if active_abort is not None and active_abort[1] is abort_event:
+                _abort_events.pop(session_id, None)
             await sse_queue.put(None)  # signal end-of-stream
 
     async def event_stream() -> AsyncIterator[str]:
@@ -1342,10 +1836,41 @@ async def send_message(
 async def send_message_sync(
     session_id: str,
     body: MessageRequest,
-    auth: Annotated[AuthContext | None, Depends(get_optional_auth_context)],
+    auth: Annotated[AuthContext | None, Depends(get_optional_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Send a user message and return the final assistant text as JSON."""
+    if auth is None and not _anonymous_api_enabled(runtime.workspace):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if auth is None and body.persist_mode == "session":
+        raise HTTPException(status_code=401, detail="Authentication required for web sessions")
+    principal = _principal_for_auth(auth) if auth is not None else _anonymous_principal(session_id)
+    persist_mode = _resolve_persist_mode(body, "log")
+    initial_snapshot: dict[str, Any] | None = None
+    try:
+        initial_snapshot = load_by_id(workspace=runtime.workspace, session_id=session_id)
+    except Exception:
+        initial_snapshot = None
+    if auth is not None:
+        initial_snapshot = _load_session_for_message(runtime, session_id, principal)
+        if initial_snapshot is None and persist_mode == "session" and principal.source == "mes":
+            raise HTTPException(status_code=404, detail="Session not found")
+    elif initial_snapshot is not None:
+        if (
+            initial_snapshot.get("channel") != "api"
+            or initial_snapshot.get("owner_source") != "anonymous"
+            or str(initial_snapshot.get("owner_subject") or "") != principal.subject
+        ):
+            raise HTTPException(status_code=404, detail="Session not found")
+    body.attachments = (
+        _validate_attachments(
+            body.attachments,
+            principal=principal,
+            workspace=runtime.workspace,
+        )
+        if auth is not None
+        else list(body.attachments)
+    )
     trace_id = set_trace_id()
     start_monotonic = time.monotonic()
     permission_requests: list[PermissionRequestInfo] = []
@@ -1354,7 +1879,6 @@ async def send_message_sync(
     text_parts: list[str] = []
     usage_dict: dict[str, Any] | None = None
     invocation_id: str | None = None
-    persist_mode = _resolve_persist_mode(body, "log")
 
     async def permission_prompt(tool_name: str, reason: str) -> bool:
         req_id = uuid4().hex[:8]
@@ -1397,6 +1921,7 @@ async def send_message_sync(
                 error=error_text,
                 trace_id=trace_id,
                 duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                **_record_owner_fields(principal, initial_snapshot),
             )
             invocation_id = _record_id_from_path(path)
         except Exception:
@@ -1425,13 +1950,11 @@ async def send_message_sync(
         settings = load_settings()
         agent_def = None
         agent_name: str | None = None
-        snap = None
-        try:
-            snap = load_by_id(workspace=runtime.workspace, session_id=session_id)
-            if snap:
-                agent_name = snap.get("agent_name")
-        except Exception:
-            snap = None
+        snap = _load_session_for_message(runtime, session_id, principal)
+        if initial_snapshot is not None and snap is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if snap:
+            agent_name = snap.get("agent_name")
         if agent_name:
             try:
                 from openharness.coordinator.agent_definitions import get_agent_definition
@@ -1648,6 +2171,7 @@ async def send_message_sync(
                             agent_name=agent_name,
                             channel="web",
                             platform="web",
+                            **_record_owner_fields(principal, initial_snapshot),
                         )
                     elif persist_mode == "log":
                         path = save_invocation_record(
@@ -1668,6 +2192,7 @@ async def send_message_sync(
                             tool_metadata=tool_metadata,
                             trace_id=trace_id,
                             duration_ms=int((time.monotonic() - start_monotonic) * 1000),
+                            **_record_owner_fields(principal, initial_snapshot),
                         )
                         invocation_id = _record_id_from_path(path)
                 except Exception:
@@ -1745,10 +2270,21 @@ async def send_message_sync(
 async def approve_tool(
     session_id: str,
     body: ApproveRequest,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """Resolve a pending permission confirmation request."""
-    future = _pending_approvals.get(body.request_id)
+    _load_authorized_session(
+        runtime,
+        session_id,
+        _principal_for_auth(_user),
+        allow_missing_for_os=True,
+    )
+    future = (
+        _pending_approvals.get(body.request_id)
+        if _pending_approval_sessions.get(body.request_id) == session_id
+        else None
+    )
     if future is not None and not future.done():
         future.set_result(PermissionApproval(body.approved, body.scope))
 
@@ -1756,9 +2292,19 @@ async def approve_tool(
 @router.post("/{session_id}/messages/abort", status_code=status.HTTP_204_NO_CONTENT)
 async def abort_message(
     session_id: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
+    runtime: Annotated[_RuntimeState, Depends(get_runtime)],
+    run_id: str | None = None,
 ):
     """Signal the active generation for this session to stop."""
-    event = _abort_events.get(session_id)
-    if event:
-        event.set()
+    if run_id is not None and len(run_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid run id")
+    _load_authorized_session(
+        runtime,
+        session_id,
+        _principal_for_auth(_user),
+        allow_missing_for_os=True,
+    )
+    active_abort = _abort_events.get(session_id)
+    if active_abort and (run_id is None or active_abort[0] == run_id):
+        active_abort[1].set()

@@ -1,6 +1,7 @@
 """DingTalk/DingDing channel implementation using Stream Mode."""
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -8,7 +9,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 import logging
@@ -16,11 +17,28 @@ import logging
 from openharness.channels.bus.events import OutboundMessage
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel, resolve_channel_media_dir
+from openharness.config import load_settings
 from openharness.config.schema import DingTalkBotConfig, DingTalkConfig
+from openharness.utils.images import detect_supported_image_media_type
+from openharness.utils.network_guard import ensure_public_http_url
 
 logger = logging.getLogger(__name__)
 
 MAX_INBOUND_MEDIA_BYTES = 50 * 1024 * 1024
+MAX_DEFERRED_BOARD_IMAGES = 20
+
+
+class DingTalkBoardImageEnqueueError(RuntimeError):
+    """Raised when a deferred board-image batch was not durably enqueued."""
+
+
+def _system_exception_ack_status() -> int:
+    """Return a retryable DingTalk ACK status even with older SDK versions."""
+    system_exception = getattr(AckMessage, "STATUS_SYSTEM_EXCEPTION", None)
+    ok = getattr(AckMessage, "STATUS_OK", 200)
+    if isinstance(system_exception, int) and system_exception != ok:
+        return system_exception
+    return 500
 
 # 网页对话可就地渲染 ```echarts 代码块;钉钉渲染不了,发送前替换为提示
 _ECHARTS_BLOCK_RE = re.compile(r"```echarts\s*\n.*?```", re.DOTALL | re.IGNORECASE)
@@ -67,6 +85,33 @@ class NanobotDingTalkHandler(CallbackHandler):
             # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(raw_data)
 
+            sender_id = (
+                chatbot_msg.sender_staff_id
+                or chatbot_msg.sender_id
+                or raw_data.get("senderStaffId")
+                or raw_data.get("senderId")
+            )
+            sender_name = chatbot_msg.sender_nick or raw_data.get("senderNick") or "Unknown"
+            if not sender_id:
+                logger.warning(
+                    "DingTalk message missing sender id type=%s overview=%s",
+                    chatbot_msg.message_type,
+                    self.channel._payload_overview(raw_data),
+                )
+                return AckMessage.STATUS_OK, "OK"
+            # Authorize before resolving download URLs or writing any media to disk.
+            if not self.channel.is_allowed(str(sender_id)):
+                logger.warning(
+                    "Access denied for sender %s on DingTalk channel %s",
+                    sender_id,
+                    self.channel.name,
+                )
+                return AckMessage.STATUS_OK, "OK"
+
+            deferred_board_message = bool(
+                getattr(self.channel.config, "defer_board_images", False)
+            ) and self.channel._looks_like_board_image_message(chatbot_msg, raw_data)
+
             # Extract text content; fall back to raw dict if SDK object is empty
             content_parts = []
             try:
@@ -84,16 +129,27 @@ class NanobotDingTalkHandler(CallbackHandler):
                 if raw_text:
                     content_parts.append(raw_text)
 
-            media_paths, media_notes = await self.channel._download_inbound_media(
-                chatbot_msg,
-                raw_data,
-            )
+            try:
+                media_paths, media_notes = await self.channel._download_inbound_media(
+                    chatbot_msg,
+                    raw_data,
+                )
+            except Exception as exc:
+                if deferred_board_message:
+                    raise DingTalkBoardImageEnqueueError(
+                        "DingTalk board images could not be downloaded"
+                    ) from exc
+                raise
             # Keep downloaded attachment paths out of the user-visible prompt.
             # The runtime receives them through ``media`` and can attach image
             # blocks directly without polluting the conversation text.
             content_parts.extend(note for note in media_notes if "download failed" in note or "too large" in note)
 
             if not content_parts and not media_paths:
+                if deferred_board_message:
+                    raise DingTalkBoardImageEnqueueError(
+                        "DingTalk board-image message contained no downloaded images"
+                    )
                 logger.warning(
                     "Received empty or unsupported DingTalk message type=%s overview=%s",
                     chatbot_msg.message_type,
@@ -101,22 +157,9 @@ class NanobotDingTalkHandler(CallbackHandler):
                 )
                 return AckMessage.STATUS_OK, "OK"
 
-            sender_id = (
-                chatbot_msg.sender_staff_id
-                or chatbot_msg.sender_id
-                or raw_data.get("senderStaffId")
-                or raw_data.get("senderId")
-            )
-            sender_name = chatbot_msg.sender_nick or raw_data.get("senderNick") or "Unknown"
-            if not sender_id:
-                logger.warning(
-                    "DingTalk message missing sender id type=%s overview=%s",
-                    chatbot_msg.message_type,
-                    self.channel._payload_overview(raw_data),
-                )
-                return AckMessage.STATUS_OK, "OK"
-
             content = "\n".join(content_parts) if content_parts else "[attachment message]"
+            message_id = self.channel._raw_message_id(chatbot_msg, raw_data)
+            conversation_id = self.channel._raw_conversation_id(chatbot_msg, raw_data)
 
             logger.info(
                 "Received DingTalk message from %s (%s): %s media=%s",
@@ -125,6 +168,50 @@ class NanobotDingTalkHandler(CallbackHandler):
                 content,
                 len(media_paths),
             )
+
+            if deferred_board_message:
+                failed_downloads = [
+                    note
+                    for note in media_notes
+                    if "download failed" in note or "too large" in note
+                ]
+                if failed_downloads:
+                    raise DingTalkBoardImageEnqueueError(
+                        "one or more DingTalk board images were not downloaded: "
+                        + ", ".join(failed_downloads)
+                    )
+                if not media_paths:
+                    raise DingTalkBoardImageEnqueueError(
+                        "DingTalk board-image message contained no downloaded images"
+                    )
+                try:
+                    batch = await self.channel._enqueue_board_images(
+                        media_paths=media_paths,
+                        sender_id=str(sender_id),
+                        sender_name=str(sender_name),
+                        conversation_id=conversation_id,
+                        source_message_id=message_id,
+                        message_text=content,
+                        raw_data=raw_data,
+                    )
+                    await self.channel.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=self.channel.name,
+                            chat_id=str(sender_id),
+                            content=(
+                                f"已保存 {len(media_paths)} 张白板照片，"
+                                "系统将逐张识别并分别生成白板草稿。"
+                            ),
+                            metadata={"message_id": batch["source_message_id"]},
+                        )
+                    )
+                except DingTalkBoardImageEnqueueError:
+                    raise
+                except Exception as exc:
+                    raise DingTalkBoardImageEnqueueError(
+                        "deferred DingTalk board-image acknowledgement failed"
+                    ) from exc
+                return AckMessage.STATUS_OK, "OK"
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
@@ -136,8 +223,8 @@ class NanobotDingTalkHandler(CallbackHandler):
                     media=media_paths,
                     metadata_extra={
                         "msg_type": chatbot_msg.message_type,
-                        "message_id": chatbot_msg.message_id,
-                        "conversation_id": chatbot_msg.conversation_id,
+                        "message_id": message_id,
+                        "conversation_id": conversation_id,
                     },
                 )
             )
@@ -146,6 +233,9 @@ class NanobotDingTalkHandler(CallbackHandler):
 
             return AckMessage.STATUS_OK, "OK"
 
+        except DingTalkBoardImageEnqueueError as e:
+            logger.exception("Failed to durably enqueue DingTalk board images: %s", e)
+            return _system_exception_ack_status(), "RETRY"
         except Exception as e:
             logger.error("Error processing DingTalk message: %s", e)
             # Return OK to avoid retry loop from DingTalk server
@@ -328,17 +418,13 @@ class DingTalkChannel(BaseChannel):
 
     @staticmethod
     def _image_extension_from_bytes(content: bytes) -> str | None:
-        if content.startswith(b"\xff\xd8\xff"):
-            return ".jpg"
-        if content.startswith(b"\x89PNG\r\n\x1a\n"):
-            return ".png"
-        if content.startswith((b"GIF87a", b"GIF89a")):
-            return ".gif"
-        if content.startswith(b"BM"):
-            return ".bmp"
-        if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
-            return ".webp"
-        return None
+        return {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/bmp": ".bmp",
+            "image/webp": ".webp",
+        }.get(detect_supported_image_media_type(content))
 
     @classmethod
     def _image_extension_from_content_type(cls, content_type: str) -> str | None:
@@ -381,6 +467,62 @@ class DingTalkChannel(BaseChannel):
             if msg_type:
                 normalized["msgtype"] = msg_type
         return normalized
+
+    @staticmethod
+    def _raw_message_id(chatbot_msg: Any, raw_data: dict[str, Any]) -> str:
+        for value in (
+            getattr(chatbot_msg, "message_id", None),
+            raw_data.get("msgId"),
+            raw_data.get("msg_id"),
+            raw_data.get("messageId"),
+            raw_data.get("message_id"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _raw_conversation_id(chatbot_msg: Any, raw_data: dict[str, Any]) -> str:
+        for value in (
+            getattr(chatbot_msg, "conversation_id", None),
+            raw_data.get("conversationId"),
+            raw_data.get("conversation_id"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    @classmethod
+    def _looks_like_board_image_message(
+        cls,
+        chatbot_msg: Any,
+        raw_data: dict[str, Any],
+    ) -> bool:
+        message_type = str(
+            getattr(chatbot_msg, "message_type", None)
+            or raw_data.get("msgtype")
+            or raw_data.get("msgType")
+            or ""
+        ).strip().lower()
+        if message_type in {"image", "images", "photo", "picture"}:
+            return True
+        try:
+            if chatbot_msg.get_image_list() or []:
+                return True
+        except Exception:
+            pass
+
+        content = cls._parse_json_object(raw_data.get("content") or {})
+        candidates = cls._iter_download_code_items(content)
+        candidates.extend(cls._iter_media_url_items(content))
+        for item in candidates:
+            candidate = str(item.get("filename") or item.get("url") or "")
+            suffix = Path(urlparse(candidate).path).suffix.lower()
+            if suffix in cls._IMAGE_EXTS:
+                return True
+        return False
 
     @classmethod
     def _iter_download_code_items(cls, data: Any) -> list[dict[str, str]]:
@@ -534,6 +676,232 @@ class DingTalkChannel(BaseChannel):
             logger.error("DingTalk download url error: %s", e)
             return None
 
+    async def _enqueue_board_images(
+        self,
+        *,
+        media_paths: list[str],
+        sender_id: str,
+        sender_name: str,
+        conversation_id: str,
+        source_message_id: str,
+        message_text: str,
+        raw_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist images in one receiving batch for independent recognition."""
+        if not media_paths:
+            raise DingTalkBoardImageEnqueueError("deferred board-image request contained no images")
+        if len(media_paths) > MAX_DEFERRED_BOARD_IMAGES:
+            raise DingTalkBoardImageEnqueueError(
+                f"deferred board-image request exceeds {MAX_DEFERRED_BOARD_IMAGES} images"
+            )
+        try:
+            settings = load_settings()
+            upstream = str(settings.internal_api.base_url or "").strip()
+            token = str(settings.internal_api.dingtalk_token or "").strip()
+        except Exception as exc:
+            raise DingTalkBoardImageEnqueueError(
+                "unable to load internal API settings for deferred board images"
+            ) from exc
+
+        if not upstream:
+            raise DingTalkBoardImageEnqueueError("internal_api.base_url is not configured")
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if not token:
+            raise DingTalkBoardImageEnqueueError("internal_api.dingtalk_token is not configured")
+
+        authorization = f"Bearer {token}"
+        upload_url = urljoin(upstream.rstrip("/") + "/", "Common/UploadImage")
+        enqueue_url = urljoin(
+            upstream.rstrip("/") + "/",
+            "BoardImageRecognition/Enqueue",
+        )
+        uploaded_images: list[dict[str, Any]] = []
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0, trust_env=False) as client:
+                for source_index, media_path in enumerate(media_paths):
+                    path = Path(str(media_path)).expanduser().resolve()
+                    try:
+                        content = await asyncio.to_thread(path.read_bytes)
+                    except OSError as exc:
+                        raise DingTalkBoardImageEnqueueError(
+                            f"deferred board image is unavailable: {path}"
+                        ) from exc
+
+                    content_type = self._board_image_content_type(path, content)
+                    if not content_type:
+                        raise DingTalkBoardImageEnqueueError(
+                            f"deferred board attachment is not a supported image: {path}"
+                        )
+                    sha256 = hashlib.sha256(content).hexdigest()
+                    response = await client.post(
+                        upload_url,
+                        headers={"Authorization": authorization},
+                        files={"file": (path.name, content, content_type)},
+                    )
+                    upload_result = self._successful_json_response(
+                        response,
+                        operation=f"upload board image index={source_index}",
+                    )
+                    file_url = upload_result.get("backResult") or upload_result.get("BackResult")
+                    if not isinstance(file_url, str) or not file_url.strip():
+                        raise DingTalkBoardImageEnqueueError(
+                            f"upload board image index={source_index} returned no fileUrl"
+                        )
+                    uploaded_images.append(
+                        {
+                            "fileUrl": file_url.strip(),
+                            "fileName": path.name,
+                            "contentType": content_type,
+                            "sizeBytes": len(content),
+                            "sha256": sha256,
+                            "sourceIndex": source_index,
+                        }
+                    )
+
+                stable_message_id = source_message_id.strip() or self._fallback_message_id(
+                    raw_data=raw_data,
+                    sender_id=sender_id,
+                    conversation_id=conversation_id,
+                    image_hashes=[str(image["sha256"]) for image in uploaded_images],
+                )
+                business_domain = str(
+                    getattr(self.config, "board_business_domain", "") or ""
+                ).strip() or self.bot_name
+                quiet_seconds = int(getattr(self.config, "board_batch_quiet_seconds", 20))
+                payload = {
+                    "businessDomain": business_domain,
+                    "sourceChannel": f"dingtalk:{self.bot_name}",
+                    "botName": self.bot_name,
+                    "agentName": self.default_agent or "",
+                    "sourceChatId": sender_id,
+                    "sourceSenderId": sender_id,
+                    "sourceSenderName": sender_name,
+                    "conversationId": conversation_id,
+                    "sourceMessageId": stable_message_id,
+                    "messageText": message_text,
+                    "quietSeconds": quiet_seconds,
+                    "images": uploaded_images,
+                }
+                response = await client.post(
+                    enqueue_url,
+                    headers={
+                        "Authorization": authorization,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                enqueue_result = self._successful_json_response(
+                    response,
+                    operation="enqueue deferred board-image batch",
+                )
+                back_result = enqueue_result.get("backResult") or enqueue_result.get("BackResult")
+                if not isinstance(back_result, dict):
+                    raise DingTalkBoardImageEnqueueError(
+                        "enqueue deferred board-image batch returned no backResult"
+                    )
+                batch_id = back_result.get("batchId") or back_result.get("BatchId")
+                total_image_count = back_result.get("totalImageCount")
+                if total_image_count is None:
+                    total_image_count = back_result.get("TotalImageCount")
+                if batch_id is None or not str(batch_id).strip() or total_image_count is None:
+                    raise DingTalkBoardImageEnqueueError(
+                        "enqueue deferred board-image batch returned incomplete batch metadata"
+                    )
+                result = {
+                    "batch_id": str(batch_id),
+                    "total_image_count": int(total_image_count),
+                    "source_message_id": stable_message_id,
+                }
+        except DingTalkBoardImageEnqueueError:
+            if uploaded_images:
+                logger.warning(
+                    "DingTalk board-image enqueue failed after %d upload(s); uploaded files may be orphaned",
+                    len(uploaded_images),
+                )
+            raise
+        except Exception as exc:
+            if uploaded_images:
+                logger.warning(
+                    "DingTalk board-image enqueue failed after %d upload(s); uploaded files may be orphaned",
+                    len(uploaded_images),
+                )
+            raise DingTalkBoardImageEnqueueError(
+                f"deferred board-image request failed: {exc}"
+            ) from exc
+
+        logger.info(
+            "DingTalk board images durably enqueued bot=%s batch_id=%s callback_images=%d total_images=%s",
+            self.bot_name,
+            result["batch_id"],
+            len(uploaded_images),
+            result["total_image_count"],
+        )
+        return result
+
+    @classmethod
+    def _board_image_content_type(cls, path: Path, content: bytes) -> str | None:
+        extension = cls._image_extension_from_bytes(content)
+        if extension:
+            return {
+                ".jpg": "image/jpeg",
+                ".png": "image/png",
+                ".gif": "image/gif",
+                ".bmp": "image/bmp",
+                ".webp": "image/webp",
+            }.get(extension)
+        guessed, _ = mimetypes.guess_type(path.name)
+        if guessed and guessed.startswith("image/"):
+            return guessed
+        return None
+
+    @staticmethod
+    def _successful_json_response(response: httpx.Response, *, operation: str) -> dict[str, Any]:
+        if response.status_code >= 400:
+            raise DingTalkBoardImageEnqueueError(
+                f"{operation} failed status={response.status_code} body={response.text[:500]}"
+            )
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise DingTalkBoardImageEnqueueError(
+                f"{operation} returned non-JSON body={response.text[:500]}"
+            ) from exc
+        if not isinstance(result, dict):
+            raise DingTalkBoardImageEnqueueError(f"{operation} returned an invalid response")
+        is_success = result.get("isSuccess")
+        if is_success is None:
+            is_success = result.get("IsSuccess")
+        if is_success is not True:
+            raise DingTalkBoardImageEnqueueError(
+                f"{operation} was unsuccessful body={str(result)[:500]}"
+            )
+        return result
+
+    def _fallback_message_id(
+        self,
+        *,
+        raw_data: dict[str, Any],
+        sender_id: str,
+        conversation_id: str,
+        image_hashes: list[str],
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "botName": self.bot_name,
+                "conversationId": conversation_id,
+                "senderId": sender_id,
+                "raw": raw_data,
+                "imageHashes": image_hashes,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return f"fallback-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]}"
+
     async def _download_inbound_media(
         self,
         chatbot_msg: Any,
@@ -622,7 +990,7 @@ class DingTalkChannel(BaseChannel):
         for index, item in enumerate(download_targets):
             download_url = item["url"]
             try:
-                resp = await self._http.get(download_url, follow_redirects=True)
+                resp = await self._get_public_media_response(download_url)
                 if resp.status_code >= 400:
                     logger.error(
                         "DingTalk media download failed status=%s source=%s",
@@ -636,8 +1004,24 @@ class DingTalkChannel(BaseChannel):
                     continue
 
                 content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                filename_hint = str(item.get("filename") or "")
+                expects_image = (
+                    msg_type.strip().lower() in {"image", "images", "photo", "picture"}
+                    or Path(filename_hint).suffix.lower() in self._IMAGE_EXTS
+                    or content_type.lower().startswith("image/")
+                )
+                if expects_image and detect_supported_image_media_type(resp.content) is None:
+                    logger.warning(
+                        "Rejected invalid or unsupported DingTalk image "
+                        "source=%s content_type=%s bytes=%s",
+                        item.get("source"),
+                        content_type or "unknown",
+                        len(resp.content),
+                    )
+                    notes.append(f"[{msg_type}: download failed]")
+                    continue
                 filename = self._download_filename(
-                    item.get("filename"),
+                    filename_hint,
                     resp.headers.get("content-disposition"),
                     f"{message_id}_{index}",
                     content_type,
@@ -661,6 +1045,29 @@ class DingTalkChannel(BaseChannel):
                 notes.append(f"[{msg_type}: download failed]")
 
         return media_paths, notes
+
+    async def _get_public_media_response(
+        self,
+        url: str,
+        *,
+        max_redirects: int = 5,
+    ) -> httpx.Response:
+        """Download media while rejecting private targets and unsafe redirects."""
+        if not self._http:
+            raise RuntimeError("DingTalk HTTP client is not initialized")
+        current_url = url
+        for redirect_count in range(max_redirects + 1):
+            await ensure_public_http_url(current_url)
+            response = await self._http.get(current_url, follow_redirects=False)
+            if not response.has_redirect_location:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            if redirect_count >= max_redirects:
+                raise ValueError(f"too many DingTalk media redirects (>{max_redirects})")
+            current_url = urljoin(str(response.url), location)
+        raise RuntimeError("DingTalk media request ended without a response")
 
     async def _read_media_bytes(
         self,

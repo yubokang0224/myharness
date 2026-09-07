@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import base64
-import mimetypes
 from pathlib import Path
 from typing import Any, Annotated, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
+
+from openharness.utils.images import detect_supported_image_media_type
 
 
 class TextBlock(BaseModel):
@@ -30,10 +31,11 @@ class ImageBlock(BaseModel):
     def from_path(cls, path: str | Path) -> "ImageBlock":
         """Load a local image file into a base64-backed content block."""
         resolved = Path(path).expanduser().resolve()
-        media_type, _ = mimetypes.guess_type(str(resolved))
-        if not media_type or not media_type.startswith("image/"):
-            raise ValueError(f"Unsupported image attachment: {resolved}")
-        payload = base64.b64encode(resolved.read_bytes()).decode("ascii")
+        raw = resolved.read_bytes()
+        media_type = detect_supported_image_media_type(raw)
+        if media_type is None:
+            raise ValueError(f"Invalid or unsupported image attachment: {resolved}")
+        payload = base64.b64encode(raw).decode("ascii")
         return cls(media_type=media_type, data=payload, source_path=str(resolved))
 
 

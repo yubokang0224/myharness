@@ -83,7 +83,7 @@ def _describe_exception(
         timeout_message = (
             "Request timed out while waiting for the model provider to stream a response. "
             "Long HTML or file-generation tasks may need more time; increase "
-            "OPENHARNESS_TIMEOUT if this repeats."
+            "the configured model-response timeout if this repeats."
         )
         if message:
             return _truncate(f"{timeout_message} ({message})")
