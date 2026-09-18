@@ -190,6 +190,7 @@ class ChannelManager:
                     enabled=True,
                     allow_from=list(config.allow_from),
                     client_id=config.client_id,
+                    corp_id=config.corp_id,
                     client_secret=config.client_secret,
                     robot_code=config.robot_code,
                     default_agent=config.default_agent,

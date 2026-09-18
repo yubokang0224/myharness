@@ -34,10 +34,10 @@ from openharness.config.settings import KbSettings
 
 from ohmo.gateway.dependencies import _decode_bearer_credentials, get_current_user, get_runtime
 
-# Shared helpers from the production-issue proxy: source-channel resolution,
+# Existing shared knowledge-base helpers: source-channel resolution,
 # token forwarding and attachment upload to the internal (C#) API. Kept as a
 # single implementation on purpose — see that module before changing them.
-from ohmo.gateway.routers.production_issue import (
+from ohmo.gateway.legacy_attachment_proxy import (
     _resolve_forward_token,
     _source_channel,
     _upload_attachments_recursively,

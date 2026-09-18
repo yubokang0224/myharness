@@ -346,14 +346,10 @@ async def test_gateway_startup_connects_shared_mcp_manager(tmp_path, monkeypatch
 
 
 def test_gateway_app_mounts_production_issue_proxy(tmp_path):
-    app = create_app(workspace=str(tmp_path))
-    # FastAPI >= 0.115 keeps included routers as lazy _IncludedRouter entries in
-    # app.routes, so collect the mounted paths from the OpenAPI schema instead.
-    paths = set(app.openapi()["paths"])
-
-    assert "/agent/api/v1/ProductionIssue/Insert" in paths
-    assert "/agent/api/v1/ProductionIssue/AppendProcess" in paths
-    assert "/agent/api/v1/ProductionIssue/UpdateStatus" in paths
+    paths = set(create_app(workspace=str(tmp_path)).openapi()["paths"])
+    for action in ("Me", "Projects", "Contacts", "Insert", "Assign", "Resolve", "Verify"):
+        assert "/agent/api/v1/ProductionIssue/" + action in paths
+    assert "/agent/api/v1/ProductionIssue/UpdateStatus" not in paths
 
 
 def test_gateway_app_mounts_board_memo_summary_proxy(tmp_path):
@@ -442,467 +438,20 @@ def test_board_memo_skill_query_contract_uses_summary_and_full_pagination():
     assert "2026-07-02" not in query_section
 
 
-def test_production_issue_contract_requires_project_number_and_attachment_only_images():
-    repo_root = Path(__file__).resolve().parents[4]
-    skill_text = (
-        repo_root / ".agents" / "skills" / "production-site-issue" / "SKILL.md"
-    ).read_text(encoding="utf-8")
 
-    assert '"projectNo": "必填' in skill_text
-    assert '"projectNo": "PJ-2026-001"' in skill_text
-    assert "缺少项目编号时先追问" in skill_text
-    assert "禁止查看、识别、OCR" in skill_text
-    assert '"attachments": []' in skill_text
 
 
-def test_production_issue_proxy_forwards_dingtalk_service_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-    captured: dict[str, object] = {}
 
-    class FakeResponse:
-        status_code = 200
-        content = b'{"success":true}'
-        headers = {"content-type": "application/json"}
 
-    class FakeAsyncClient:
-        def __init__(self, *args, **kwargs):
-            captured["client_kwargs"] = kwargs
 
-        async def __aenter__(self):
-            return self
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
 
-        async def request(self, method, url, **kwargs):
-            captured["method"] = method
-            captured["url"] = url
-            captured["kwargs"] = kwargs
-            return FakeResponse()
 
-    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", FakeAsyncClient)
 
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.post(
-        "/agent/api/v1/ProductionIssue/Insert",
-        headers={"X-OHMO-Source-Channel": "dingtalk"},
-        json={"title": "现场问题"},
-    )
 
-    assert response.status_code == 200
-    assert response.json() == {"success": True}
-    assert captured["method"] == "POST"
-    assert captured["url"] == "http://api.internal:5000/ProductionIssue/Insert"
-    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
-    forwarded_body = json.loads(captured["kwargs"]["content"])
-    assert forwarded_body["title"]
-    assert forwarded_body["sourceChannel"] == "dingtalk"
 
 
-def test_production_issue_proxy_requires_dingtalk_sender_name_for_queries(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
 
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.get(
-        "/agent/api/v1/ProductionIssue/GetListPaged?page=1&limit=10",
-        headers={"X-OHMO-Source-Channel": "dingtalk"},
-    )
-
-    assert response.status_code == 403
-
-
-def test_production_issue_proxy_forces_and_verifies_current_dingtalk_sender(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        status_code = 200
-        content = json.dumps(
-            {
-                "total": 2,
-                "data": [
-                    {"id": 1, "sourceSenderName": "俞晨", "title": "本人问题"},
-                    {"id": 2, "sourceSenderName": "俞晨同名", "title": "他人问题"},
-                ],
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        headers = {"content-type": "application/json"}
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def request(self, method, url, **kwargs):
-            captured["params"] = kwargs["params"]
-            captured["headers"] = kwargs["headers"]
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.httpx.AsyncClient",
-        lambda *a, **k: FakeAsyncClient(),
-    )
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.get(
-        "/agent/api/v1/ProductionIssue/GetListPaged",
-        params={"page": 1, "limit": 10, "sourceSenderName": "张三"},
-        headers={
-            "X-OHMO-Source-Channel": "dingtalk",
-            "X-OHMO-Source-Sender-Name": quote("俞晨", safe=""),
-        },
-    )
-
-    assert response.status_code == 200
-    assert captured["params"]["sourceSenderName"] == "俞晨"
-    assert "X-OHMO-Source-Sender-Name" not in captured["headers"]
-    assert response.json() == {
-        "total": 1,
-        "data": [{"id": 1, "sourceSenderName": "俞晨", "title": "本人问题"}],
-    }
-
-
-def test_production_issue_proxy_denies_other_users_detail(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-
-    class FakeResponse:
-        status_code = 200
-        content = json.dumps(
-            {"isSuccess": True, "backResult": {"id": 2, "sourceSenderName": "张三"}},
-            ensure_ascii=False,
-        ).encode("utf-8")
-        headers = {"content-type": "application/json"}
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def request(self, method, url, **kwargs):
-            return FakeResponse()
-
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.httpx.AsyncClient",
-        lambda *a, **k: FakeAsyncClient(),
-    )
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.get(
-        "/agent/api/v1/ProductionIssue/Get?id=2",
-        headers={
-            "X-OHMO-Source-Channel": "dingtalk",
-            "X-OHMO-Source-Sender-Name": quote("俞晨", safe=""),
-        },
-    )
-
-    assert response.status_code == 404
-
-
-def test_production_issue_proxy_detects_dingtalk_source_from_body(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        status_code = 200
-        content = b'{"success":true}'
-        headers = {"content-type": "application/json"}
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def request(self, method, url, **kwargs):
-            captured["headers"] = kwargs["headers"]
-            return FakeResponse()
-
-    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.post(
-        "/agent/api/v1/ProductionIssue/Insert",
-        json={"title": "现场问题", "sourceChannel": "dingtalk"},
-    )
-
-    assert response.status_code == 200
-    assert captured["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
-
-
-def test_production_issue_proxy_uploads_dingtalk_attachment_before_forwarding(tmp_path, monkeypatch):
-    media_root = tmp_path / "media"
-    media_dir = media_root / "dingtalk_ops-bot"
-    media_dir.mkdir(parents=True)
-    image_path = media_dir / "receipt.png"
-    image_path.write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
-    monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(media_root))
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        def __init__(self, content: bytes, *, status_code: int = 200):
-            self.status_code = status_code
-            self.content = content
-            self.headers = {"content-type": "application/json"}
-            self.text = content.decode("utf-8")
-
-        def json(self):
-            return json.loads(self.text)
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def post(self, url, *, headers=None, files=None):
-            filename, content, mime_type = files["file"]
-            captured["upload"] = {
-                "url": url,
-                "headers": headers,
-                "filename": filename,
-                "content": content,
-                "mime_type": mime_type,
-            }
-            return FakeResponse(
-                b'{"isSuccess":true,"backResult":"/WebUp_Files/images/uploaded.jpg"}'
-            )
-
-        async def request(self, method, url, **kwargs):
-            captured["forward"] = {"method": method, "url": url, "kwargs": kwargs}
-            return FakeResponse(b'{"success":true}')
-
-    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.post(
-        "/agent/api/v1/ProductionIssue/Insert",
-        json={
-            "title": "现场问题",
-            "sourceChannel": "dingtalk",
-            "attachments": [
-                {
-                    "fileName": "receipt.png",
-                    "sourceLocalPath": str(image_path),
-                    "sourceType": "dingtalk",
-                }
-            ],
-        },
-    )
-
-    assert response.status_code == 200
-    upload = captured["upload"]
-    assert upload["url"] == "http://api.internal:5000/Common/UploadImage"
-    assert upload["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
-    assert upload["filename"] == "receipt.jpg"
-    assert upload["mime_type"] == "image/jpeg"
-    forwarded_body = json.loads(captured["forward"]["kwargs"]["content"])
-    attachment = forwarded_body["attachments"][0]
-    assert attachment["fileUrl"] == "/WebUp_Files/images/uploaded.jpg"
-    assert attachment["fileName"] == "receipt.jpg"
-    assert attachment["fileSize"] == len(b"\xff\xd8\xff\xe0fake-jpeg")
-    assert attachment["mimeType"] == "image/jpeg"
-    assert attachment["sourceLocalPath"] == str(image_path)
-
-
-def test_production_issue_proxy_uploads_dingtalk_file_before_forwarding(tmp_path, monkeypatch):
-    media_root = tmp_path / "media"
-    media_dir = media_root / "dingtalk_ops-bot"
-    media_dir.mkdir(parents=True)
-    file_path = media_dir / "report.pdf"
-    file_path.write_bytes(b"%PDF-1.7 fake")
-    monkeypatch.setenv("OPENHARNESS_CHANNEL_MEDIA_DIR", str(media_root))
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(
-            internal_api={
-                "base_url": "http://api.internal:5000",
-                "dingtalk_token": "settings-dingtalk-token",
-            }
-        ),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        def __init__(self, content: bytes, *, status_code: int = 200):
-            self.status_code = status_code
-            self.content = content
-            self.headers = {"content-type": "application/json"}
-            self.text = content.decode("utf-8")
-
-        def json(self):
-            return json.loads(self.text)
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def post(self, url, *, headers=None, files=None):
-            filename, content, mime_type = files["file"]
-            captured["upload"] = {
-                "url": url,
-                "headers": headers,
-                "filename": filename,
-                "content": content,
-                "mime_type": mime_type,
-            }
-            return FakeResponse(
-                b'{"isSuccess":true,"backResult":"/WebUp_Files/files/uploaded.pdf"}'
-            )
-
-        async def request(self, method, url, **kwargs):
-            captured["forward"] = {"method": method, "url": url, "kwargs": kwargs}
-            return FakeResponse(b'{"success":true}')
-
-    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.post(
-        "/agent/api/v1/ProductionIssue/AppendProcess",
-        json={
-            "issueId": 1,
-            "content": "补充检测报告",
-            "sourceChannel": "dingtalk",
-            "attachments": [
-                {
-                    "fileName": "report.pdf",
-                    "sourceLocalPath": str(file_path),
-                    "sourceType": "dingtalk",
-                }
-            ],
-        },
-    )
-
-    assert response.status_code == 200
-    upload = captured["upload"]
-    assert upload["url"] == "http://api.internal:5000/Common/UploadFile"
-    assert upload["headers"]["Authorization"] == "Bearer settings-dingtalk-token"
-    assert upload["filename"] == "report.pdf"
-    assert upload["mime_type"] == "application/pdf"
-    forwarded_body = json.loads(captured["forward"]["kwargs"]["content"])
-    attachment = forwarded_body["attachments"][0]
-    assert attachment["fileUrl"] == "/WebUp_Files/files/uploaded.pdf"
-    assert attachment["fileName"] == "report.pdf"
-    assert attachment["fileSize"] == len(b"%PDF-1.7 fake")
-    assert attachment["mimeType"] == "application/pdf"
-
-
-def test_production_issue_proxy_forwards_user_token_for_non_dingtalk(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue.load_settings",
-        lambda: Settings(internal_api={"base_url": "http://api.internal:5000"}),
-    )
-    monkeypatch.setattr(
-        "ohmo.gateway.routers.production_issue._decode_bearer_credentials",
-        lambda credentials: ({"sub": "u1"}, credentials.credentials),
-    )
-    captured: dict[str, object] = {}
-
-    class FakeResponse:
-        status_code = 200
-        content = b'{"success":true}'
-        headers = {"content-type": "application/json"}
-
-    class FakeAsyncClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def request(self, method, url, **kwargs):
-            captured["headers"] = kwargs["headers"]
-            return FakeResponse()
-
-    monkeypatch.setattr("ohmo.gateway.routers.production_issue.httpx.AsyncClient", lambda *a, **k: FakeAsyncClient())
-
-    app = FastAPI()
-    app.include_router(production_issue.router, prefix="/agent/api/v1")
-    client = TestClient(app)
-    response = client.post(
-        "/agent/api/v1/ProductionIssue/Insert",
-        headers={"Authorization": "Bearer user-token"},
-        json={"title": "现场问题"},
-    )
-
-    assert response.status_code == 200
-    assert captured["headers"]["Authorization"] == "Bearer user-token"
 
 
 @pytest.mark.asyncio
@@ -2048,6 +1597,10 @@ async def test_runtime_pool_stream_message_sets_dingtalk_channel_context(tmp_pat
         "chat_id": "c1",
         "sender_id": "u1",
         "source_sender_id": None,
+        "raw_sender_id": None,
+        "source_corp_id": None,
+        "source_app_id": None,
+        "default_agent": None,
         "sender_name": "Alice",
         "message_id": "msg-1",
         "conversation_id": "conv-1",
@@ -2721,7 +2274,16 @@ async def test_runtime_pool_includes_media_paths_in_prompt(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_production_issue_agent_keeps_images_as_hidden_attachments(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("skills", "attachments_only"),
+    [
+        (["production-site-issue"], True),
+        (["production-site-issue", "board-memo", "board-memo-analysis", "web-chart"], False),
+    ],
+)
+async def test_issue_skill_only_hides_images_for_dedicated_collector(
+    tmp_path, monkeypatch, skills, attachments_only
+):
     workspace = tmp_path / ".ohmo-home"
     initialize_workspace(workspace)
     image_path = tmp_path / "evidence.png"
@@ -2766,7 +2328,7 @@ async def test_production_issue_agent_keeps_images_as_hidden_attachments(tmp_pat
         lambda name: AgentDefinition(
             name=name,
             description="production issue collector",
-            skills=["production-site-issue"],
+            skills=skills,
         ),
     )
 
@@ -2784,8 +2346,8 @@ async def test_production_issue_agent_keeps_images_as_hidden_attachments(tmp_pat
     assert updates[-1].text == "done"
     submitted = captured["content"]
     assert isinstance(submitted, ConversationMessage)
-    assert not any(isinstance(block, ImageBlock) for block in submitted.content)
-    assert "retained for storage only" in submitted.text
+    assert any(isinstance(block, ImageBlock) for block in submitted.content) is not attachments_only
+    assert ("retained for storage only" in submitted.text) is attachments_only
     assert "evidence.png" not in submitted.text
 
     bundle = captured["bundle"]

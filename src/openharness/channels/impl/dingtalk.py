@@ -21,6 +21,7 @@ from openharness.config import load_settings
 from openharness.config.schema import DingTalkBotConfig, DingTalkConfig
 from openharness.utils.images import detect_supported_image_media_type
 from openharness.utils.network_guard import ensure_public_http_url
+from openharness.utils.production_issue_identity import register_stream_identity
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +86,9 @@ class NanobotDingTalkHandler(CallbackHandler):
             # Parse using SDK's ChatbotMessage for robust handling
             chatbot_msg = ChatbotMessage.from_dict(raw_data)
 
-            sender_id = (
-                chatbot_msg.sender_staff_id
-                or chatbot_msg.sender_id
-                or raw_data.get("senderStaffId")
-                or raw_data.get("senderId")
-            )
+            staff_id = str(chatbot_msg.sender_staff_id or raw_data.get("senderStaffId") or "").strip()
+            raw_sender_id = str(chatbot_msg.sender_id or raw_data.get("senderId") or "").strip()
+            sender_id = staff_id or raw_sender_id
             sender_name = chatbot_msg.sender_nick or raw_data.get("senderNick") or "Unknown"
             if not sender_id:
                 logger.warning(
@@ -213,6 +211,17 @@ class NanobotDingTalkHandler(CallbackHandler):
                     ) from exc
                 return AckMessage.STATUS_OK, "OK"
 
+            # Identity is issued exclusively here, after authenticated Stream
+            # delivery and allow_from checks. raw senderId never substitutes for staffId.
+            issue_capability = register_stream_identity(
+                corp_id=str(getattr(self.channel.config, "corp_id", "") or "").strip(),
+                payload_corp_id=str(raw_data.get("senderCorpId") or "").strip(),
+                staff_id=staff_id, raw_sender_id=raw_sender_id,
+                app_id=str(self.channel.config.client_id or "").strip(),
+                bot_name=self.channel.bot_name, sender_name=sender_name,
+                message_id=str(message_id or ""), conversation_id=str(conversation_id or ""),
+                attachment_paths=media_paths,
+            )
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
@@ -225,6 +234,11 @@ class NanobotDingTalkHandler(CallbackHandler):
                         "msg_type": chatbot_msg.message_type,
                         "message_id": message_id,
                         "conversation_id": conversation_id,
+                        "source_sender_id": staff_id,
+                        "raw_sender_id": raw_sender_id,
+                        "source_corp_id": str(getattr(self.channel.config, "corp_id", "") or ""),
+                        "source_app_id": str(self.channel.config.client_id or ""),
+                        "_issue_capability": issue_capability,
                     },
                 )
             )

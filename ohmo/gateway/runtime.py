@@ -672,7 +672,9 @@ class OhmoSessionRuntimePool:
         }
 
     async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
-        tool_metadata = getattr(bundle.engine, "tool_metadata", {}) or {}
+        tool_metadata = dict(getattr(bundle.engine, "tool_metadata", {}) or {})
+        # Never persist process-local production identity capabilities in session snapshots.
+        tool_metadata.pop("_issue_capability", None)
         session_metadata = self._session_metadata.get(session_key, {})
         self._session_backend.save_snapshot(
             cwd=self._cwd,
@@ -902,6 +904,10 @@ def _apply_channel_context_metadata(
         "chat_id": message.chat_id,
         "sender_id": message.sender_id,
         "source_sender_id": _optional_str(message.metadata.get("source_sender_id")),
+        "raw_sender_id": _optional_str(message.metadata.get("raw_sender_id")),
+        "source_corp_id": _optional_str(message.metadata.get("source_corp_id")),
+        "source_app_id": _optional_str(message.metadata.get("source_app_id")),
+        "default_agent": _optional_str(message.metadata.get("default_agent")),
         "sender_name": _optional_str(message.metadata.get("sender_name")),
         "message_id": message_id,
         "conversation_id": _optional_str(message.metadata.get("conversation_id")),
@@ -926,6 +932,15 @@ def _apply_channel_context_metadata(
             channel_context["attachment_urls"] = [
                 dict(item) for item in attachment_urls if isinstance(item, dict)
             ]
+    from openharness.utils.production_issue_identity import bind_session, IssueIdentityError
+    previous_capability = metadata.pop("_issue_capability", None)
+    capability = message.metadata.get("_issue_capability")
+    if capability:
+        try:
+            bind_session(capability, session_key, previous_capability)
+            metadata["_issue_capability"] = capability
+        except IssueIdentityError:
+            pass  # ordinary channels remain usable; issue operations fail closed
     metadata["channel_context"] = channel_context
 
 
@@ -1177,13 +1192,19 @@ def _build_inbound_user_message(
 
 
 def _agent_stores_images_as_attachments(agent_def: AgentDefinition | None) -> bool:
-    """Keep images out of vision input for production-issue collection agents."""
+    """Keep evidence-only images private for dedicated issue collection agents.
+
+    A multi-skill assistant may need image input for its other tasks, such as
+    whiteboard recognition. Merely listing the issue skill must not disable it.
+    """
     if agent_def is None:
         return False
-    return any(
-        str(skill).strip().lower() == "production-site-issue"
+    skills = {
+        str(skill).strip().lower()
         for skill in (agent_def.skills or [])
-    )
+        if str(skill).strip()
+    }
+    return skills == {"production-site-issue"}
 
 
 def _should_retry_without_image_input(

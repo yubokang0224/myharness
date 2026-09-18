@@ -57,7 +57,7 @@ def load_gateway_config(workspace: str | Path | None = None) -> GatewayConfig:
     """Load ``.ohmo/gateway.json``."""
     path = get_gateway_config_path(workspace)
     if path.exists():
-        return GatewayConfig.model_validate_json(path.read_text(encoding="utf-8"))
+        return GatewayConfig.model_validate_json(path.read_text(encoding="utf-8-sig"))
     return GatewayConfig()
 
 

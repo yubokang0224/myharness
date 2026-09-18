@@ -140,163 +140,20 @@ def test_internal_api_request_headers_include_channel_context():
     assert unquote(headers["X-OHMO-Source-Sender-Name"]) == "俞晨"
 
 
-def test_dingtalk_issue_list_defaults_to_current_sender_name():
-    original = {"page": 1, "limit": 10, "status": "open"}
-
-    params = _params_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/GetListPaged",
-        original,
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "sender_name": "俞晨",
-            }
-        },
-    )
-
-    assert params == {
-        "page": 1,
-        "limit": 10,
-        "status": "open",
-        "sourceSenderName": "俞晨",
-    }
-    assert original == {"page": 1, "limit": 10, "status": "open"}
 
 
-def test_dingtalk_issue_list_overrides_explicit_sender_filter():
-    params = _params_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/GetListPaged",
-        {"sourceSenderName": "张三", "sourceSenderId": "other-user"},
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "sender_name": "俞晨",
-            }
-        },
-    )
-
-    assert params == {"sourceSenderName": "俞晨"}
 
 
-def test_dingtalk_issue_list_fails_closed_without_sender_name():
-    with pytest.raises(NetworkGuardError, match="sender name is unavailable"):
-        _params_with_channel_context(
-            "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/GetListPaged",
-            {"page": 1},
-            metadata={"channel_context": {"channel": "dingtalk"}},
-        )
 
 
-def test_dingtalk_issue_detail_forces_current_sender_name():
-    params = _params_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Get",
-        {"id": 123, "sourceSenderName": "张三"},
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "sender_name": "俞晨",
-            }
-        },
-    )
-
-    assert params == {"id": 123, "sourceSenderName": "俞晨"}
 
 
-def test_issue_list_does_not_add_sender_name_outside_dingtalk():
-    params = _params_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/GetListPaged",
-        {"page": 1},
-        metadata={
-            "channel_context": {
-                "channel": "web",
-                "sender_name": "俞晨",
-            }
-        },
-    )
-
-    assert params == {"page": 1}
 
 
-def test_internal_api_request_body_includes_production_issue_channel_context():
-    body = _json_body_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
-        {"title": "合同号识别错误"},
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "chat_id": "chat-1",
-                "sender_name": "俞晨",
-                "message_id": "msg-1",
-                "conversation_id": "conv-1",
-                "session_key": "dingtalk:dingtalk-bot:生产助手:chat-1:sender-1",
-                "attachment_paths": ["/tmp/receipt.png"],
-            }
-        },
-    )
-
-    assert body["sourceChannel"] == "dingtalk"
-    assert body["sourceChatId"] == "chat-1"
-    assert body["sourceSenderName"] == "俞晨"
-    assert body["sourceMessageId"] == "msg-1"
-    assert body["sourceConversationId"] == "conv-1"
-    assert body["idempotencyKey"] == "production-site-issue:msg-1:insert"
-    assert body["reporterName"] == "俞晨"
-    assert "sourceSenderId" not in body
-    assert body["attachments"] == [
-        {
-            "fileName": "receipt.png",
-            "sourceLocalPath": "/tmp/receipt.png",
-            "sourceType": "dingtalk",
-        }
-    ]
 
 
-@pytest.mark.parametrize("action", ["Insert", "AppendProcess", "UpdateStatus"])
-def test_production_issue_confirmation_uses_last_attachment_paths(action):
-    body = _json_body_with_channel_context(
-        f"http://192.168.6.123:2416/agent/api/v1/ProductionIssue/{action}",
-        {"title": "装箱单识别异常", "attachments": []},
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "message_id": "confirm-msg",
-                "attachment_paths": [],
-                "last_attachment_paths": ["/tmp/issue-photo.jpg"],
-                "last_attachment_message_id": "photo-msg",
-            }
-        },
-    )
-
-    assert body["attachments"] == [
-        {
-            "fileName": "issue-photo.jpg",
-            "sourceLocalPath": "/tmp/issue-photo.jpg",
-            "sourceType": "dingtalk",
-        }
-    ]
 
 
-def test_production_issue_replaces_unusable_attachment_shell_from_model():
-    body = _json_body_with_channel_context(
-        "http://192.168.6.123:2416/agent/api/v1/ProductionIssue/Insert",
-        {"title": "装箱单识别异常", "attachments": [{"fileName": "image.jpg"}]},
-        metadata={
-            "channel_context": {
-                "channel": "dingtalk",
-                "message_id": "confirm-msg",
-                "attachment_paths": [],
-                "last_attachment_paths": ["/tmp/issue-photo.jpg"],
-            }
-        },
-    )
-
-    assert body["attachments"] == [
-        {
-            "fileName": "issue-photo.jpg",
-            "sourceLocalPath": "/tmp/issue-photo.jpg",
-            "sourceType": "dingtalk",
-        }
-    ]
 
 
 def test_internal_api_request_coerces_json_string_body():

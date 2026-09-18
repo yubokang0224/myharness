@@ -6,7 +6,7 @@ import json
 import mimetypes
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit, parse_qsl
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,6 +57,10 @@ class InternalApiRequestTool(BaseTool):
         arguments: InternalApiRequestInput,
         context: ToolExecutionContext,
     ) -> ToolResult:
+        # Production workflow is a dedicated, authenticated path. Even old or
+        # absolute OS URLs are intercepted before generic HTTP/token forwarding.
+        if _is_production_issue_url(arguments.url):
+            return await _execute_production_issue(arguments, context)
         url = resolve_internal_api_url(arguments.url)
         if _requires_agent_gateway(url) and not _is_allowed_agent_gateway_target(url):
             return ToolResult(
@@ -135,6 +139,36 @@ class InternalApiRequestTool(BaseTool):
     def is_read_only(self, arguments: BaseModel) -> bool:
         method = getattr(arguments, "method", "GET")
         return str(method).upper() == "GET"
+
+
+async def _execute_production_issue(arguments: InternalApiRequestInput,
+                                    context: ToolExecutionContext) -> ToolResult:
+    from ohmo.gateway.production_issue_client import execute_issue_request, issue_action
+    from ohmo.gateway.production_issue_errors import IssueRequestError, identity_failure
+    from openharness.utils.production_issue_identity import IssueIdentityError
+    action = ""
+    try:
+        action = issue_action("/" + arguments.url.lstrip("/") if not urlsplit(arguments.url).scheme else arguments.url)
+        payload = _coerce_json_body(arguments.json_body, arguments.body)
+        params = dict(parse_qsl(urlsplit(arguments.url).query))
+        params.update(arguments.params or {})
+        response = await execute_issue_request(action=action, method=str(arguments.method).upper(),
+            capability=(context.metadata or {}).get("_issue_capability"),
+            params=params, body=payload, timeout=arguments.timeout)
+        output = response.text
+        if len(output) > arguments.max_chars:
+            output = output[:arguments.max_chars] + "\n...[truncated]"
+        return ToolResult(output=f"Status: {response.status_code}\n{output}",
+                          is_error=response.status_code >= 400)
+    except IssueRequestError as exc:
+        # Keep the complete bounded error contract, even when success output is truncated.
+        return ToolResult(output=json.dumps(exc.payload, ensure_ascii=False), is_error=True)
+    except IssueIdentityError as exc:
+        return ToolResult(output=json.dumps(identity_failure(exc, action).payload, ensure_ascii=False), is_error=True)
+    except OSError:
+        error = IssueRequestError("无法读取本次现场附件。", stage="upload", action=action,
+            code="ISSUE_ATTACHMENT_UNAVAILABLE", user_action="请重新发送附件后重试，问题尚未提交。")
+        return ToolResult(output=json.dumps(error.payload, ensure_ascii=False), is_error=True)
 
 
 async def _request_with_auth_per_redirect(
@@ -222,37 +256,10 @@ def _headers_with_channel_context(
     return next_headers
 
 
-def _params_with_channel_context(
-    url: str,
-    params: dict[str, str | int | float | bool] | None,
-    *,
-    metadata: dict[str, Any] | None,
-) -> dict[str, str | int | float | bool] | None:
-    """Force DingTalk issue reads to the current sender's display name."""
-    if not _is_production_issue_read_url(url) or not isinstance(metadata, dict):
-        return params
-    channel_context = metadata.get("channel_context")
-    if not isinstance(channel_context, dict):
-        return params
-    channel = _metadata_text(channel_context.get("channel")).lower()
-    sender_name = _metadata_text(channel_context.get("sender_name"))
-    if channel != "dingtalk":
-        return params
-    if not sender_name:
-        raise NetworkGuardError(
-            "ProductionIssue query denied: current DingTalk sender name is unavailable"
-        )
-
-    next_params = dict(params or {})
-    sender_filter_keys = [
-        key
-        for key in next_params
-        if str(key).replace("_", "").lower() in {"sourcesenderid", "sourcesendername"}
-    ]
-    for key in sender_filter_keys:
-        next_params.pop(key, None)
-    next_params["sourceSenderName"] = sender_name
-    return next_params
+def _params_with_channel_context(url, params, *, metadata):
+    if _is_production_issue_url(url):
+        raise NetworkGuardError("ProductionIssue requires the trusted MES workflow client")
+    return params
 
 
 def _coerce_json_body(json_body: Any, body: Any) -> Any:
@@ -285,7 +292,9 @@ def _json_body_with_channel_context(
     *,
     metadata: dict[str, Any] | None,
 ) -> Any:
-    if not (_is_production_issue_url(url) or _is_board_memo_url(url) or _is_kb_url(url)) or not isinstance(json_body, dict):
+    if _is_production_issue_url(url):
+        raise NetworkGuardError("ProductionIssue requires the trusted MES workflow client")
+    if not (_is_board_memo_url(url) or _is_kb_url(url)) or not isinstance(json_body, dict):
         return json_body
     if not isinstance(metadata, dict):
         return json_body
@@ -306,11 +315,10 @@ def _json_body_with_channel_context(
     _set_if_missing(next_body, "sourceConversationId", _metadata_text(channel_context.get("conversation_id")))
     _set_if_missing(next_body, "sourceSessionKey", _metadata_text(channel_context.get("session_key")))
     _set_if_missing(next_body, "reporterName", _metadata_text(channel_context.get("sender_name")))
-    _set_production_issue_idempotency_key(next_body, url, channel_context)
 
     body_attachments = next_body.get("attachments")
     supports_attachment_fallback = (
-        _is_board_memo_insert_url(url) or _is_production_issue_write_url(url)
+        _is_board_memo_insert_url(url)
     )
     needs_attachments = not body_attachments
     if supports_attachment_fallback and not _has_usable_attachment(body_attachments):
@@ -422,7 +430,7 @@ async def _upload_local_attachments_in_place(
     带 fileUrl 的附件下游中转会原样放行。上传失败时保留原路径，交由中转兜底。
     """
     if not (
-        _is_board_memo_insert_url(url) or _is_production_issue_write_url(url)
+        _is_board_memo_insert_url(url)
     ) or not isinstance(json_body, dict):
         return
     attachments = json_body.get("attachments")
@@ -652,19 +660,14 @@ def _set_board_memo_insert_idempotency_key(
 
 
 def _is_production_issue_url(url: str) -> bool:
-    return "/productionissue/" in url.lower()
+    return "/productionissue/" in ("/" + _normalized_url_path(url).lstrip("/"))
 
 
 def _is_production_issue_write_url(url: str) -> bool:
-    normalized = url.lower().rstrip("/")
-    return any(
-        normalized.endswith(path)
-        for path in (
-            "/productionissue/insert",
-            "/productionissue/appendprocess",
-            "/productionissue/updatestatus",
-        )
-    )
+    normalized = _normalized_url_path(url)
+    return normalized.endswith(tuple("/productionissue/" + action for action in (
+        "insert", "assign", "accept", "appendprocess", "resolve", "verify", "reopen", "invalidate"
+    )))
 
 
 def _is_production_issue_read_url(url: str) -> bool:
@@ -674,32 +677,6 @@ def _is_production_issue_read_url(url: str) -> bool:
     )
 
 
-def _set_production_issue_idempotency_key(
-    body: dict[str, Any],
-    url: str,
-    channel_context: dict[str, Any],
-) -> None:
-    if body.get("idempotencyKey") or body.get("idempotency_key"):
-        return
-
-    normalized = url.lower().rstrip("/")
-    if normalized.endswith("/productionissue/insert"):
-        action = "insert"
-    elif normalized.endswith(("/productionissue/appendprocess", "/productionissue/updatestatus")):
-        action = "process"
-    else:
-        return
-
-    seed = (
-        _metadata_text(channel_context.get("message_id"))
-        or _metadata_text(body.get("sourceMessageId"))
-        or _metadata_text(channel_context.get("timestamp"))
-        or _metadata_text(channel_context.get("session_key"))
-    )
-    if not seed:
-        return
-
-    body["idempotencyKey"] = f"production-site-issue:{seed}:{action}"
 
 
 def _is_kb_url(url: str) -> bool:

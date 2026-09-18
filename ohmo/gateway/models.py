@@ -47,6 +47,18 @@ class BoardRecognitionConfig(BaseModel):
     request_timeout_seconds: float = 60
 
 
+class ProductionIssueConfig(BaseModel):
+    """Dedicated MES workflow scope; never reuse the OS service token."""
+
+    enabled: bool = False
+    mes_base_url: str = ""
+    corp_id: str = ""
+    app_id: str = ""  # Optional explicit application restriction; the Stream channel supplies its ID.
+    bot_name: str = ""
+    company_code: str = ""  # Legacy field ignored: MOM resolves the employee company by DingTalk ID.
+    mobile_base_url: str = ""
+
+
 class GatewayConfig(BaseModel):
     """Persistent gateway configuration."""
 
@@ -64,6 +76,7 @@ class GatewayConfig(BaseModel):
     alerting: AlertingConfig = Field(default_factory=AlertingConfig)
     mes: MesWorkspaceConfig = Field(default_factory=MesWorkspaceConfig)
     board_recognition: BoardRecognitionConfig = Field(default_factory=BoardRecognitionConfig)
+    production_issue: ProductionIssueConfig = Field(default_factory=ProductionIssueConfig)
 
 
 class GatewayState(BaseModel):

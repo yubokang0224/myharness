@@ -57,6 +57,7 @@ class FeishuConfig(BaseChannelConfig):
 class DingTalkBotConfig(BaseChannelConfig):
     name: str = ""
     client_id: str = ""
+    corp_id: str = ""
     client_secret: str = ""
     robot_code: str = ""
     default_agent: str = ""
@@ -67,6 +68,7 @@ class DingTalkBotConfig(BaseChannelConfig):
 
 class DingTalkConfig(BaseChannelConfig):
     client_id: str = ""
+    corp_id: str = ""
     client_secret: str = ""
     robot_code: str = ""
     default_agent: str = ""
