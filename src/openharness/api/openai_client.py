@@ -69,14 +69,16 @@ def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]
     """
     result = []
     for tool in tools:
-        result.append({
-            "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {}),
-            },
-        })
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {}),
+                },
+            }
+        )
     return result
 
 
@@ -109,11 +111,13 @@ def _convert_messages_to_openai(
             if tool_results:
                 # Each tool result becomes a separate message with role="tool"
                 for tr in tool_results:
-                    openai_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tr.tool_use_id,
-                        "content": tr.content,
-                    })
+                    openai_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tr.tool_use_id,
+                            "content": tr.content,
+                        }
+                    )
             if user_blocks:
                 content = _convert_user_content_to_openai(user_blocks)
                 if isinstance(content, str):
@@ -139,12 +143,14 @@ def _convert_user_content_to_openai(blocks: list[ContentBlock]) -> str | list[di
         if isinstance(block, TextBlock) and block.text:
             content.append({"type": "text", "text": block.text})
         elif isinstance(block, ImageBlock):
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{block.media_type};base64,{block.data}",
-                },
-            })
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{block.media_type};base64,{block.data}",
+                    },
+                }
+            )
     return content
 
 
@@ -201,7 +207,9 @@ def _sanitized_request_payload(params: dict[str, Any]) -> dict[str, Any]:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "image_url":
                     url = str((block.get("image_url") or {}).get("url") or "")
-                    blocks.append({"type": "image_url", "image_url": {"url": f"<{len(url)} chars omitted>"}})
+                    blocks.append(
+                        {"type": "image_url", "image_url": {"url": f"<{len(url)} chars omitted>"}}
+                    )
                 else:
                     blocks.append(block)
             cleaned["content"] = blocks
@@ -232,11 +240,13 @@ def _parse_assistant_response(response: Any) -> ConversationMessage:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            content.append(ToolUseBlock(
-                id=tc.id,
-                name=tc.function.name,
-                input=args,
-            ))
+            content.append(
+                ToolUseBlock(
+                    id=tc.id,
+                    name=tc.function.name,
+                    input=args,
+                )
+            )
 
     return ConversationMessage(role="assistant", content=content)
 
@@ -270,7 +280,15 @@ class OpenAICompatibleClient:
     so it can be used as a drop-in replacement in the agent loop.
     """
 
-    def __init__(self, api_key: str, *, base_url: str | None = None, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        reasoning_mode: str = "auto",
+        reasoning_effort: str | None = None,
+    ) -> None:
         kwargs: dict[str, Any] = {"api_key": api_key}
         normalized_base_url = _normalize_openai_base_url(base_url)
         if normalized_base_url:
@@ -279,6 +297,8 @@ class OpenAICompatibleClient:
             kwargs["timeout"] = _streaming_timeout(timeout)
         self._base_url = normalized_base_url or ""
         self._client = AsyncOpenAI(**kwargs)
+        self._reasoning_mode = reasoning_mode
+        self._reasoning_effort = reasoning_effort
 
     def _omit_stream_options_with_tools(self, model: str) -> bool:
         """Moonshot/Kimi rejects tool-call follow-ups when stream_options triggers
@@ -304,10 +324,13 @@ class OpenAICompatibleClient:
                 if attempt >= MAX_RETRIES or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
 
-                delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                delay = min(BASE_DELAY * (2**attempt), MAX_DELAY)
                 log.warning(
                     "OpenAI API request failed (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1, MAX_RETRIES + 1, delay, error_message,
+                    attempt + 1,
+                    MAX_RETRIES + 1,
+                    delay,
+                    error_message,
                 )
                 yield ApiRetryEvent(
                     message=error_message,
@@ -332,6 +355,24 @@ class OpenAICompatibleClient:
             "stream_options": {"include_usage": True},
         }
         params.update(_token_limit_param_for_model(request.model, request.max_tokens))
+        extra = {}
+        if self._reasoning_mode != "auto":
+            if "qwen" in request.model.lower():
+                extra["enable_thinking"] = self._reasoning_mode == "enabled"
+            elif "glm" in request.model.lower():
+                mode = (
+                    "enabled"
+                    if request.model.lower().startswith("glm-5.3")
+                    else self._reasoning_mode
+                )
+                extra["thinking"] = {"type": mode}
+        if self._reasoning_effort:
+            if "glm" in request.model.lower() or "qwen" in request.model.lower():
+                extra["reasoning_effort"] = self._reasoning_effort
+            else:
+                params["reasoning_effort"] = self._reasoning_effort
+        if extra:
+            params["extra_body"] = extra
         if openai_tools:
             params["tools"] = openai_tools
             if self._omit_stream_options_with_tools(request.model):
@@ -345,13 +386,16 @@ class OpenAICompatibleClient:
         usage_data: dict[str, int] = {}
         # Buffer to strip inline <think>…</think> blocks across streaming chunks.
         _think_buf = ""
-        no_think_requested = re.search(
-            r"(^|\n)\s*/no_think(?:\s|$)",
-            (request.system_prompt or "")
-            + "\n"
-            + "\n".join(message.text for message in request.messages),
-            flags=re.IGNORECASE,
-        ) is not None
+        no_think_requested = (
+            re.search(
+                r"(^|\n)\s*/no_think(?:\s|$)",
+                (request.system_prompt or "")
+                + "\n"
+                + "\n".join(message.text for message in request.messages),
+                flags=re.IGNORECASE,
+            )
+            is not None
+        )
         chunk_count = 0
         choice_chunk_count = 0
         content_delta_chunks = 0
@@ -386,9 +430,7 @@ class OpenAICompatibleClient:
             # vLLM's reasoning parser emits `reasoning` while other providers
             # use `reasoning_content` — accept both.
             reasoning_piece = (
-                getattr(delta, "reasoning_content", None)
-                or getattr(delta, "reasoning", None)
-                or ""
+                getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
             )
             if reasoning_piece:
                 reasoning_delta_chunks += 1
@@ -445,11 +487,13 @@ class OpenAICompatibleClient:
                 args = json.loads(tc["arguments"])
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            content.append(ToolUseBlock(
-                id=tc["id"],
-                name=tc["name"],
-                input=args,
-            ))
+            content.append(
+                ToolUseBlock(
+                    id=tc["id"],
+                    name=tc["name"],
+                    input=args,
+                )
+            )
 
         final_message = ConversationMessage(role="assistant", content=content)
 

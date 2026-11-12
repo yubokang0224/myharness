@@ -9,6 +9,7 @@ import mimetypes
 from pathlib import Path
 import json
 import os
+import re
 import string
 import time
 
@@ -35,7 +36,13 @@ from openharness.engine.stream_events import (
     ToolExecutionStarted,
 )
 from openharness.prompts import build_runtime_system_prompt
-from openharness.ui.runtime import RuntimeBundle, _last_user_text, build_runtime, close_runtime, start_runtime
+from openharness.ui.runtime import (
+    RuntimeBundle,
+    _last_user_text,
+    build_runtime,
+    close_runtime,
+    start_runtime,
+)
 from openharness.utils.trace import get_trace_id
 
 from ohmo.gateway.config import load_gateway_config
@@ -112,6 +119,7 @@ class OhmoSessionRuntimePool:
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._bundles: dict[str, RuntimeBundle] = {}
+        self._config_fingerprints: dict[str, str] = {}
         self._session_agents: dict[str, str] = {}
         self._session_metadata: dict[str, dict[str, str | None]] = {}
         # Last recorded cumulative usage per session; engines are reused across
@@ -146,7 +154,20 @@ class OhmoSessionRuntimePool:
         agent_def = self._resolve_agent_definition(agent_name)
         if agent_def is not None:
             self._session_agents[session_key] = agent_def.name
+        from openharness.config import load_settings
+        from openharness.config.model_catalog import (
+            resolve_agent_settings,
+            runtime_config_fingerprint,
+        )
+
+        latest_settings = load_settings()
+        effective = resolve_agent_settings(latest_settings, agent_def)
+        fingerprint = runtime_config_fingerprint(effective, agent_def)
         bundle = self._bundles.get(session_key)
+        if bundle is not None and self._config_fingerprints.get(session_key) != fingerprint:
+            bundle = await self._refresh_bundle(session_key, bundle, latest_user_prompt)
+            self._bundles[session_key] = bundle
+        self._config_fingerprints[session_key] = fingerprint
         if bundle is not None:
             self._apply_agent_tool_policy(bundle, agent_def)
             logger.info(
@@ -166,13 +187,15 @@ class OhmoSessionRuntimePool:
             _content_snippet(latest_user_prompt or ""),
         )
         bundle = await build_runtime(
+            resolved_settings=effective,
             model=self._model_for_agent(agent_def),
             max_turns=agent_def.max_turns if agent_def and agent_def.max_turns else self._max_turns,
             system_prompt=self._base_system_prompt(agent_def),
             active_profile=self._provider_profile,
             permission_mode=agent_def.permission_mode if agent_def else None,
             session_backend=self._session_backend,
-            enforce_max_turns=self._max_turns is not None or bool(agent_def and agent_def.max_turns),
+            enforce_max_turns=self._max_turns is not None
+            or bool(agent_def and agent_def.max_turns),
             restore_messages=snapshot.get("messages") if snapshot else None,
             restore_tool_metadata=snapshot.get("tool_metadata") if snapshot else None,
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
@@ -327,7 +350,11 @@ class OhmoSessionRuntimePool:
             bundle.engine.set_system_prompt(
                 self._runtime_system_prompt(bundle, _last_user_text(bundle.engine.messages))
             )
-            turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
+            turns = (
+                result.continue_turns
+                if result.continue_turns is not None
+                else bundle.engine.max_turns
+            )
             reply_parts: list[str] = []
             artifact_paths: list[str] = []
             turn_stats: dict = {"tool_calls": [], "error": None}
@@ -363,11 +390,42 @@ class OhmoSessionRuntimePool:
                 error=turn_stats.get("error"),
                 started_at=started_at,
             )
-            reply = "".join(reply_parts).strip()
-            prefers_chinese = _prefers_chinese_progress(user_prompt)
-            send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+            reply = _strip_channel_thinking("".join(reply_parts).strip())
+        # 若本轮包含专家团队成员派工（ask_agent），将各成员发言前置展示，再附上团队主持人收尾总结
+        team_member_blocks: list[str] = []
+        for call in turn_stats.get("tool_calls", []):
+            meta = call.get("metadata")
+            if isinstance(meta, dict) and meta.get("team_dispatch") and meta.get("member_reply"):
+                speaker = str(meta.get("speaker_agent") or "团队成员").strip()
+                member_text = str(meta.get("member_reply") or "").strip()
+                if member_text:
+                    team_member_blocks.append(f"### 👤 {speaker}\n{member_text}")
+        if team_member_blocks:
+            joined_members = "\n\n---\n\n".join(team_member_blocks)
+            if reply:
+                reply = f"{joined_members}\n\n---\n\n**🎯 团队主持人总结**：\n{reply}"
+            else:
+                reply = joined_members
+            prefers_chinese = _prefers_chinese_progress(user_prompt) or _is_dingtalk_channel_name(
+                message.channel
+            )
+            kb_citations = _extract_kb_citations_from_tool_calls(turn_stats.get("tool_calls", []))
+            kb_footer = _format_kb_citations_footer(
+                kb_citations,
+                reply_text=reply,
+                prefers_chinese=prefers_chinese,
+            )
+            if kb_footer and reply:
+                reply = f"{reply}\n\n{kb_footer}"
+            send_media, overflow_note = _split_outbound_artifacts(
+                artifact_paths, prefers_chinese=prefers_chinese
+            )
             if send_media and not reply:
-                reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+                reply = (
+                    "📎 文件已生成，见附件。"
+                    if prefers_chinese
+                    else "📎 Generated files are attached."
+                )
             if overflow_note:
                 reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
             if reply:
@@ -389,7 +447,21 @@ class OhmoSessionRuntimePool:
         user_prompt: str,
         user_message: ConversationMessage | str,
     ):
-        bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, user_prompt))
+        agent_name = self._session_agents.get(session_key) or self._agent_name_for_message(message)
+        agent_def = self._resolve_agent_definition(agent_name)
+        if user_prompt and "@" in user_prompt:
+            from ohmo.gateway.routers.teams import extract_mentioned_experts
+
+            if extract_mentioned_experts(user_prompt) and hasattr(bundle, "tool_registry"):
+                from openharness.tools.team_collab_tools import AgentListTool, AskAgentTool
+
+                if bundle.tool_registry.get("agent_list") is None:
+                    bundle.tool_registry.register(AgentListTool())
+                if bundle.tool_registry.get("ask_agent") is None:
+                    bundle.tool_registry.register(AskAgentTool())
+        bundle.engine.set_system_prompt(
+            self._runtime_system_prompt(bundle, user_prompt, agent_def=agent_def)
+        )
         reply_parts: list[str] = []
         artifact_paths: list[str] = []
         turn_stats: dict = {"tool_calls": [], "error": None}
@@ -445,7 +517,9 @@ class OhmoSessionRuntimePool:
                             "_image_fallback_reason": image_retry_reason,
                         },
                     )
-                    async for retry_event in bundle.engine.continue_pending(max_turns=bundle.engine.max_turns):
+                    async for retry_event in bundle.engine.continue_pending(
+                        max_turns=bundle.engine.max_turns
+                    ):
                         async for update in self._convert_stream_event(
                             event=retry_event,
                             bundle=bundle,
@@ -498,11 +572,40 @@ class OhmoSessionRuntimePool:
             error=turn_stats.get("error"),
             started_at=started_at,
         )
-        reply = "".join(reply_parts).strip()
-        prefers_chinese = _prefers_chinese_progress(user_prompt)
-        send_media, overflow_note = _split_outbound_artifacts(artifact_paths, prefers_chinese=prefers_chinese)
+        reply = _strip_channel_thinking("".join(reply_parts).strip())
+        # 若本轮包含专家团队成员派工（ask_agent），将各成员发言前置展示，再附上团队主持人收尾总结
+        team_member_blocks: list[str] = []
+        for call in turn_stats.get("tool_calls", []):
+            meta = call.get("metadata")
+            if isinstance(meta, dict) and meta.get("team_dispatch") and meta.get("member_reply"):
+                speaker = str(meta.get("speaker_agent") or "团队成员").strip()
+                member_text = str(meta.get("member_reply") or "").strip()
+                if member_text:
+                    team_member_blocks.append(f"### 👤 {speaker}\n{member_text}")
+        if team_member_blocks:
+            joined_members = "\n\n---\n\n".join(team_member_blocks)
+            if reply:
+                reply = f"{joined_members}\n\n---\n\n**🎯 团队主持人总结**：\n{reply}"
+            else:
+                reply = joined_members
+        prefers_chinese = _prefers_chinese_progress(user_prompt) or _is_dingtalk_channel_name(
+            message.channel
+        )
+        kb_citations = _extract_kb_citations_from_tool_calls(turn_stats.get("tool_calls", []))
+        kb_footer = _format_kb_citations_footer(
+            kb_citations,
+            reply_text=reply,
+            prefers_chinese=prefers_chinese,
+        )
+        if kb_footer and reply:
+            reply = f"{reply}\n\n{kb_footer}"
+        send_media, overflow_note = _split_outbound_artifacts(
+            artifact_paths, prefers_chinese=prefers_chinese
+        )
         if send_media and not reply:
-            reply = "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+            reply = (
+                "📎 文件已生成，见附件。" if prefers_chinese else "📎 Generated files are attached."
+            )
         if overflow_note:
             reply = f"{reply}\n\n{overflow_note}" if reply else overflow_note
         if reply:
@@ -609,6 +712,8 @@ class OhmoSessionRuntimePool:
                     text=hint,
                     session_key=session_key,
                     content=content,
+                    tool_name=event.tool_name,
+                    tool_input=event.tool_input,
                 ),
                 metadata={
                     "_progress": True,
@@ -632,7 +737,9 @@ class OhmoSessionRuntimePool:
                 event.tool_name,
             )
             if not event.is_error:
-                for path in _artifact_paths_from_tool_metadata(event.metadata, self._artifact_roots):
+                for path in _artifact_paths_from_tool_metadata(
+                    event.metadata, self._artifact_roots
+                ):
                     # Keep last-write order so repeated writes surface once, at the end.
                     if path in artifact_paths:
                         artifact_paths.remove(path)
@@ -658,10 +765,16 @@ class OhmoSessionRuntimePool:
             if not reply_parts:
                 reply_parts.append(event.message.text.strip())
             if self._is_output_limit_stop_reason(getattr(event, "stop_reason", None)):
-                reply_parts.append(
-                    "\n\n[System notice] The model reached the max output token limit for this turn. "
-                    "Reply with 'continue' to keep going, or raise max output tokens in model settings."
-                )
+                if _prefers_chinese_progress(content) or _is_dingtalk_channel_name(message.channel):
+                    reply_parts.append(
+                        "\n\n> ⚠️ **系统提示**：本轮回复已达到单次最大输出长度限制。"
+                        "请直接回复「继续」让助手接着输出剩余内容。"
+                    )
+                else:
+                    reply_parts.append(
+                        "\n\n[System notice] The model reached the max output token limit for this turn. "
+                        "Reply with 'continue' to keep going, or raise max output tokens in model settings."
+                    )
 
     @staticmethod
     def _is_output_limit_stop_reason(stop_reason: str | None) -> bool:
@@ -671,7 +784,9 @@ class OhmoSessionRuntimePool:
             "max_completion_tokens",
         }
 
-    async def _save_snapshot(self, bundle: RuntimeBundle, session_key: str, user_prompt: str) -> None:
+    async def _save_snapshot(
+        self, bundle: RuntimeBundle, session_key: str, user_prompt: str
+    ) -> None:
         tool_metadata = dict(getattr(bundle.engine, "tool_metadata", {}) or {})
         # Never persist process-local production identity capabilities in session snapshots.
         tool_metadata.pop("_issue_capability", None)
@@ -711,7 +826,9 @@ class OhmoSessionRuntimePool:
         if current_in < base_in or current_out < base_out:
             base_in = base_out = 0
         self._session_usage_baseline[session_key] = (current_in, current_out)
-        return UsageSnapshot(input_tokens=current_in - base_in, output_tokens=current_out - base_out)
+        return UsageSnapshot(
+            input_tokens=current_in - base_in, output_tokens=current_out - base_out
+        )
 
     def _record_invocation(
         self,
@@ -771,7 +888,11 @@ class OhmoSessionRuntimePool:
         prior_session_id = bundle.session_id
         await close_runtime(bundle)
         agent_def = self._resolve_agent_definition(self._session_agents.get(session_key))
+        from openharness.config import load_settings
+        from openharness.config.model_catalog import resolve_agent_settings
+
         refreshed = await build_runtime(
+            resolved_settings=resolve_agent_settings(load_settings(), agent_def),
             cwd=self._cwd,
             model=self._model_for_agent(agent_def),
             max_turns=agent_def.max_turns if agent_def and agent_def.max_turns else self._max_turns,
@@ -779,7 +900,8 @@ class OhmoSessionRuntimePool:
             active_profile=self._provider_profile,
             permission_mode=agent_def.permission_mode if agent_def else None,
             session_backend=self._session_backend,
-            enforce_max_turns=self._max_turns is not None or bool(agent_def and agent_def.max_turns),
+            enforce_max_turns=self._max_turns is not None
+            or bool(agent_def and agent_def.max_turns),
             restore_messages=[message.model_dump(mode="json") for message in snapshot],
             restore_tool_metadata=getattr(bundle.engine, "tool_metadata", {}) or {},
             extra_skill_dirs=(str(get_skills_dir(self._workspace)),),
@@ -790,7 +912,9 @@ class OhmoSessionRuntimePool:
         self._apply_agent_tool_policy(refreshed, agent_def)
         refreshed.session_id = prior_session_id
         await start_runtime(refreshed)
-        refreshed.engine.set_system_prompt(self._runtime_system_prompt(refreshed, latest_user_prompt))
+        refreshed.engine.set_system_prompt(
+            self._runtime_system_prompt(refreshed, latest_user_prompt)
+        )
         self._bundles[session_key] = refreshed
         logger.info(
             "ohmo runtime refreshed session_key=%s session_id=%s message_count=%s",
@@ -813,25 +937,52 @@ class OhmoSessionRuntimePool:
         self._session_metadata.pop(session_key, None)
         return reset_any
 
-    def _runtime_system_prompt(self, bundle: RuntimeBundle, latest_user_prompt: str | None) -> str:
+    def _runtime_system_prompt(
+        self,
+        bundle: RuntimeBundle,
+        latest_user_prompt: str | None,
+        *,
+        agent_def: AgentDefinition | None = None,
+    ) -> str:
         if not hasattr(bundle, "current_settings"):
-            return build_ohmo_system_prompt(self._cwd, workspace=self._workspace, extra_prompt=None)
-        settings = bundle.current_settings()
-        if not hasattr(settings, "system_prompt"):
-            return build_ohmo_system_prompt(self._cwd, workspace=self._workspace, extra_prompt=None)
-        return build_runtime_system_prompt(
-            settings,
-            cwd=self._cwd,
-            latest_user_prompt=latest_user_prompt,
-            extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
-            extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
-            include_project_memory=False,
-        )
+            base_prompt = build_ohmo_system_prompt(
+                self._cwd, workspace=self._workspace, extra_prompt=None
+            )
+        else:
+            settings = bundle.current_settings()
+            if not hasattr(settings, "system_prompt"):
+                base_prompt = build_ohmo_system_prompt(
+                    self._cwd, workspace=self._workspace, extra_prompt=None
+                )
+            else:
+                base_prompt = build_runtime_system_prompt(
+                    settings,
+                    cwd=self._cwd,
+                    latest_user_prompt=latest_user_prompt,
+                    extra_skill_dirs=getattr(bundle, "extra_skill_dirs", ()),
+                    extra_plugin_roots=getattr(bundle, "extra_plugin_roots", ()),
+                    include_project_memory=False,
+                )
+        if latest_user_prompt and "@" in latest_user_prompt:
+            from ohmo.gateway.routers.teams import build_team_roster_prompt_suffix
+
+            dynamic_suffix = build_team_roster_prompt_suffix(
+                agent_def, user_text=latest_user_prompt
+            )
+            if dynamic_suffix and dynamic_suffix not in base_prompt:
+                # 避免重复拼接静态花名册头部，若已有花名册则仅追加本轮 @指定专家 强制派工段
+                if (
+                    "## 当前团队成员花名册" in base_prompt
+                    and "### 【本轮用户 @指定专家 强制派工指令】" in dynamic_suffix
+                ):
+                    idx = dynamic_suffix.index("### 【本轮用户 @指定专家 强制派工指令】")
+                    base_prompt = f"{base_prompt}\n\n{dynamic_suffix[idx:]}"
+                else:
+                    base_prompt = f"{base_prompt}{dynamic_suffix}"
+        return base_prompt
 
     @staticmethod
     def _agent_name_for_message(message: InboundMessage) -> str | None:
-        if not (message.channel == "dingtalk" or message.channel.startswith("dingtalk:")):
-            return None
         raw = message.metadata.get("default_agent")
         if not isinstance(raw, str):
             return None
@@ -858,7 +1009,9 @@ class OhmoSessionRuntimePool:
     def _base_system_prompt(self, agent_def: AgentDefinition | None) -> str:
         if agent_def is None:
             return build_ohmo_system_prompt(self._cwd, workspace=self._workspace, extra_prompt=None)
-        return agent_def.system_prompt or ""
+        from ohmo.gateway.routers.teams import build_team_roster_prompt_suffix
+
+        return (agent_def.system_prompt or "") + build_team_roster_prompt_suffix(agent_def)
 
     def _model_for_agent(self, agent_def: AgentDefinition | None) -> str | None:
         if agent_def is not None and agent_def.model and agent_def.model != "inherit":
@@ -869,6 +1022,17 @@ class OhmoSessionRuntimePool:
     def _apply_agent_tool_policy(bundle: RuntimeBundle, agent_def: AgentDefinition | None) -> None:
         if hasattr(bundle, "tool_registry"):
             apply_agent_tool_policy(bundle.tool_registry, agent_def)
+        if (
+            agent_def is not None
+            and getattr(agent_def, "kind", "expert") == "team"
+            and hasattr(bundle, "engine")
+            and hasattr(bundle.engine, "tool_metadata")
+            and isinstance(bundle.engine.tool_metadata, dict)
+        ):
+            bundle.engine.tool_metadata["team_name"] = agent_def.name
+            bundle.engine.tool_metadata["team_member_ids"] = list(
+                getattr(agent_def, "member_ids", None) or []
+            )
 
 
 def _apply_channel_context_metadata(
@@ -897,7 +1061,9 @@ def _apply_channel_context_metadata(
         last_attachment_message_id = message_id
     else:
         last_attachment_paths = list(previous_context.get("last_attachment_paths") or [])
-        last_attachment_message_id = _optional_str(previous_context.get("last_attachment_message_id"))
+        last_attachment_message_id = _optional_str(
+            previous_context.get("last_attachment_message_id")
+        )
     channel_context = {
         "channel": message.channel.split(":", 1)[0],
         "raw_channel": message.channel,
@@ -933,6 +1099,7 @@ def _apply_channel_context_metadata(
                 dict(item) for item in attachment_urls if isinstance(item, dict)
             ]
     from openharness.utils.production_issue_identity import bind_session, IssueIdentityError
+
     previous_capability = metadata.pop("_issue_capability", None)
     capability = message.metadata.get("_issue_capability")
     if capability:
@@ -999,7 +1166,7 @@ def _split_outbound_artifacts(paths: list[str], *, prefers_chinese: bool) -> tup
     if len(paths) <= _MAX_OUTBOUND_ARTIFACTS:
         return list(paths), ""
     send = paths[-_MAX_OUTBOUND_ARTIFACTS:]
-    skipped = [Path(path).name for path in paths[: -_MAX_OUTBOUND_ARTIFACTS]]
+    skipped = [Path(path).name for path in paths[:-_MAX_OUTBOUND_ARTIFACTS]]
     if prefers_chinese:
         note = (
             f"📎 本轮共生成 {len(paths)} 个文件，已随消息发送最新 {len(send)} 个。"
@@ -1028,6 +1195,208 @@ def _summarize_tool_input(tool_name: str, tool_input: dict[str, object]) -> str:
     return raw if len(raw) <= 120 else raw[:120] + "..."
 
 
+_CHANNEL_THINKING_BLOCK_RE = re.compile(
+    r"<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>\s*",
+    re.IGNORECASE,
+)
+_CHANNEL_THINKING_OPEN_RE = re.compile(r"<(?:think|thinking)>", re.IGNORECASE)
+_CHANNEL_THINKING_CLOSE_RE = re.compile(r"</(?:think|thinking)>", re.IGNORECASE)
+_CHANNEL_THINKING_TAG_RE = re.compile(r"</?(?:think|thinking)>", re.IGNORECASE)
+
+
+def _is_dingtalk_channel_name(channel: str | None) -> bool:
+    raw = str(channel or "").strip().lower()
+    return raw == "dingtalk" or raw.startswith("dingtalk:")
+
+
+def _strip_channel_thinking(text: str) -> str:
+    """剥离通道回复中的 <think>/<thinking> 块，防止内部思考过程直接发送给终端用户。"""
+    if not text:
+        return ""
+    cleaned = _CHANNEL_THINKING_BLOCK_RE.sub("", text)
+    while True:
+        close_match = _CHANNEL_THINKING_CLOSE_RE.search(cleaned)
+        if close_match is None:
+            break
+        open_match = _CHANNEL_THINKING_OPEN_RE.search(cleaned)
+        if open_match is not None and open_match.start() < close_match.start():
+            break
+        cleaned = cleaned[close_match.end() :]
+    open_match = _CHANNEL_THINKING_OPEN_RE.search(cleaned)
+    if open_match is not None:
+        cleaned = cleaned[: open_match.start()]
+    cleaned = cleaned.strip()
+    if cleaned:
+        return cleaned
+    return _CHANNEL_THINKING_TAG_RE.sub("", text).strip()
+
+
+def _parse_json_candidate(raw: object) -> dict | list | None:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    for candidate in (stripped,):
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    start_idx = stripped.find("{")
+    end_idx = stripped.rfind("}")
+    if start_idx != -1 and end_idx > start_idx:
+        try:
+            return json.loads(stripped[start_idx : end_idx + 1])
+        except Exception:
+            return None
+    return None
+
+
+def _extract_kb_citations_from_tool_calls(
+    tool_calls: list[dict[str, object]] | None,
+) -> list[dict[str, object]]:
+    """从本轮工具调用结果中提取企业知识库 (/Kb/Recall) 命中的参考文档来源。"""
+    if not tool_calls:
+        return []
+    by_title: dict[str, dict[str, object]] = {}
+    for call in tool_calls:
+        if not isinstance(call, dict) or call.get("is_error"):
+            continue
+        tool_input = call.get("tool_input")
+        if isinstance(tool_input, dict):
+            path = str(tool_input.get("path") or "")
+            if path and "kb/recall" not in path.lower():
+                continue
+        parsed = _parse_json_candidate(call.get("output"))
+        if not isinstance(parsed, dict):
+            continue
+        containers = [
+            parsed,
+            parsed.get("data") if isinstance(parsed.get("data"), dict) else None,
+            parsed.get("backResult") if isinstance(parsed.get("backResult"), dict) else None,
+            parsed.get("result") if isinstance(parsed.get("result"), dict) else None,
+        ]
+        chunks: list[object] = []
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            for key in ("chunks", "items", "records", "documents", "results"):
+                candidate_list = container.get(key)
+                if isinstance(candidate_list, list) and candidate_list:
+                    chunks = candidate_list
+                    break
+            if chunks:
+                break
+        for item in chunks:
+            if not isinstance(item, dict):
+                continue
+            title = str(
+                item.get("documentTitle")
+                or item.get("docTitle")
+                or item.get("title")
+                or item.get("fileName")
+                or item.get("documentName")
+                or ""
+            ).strip()
+            if not title:
+                continue
+            raw_score = (
+                item.get("rerankScore")
+                if item.get("rerankScore") is not None
+                else item.get("score")
+            )
+            score: float | None = None
+            if isinstance(raw_score, (int, float)):
+                score = float(raw_score)
+            section = str(item.get("sectionPath") or item.get("section") or "").strip()
+            existing = by_title.get(title)
+            if existing is None or (
+                score is not None
+                and (existing.get("score") is None or score > float(existing["score"]))
+            ):
+                by_title[title] = {
+                    "title": title,
+                    "score": score,
+                    "section": section,
+                }
+    citations = list(by_title.values())
+    citations.sort(
+        key=lambda item: float(item["score"]) if isinstance(item.get("score"), (int, float)) else -1.0,
+        reverse=True,
+    )
+    return citations[:4]
+
+
+def _format_kb_citations_footer(
+    citations: list[dict[str, object]],
+    *,
+    reply_text: str,
+    prefers_chinese: bool = True,
+) -> str:
+    """将知识库命中文档格式化为紧凑的 Markdown 引用注脚，附在通道回复末尾。"""
+    if not citations or not reply_text:
+        return ""
+    if "参考知识库" in reply_text or "📚" in reply_text:
+        return ""
+    parts: list[str] = []
+    for item in citations[:4]:
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        score = item.get("score")
+        score_label = ""
+        if isinstance(score, (int, float)):
+            if 0 < score <= 1:
+                score_label = f"（{round(score * 100)}%）" if prefers_chinese else f" ({round(score * 100)}%)"
+            elif score > 1:
+                score_label = f"（{score:.1f}）" if prefers_chinese else f" ({score:.1f})"
+        if prefers_chinese:
+            parts.append(f"《{title}》{score_label}")
+        else:
+            parts.append(f'"{title}"{score_label}')
+    if not parts:
+        return ""
+    if prefers_chinese:
+        return "---\n> 📚 **参考知识库**：" + "、".join(parts)
+    return "---\n> 📚 **Knowledge Sources**: " + ", ".join(parts)
+
+
+def _format_chinese_tool_hint(
+    tool_name: str | None,
+    tool_input: dict[str, object] | None,
+    fallback_text: str,
+) -> str:
+    """将工具调用提示转换为符合中文业务语境的直观描述。"""
+    name = str(tool_name or "").strip()
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if name == "internal_api_request":
+        path = str(inp.get("path") or "").strip()
+        lowered = path.lower()
+        body = inp.get("body") if isinstance(inp.get("body"), dict) else {}
+        params = inp.get("params") if isinstance(inp.get("params"), dict) else {}
+        if "kb/recall" in lowered:
+            query = str(body.get("query") or params.get("query") or "").strip()
+            if query:
+                short_q = query if len(query) <= 36 else query[:35] + "…"
+                return f"🛠️ 正在检索企业知识库：「{short_q}」"
+            return "🛠️ 正在检索企业知识库…"
+        if "kb/ingest" in lowered:
+            return "🛠️ 正在沉淀经验至企业知识库…"
+        if "boardmemo" in lowered:
+            if "insert" in lowered or "update" in lowered:
+                return "🛠️ 正在保存白板纪要记录…"
+            return "🛠️ 正在查询白板纪要数据…"
+        if "productionissue" in lowered:
+            if any(k in lowered for k in ("insert", "assign", "resolve", "verify")):
+                return "🛠️ 正在提交生产现场问题记录…"
+            return "🛠️ 正在查询生产现场问题数据…"
+    if fallback_text.startswith("Using "):
+        return "🛠️ " + fallback_text.replace("Using ", "正在使用 ", 1)
+    return fallback_text if fallback_text.startswith("🛠️ ") else f"🛠️ {fallback_text}"
+
+
 def _format_channel_progress(
     *,
     channel: str,
@@ -1038,8 +1407,11 @@ def _format_channel_progress(
     compact_phase: str | None = None,
     compact_trigger: str | None = None,
     attempt: int | None = None,
+    tool_name: str | None = None,
+    tool_input: dict[str, object] | None = None,
 ) -> str:
-    if channel not in {
+    base_channel = str(channel or "").split(":", 1)[0]
+    if base_channel not in {
         "feishu",
         "telegram",
         "slack",
@@ -1052,7 +1424,7 @@ def _format_channel_progress(
         "wechat",
     }:
         return text
-    prefers_chinese = _prefers_chinese_progress(content)
+    prefers_chinese = _prefers_chinese_progress(content) or base_channel == "dingtalk"
     if kind == "thinking":
         seed = f"{session_key}|{content}".encode("utf-8")
         phrases = _CHANNEL_THINKING_PHRASES if prefers_chinese else _CHANNEL_THINKING_PHRASES_EN
@@ -1060,9 +1432,7 @@ def _format_channel_progress(
         return phrases[idx]
     if kind == "tool_hint":
         if prefers_chinese:
-            if text.startswith("Using "):
-                return "🛠️ " + text.replace("Using ", "正在使用 ", 1)
-            return f"🛠️ {text}"
+            return _format_chinese_tool_hint(tool_name, tool_input, text)
         return text if text.startswith("🛠️ ") else f"🛠️ {text}"
     if kind == "image_fallback":
         if prefers_chinese:
@@ -1108,7 +1478,9 @@ def _format_channel_progress(
             if compact_phase == "session_memory_start":
                 return "🧠 Let me quickly condense the earlier parts of this chat, then I’ll keep going."
             if compact_trigger == "reactive":
-                return "🧠 The context is too large for this turn. I’ll compact the memory and retry."
+                return (
+                    "🧠 The context is too large for this turn. I’ll compact the memory and retry."
+                )
             return "🧠 This chat is getting long. I’ll compact the memory and keep going."
         if compact_phase == "compact_retry":
             suffix = f" (attempt {attempt})" if attempt is not None else ""
@@ -1200,9 +1572,7 @@ def _agent_stores_images_as_attachments(agent_def: AgentDefinition | None) -> bo
     if agent_def is None:
         return False
     skills = {
-        str(skill).strip().lower()
-        for skill in (agent_def.skills or [])
-        if str(skill).strip()
+        str(skill).strip().lower() for skill in (agent_def.skills or []) if str(skill).strip()
     }
     return skills == {"production-site-issue"}
 
@@ -1264,8 +1634,7 @@ def _image_input_retry_reason(
 
 def _history_has_image_blocks(messages: list[ConversationMessage]) -> bool:
     return any(
-        any(isinstance(block, ImageBlock) for block in message.content)
-        for message in messages
+        any(isinstance(block, ImageBlock) for block in message.content) for message in messages
     )
 
 
@@ -1338,11 +1707,7 @@ def _image_fallback_note(
     note = _INVALID_IMAGE_FALLBACK_NOTE_PREFIX if invalid else _IMAGE_FALLBACK_NOTE_PREFIX
     note += f": {sources}." if sources else "."
     if include_guidance:
-        note += (
-            _INVALID_IMAGE_FALLBACK_NOTE_GUIDANCE
-            if invalid
-            else _IMAGE_FALLBACK_NOTE_GUIDANCE
-        )
+        note += _INVALID_IMAGE_FALLBACK_NOTE_GUIDANCE if invalid else _IMAGE_FALLBACK_NOTE_GUIDANCE
     return note + "]"
 
 
@@ -1368,7 +1733,9 @@ def _build_speaker_context(message: InboundMessage) -> str:
 
 def _build_attachment_notes(media_paths: list[str]) -> str:
     """Build textual attachment notes for non-image context and persistence."""
-    non_image_paths = [media_path for media_path in media_paths if not _is_image_attachment(media_path)]
+    non_image_paths = [
+        media_path for media_path in media_paths if not _is_image_attachment(media_path)
+    ]
     if not non_image_paths:
         return ""
     lines = [
@@ -1444,7 +1811,9 @@ def _decode_text_preview(data: bytes) -> str | None:
         decoded = data.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    printable = sum(1 for char in decoded if char in string.printable or char.isprintable() or char in "\n\r\t")
+    printable = sum(
+        1 for char in decoded if char in string.printable or char.isprintable() or char in "\n\r\t"
+    )
     if printable / max(len(decoded), 1) < 0.9:
         return None
     normalized = " ".join(decoded.split())

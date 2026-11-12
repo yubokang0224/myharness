@@ -87,12 +87,7 @@ def _jwt_profiles() -> tuple[_JwtProfile, ...]:
     )
     profiles = [os_profile]
     mes_config = resolve_mes_workspace_config(getattr(_state, "workspace", None))
-    if (
-        mes_config.enabled
-        and mes_config.secret_key
-        and mes_config.issuer
-        and mes_config.audience
-    ):
+    if mes_config.enabled and mes_config.secret_key and mes_config.issuer and mes_config.audience:
         profiles.append(
             _JwtProfile(
                 source="mes",
@@ -132,7 +127,9 @@ def _claim_is_admin(payload: dict[str, Any]) -> bool:
     roles = payload.get("roles")
     if isinstance(roles, (list, tuple, set)):
         candidates.extend(roles)
-    return any(str(value).strip().lower() in admin_values for value in candidates if value is not None)
+    return any(
+        str(value).strip().lower() in admin_values for value in candidates if value is not None
+    )
 
 
 def principal_from_claims(payload: dict[str, Any], *, source: str) -> Principal:
@@ -305,7 +302,9 @@ async def _authorize_workspace_access(auth: AuthContext) -> AuthContext:
     if not isinstance(permissions, list) or required_permission not in {
         str(value) for value in permissions
     }:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="AI workspace access denied")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="AI workspace access denied"
+        )
     return auth
 
 
@@ -340,6 +339,7 @@ async def get_optional_auth_context(
 # Optional auth (allows unauthenticated during development)
 # ---------------------------------------------------------------------------
 
+
 async def get_optional_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> dict[str, Any] | None:
@@ -356,16 +356,27 @@ async def get_optional_user(
 # Singleton runtime holders (populated at startup in api.py)
 # ---------------------------------------------------------------------------
 
+
 class _RuntimeState:
-    task_manager: Any = None          # BackgroundTaskManager
-    mcp_manager: Any = None           # McpClientManager
-    skill_registry: Any = None        # SkillRegistry
+    task_manager: Any = None  # BackgroundTaskManager
+    mcp_manager: Any = None  # McpClientManager
+    skill_registry: Any = None  # SkillRegistry
     disabled_skills: set[str] = set()
     # session storage
     workspace: str | None = None
+
 
 _state = _RuntimeState()
 
 
 def get_runtime() -> _RuntimeState:
     return _state
+
+
+async def require_agent_admin(
+    auth: Annotated[AuthContext, Depends(get_auth_context)],
+) -> dict[str, Any]:
+    principal = auth.principal or principal_from_user_claims(auth.user)
+    if principal.source != "os" or not principal.is_admin:
+        raise HTTPException(status_code=403, detail="仅管理员可以修改或查看智能体配置")
+    return auth.user

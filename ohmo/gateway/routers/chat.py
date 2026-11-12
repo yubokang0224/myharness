@@ -81,6 +81,7 @@ _AUTH_CONFIG_ERROR_MESSAGE = (
 _abort_events: dict[str, tuple[str | None, asyncio.Event]] = {}
 _attachment_upload_locks: dict[str, asyncio.Lock] = {}
 
+
 # ---------------------------------------------------------------------------
 # In-process permission approval registry (keyed by request_id)
 # ---------------------------------------------------------------------------
@@ -109,22 +110,33 @@ async def list_available_agents(
             "name": definition.name,
             "description": definition.description,
             "color": definition.color,
+            "kind": getattr(definition, "kind", "expert") or "expert",
+            "member_ids": list(getattr(definition, "member_ids", None) or []),
+            "welcome_message": getattr(definition, "welcome_message", None),
             "status": "idle",
         }
         for definition in definitions
     ]
+
+
 _session_allowed_tools: dict[str, set[str]] = {}
 
 _EMPTY_ASSISTANT_MESSAGE = (
-    "Model returned an empty assistant message. "
-    "The turn was ignored to keep the session healthy."
+    "Model returned an empty assistant message. The turn was ignored to keep the session healthy."
 )
 _EMPTY_ASSISTANT_SYNC_ERROR = (
     "Model returned no visible content. Check server logs for empty-response diagnostics."
 )
 
 _ARTIFACT_PREVIEW_KINDS = {"code", "text", "markdown", "html", "pdf", "word", "image", "binary"}
-_LEGACY_PATH_TOOLS = {"write_file", "file_write", "edit_file", "file_edit", "todo_write", "notebook_edit"}
+_LEGACY_PATH_TOOLS = {
+    "write_file",
+    "file_write",
+    "edit_file",
+    "file_edit",
+    "todo_write",
+    "notebook_edit",
+}
 _LEGACY_OUTPUT_PREFIXES = (
     "Updated notebook cell ",
     "Wrote ",
@@ -133,7 +145,9 @@ _LEGACY_OUTPUT_PREFIXES = (
     "Saved ",
     "Generated ",
 )
-_LEGACY_PATH_LABEL_RE = re.compile(r"^\s*(?:路径|path|file|output)\s*[:：]\s*(?P<path>.+?)\s*$", re.IGNORECASE)
+_LEGACY_PATH_LABEL_RE = re.compile(
+    r"^\s*(?:路径|path|file|output)\s*[:：]\s*(?P<path>.+?)\s*$", re.IGNORECASE
+)
 
 _FILE_LINK_GUIDANCE = (
     "\n\n[生成文件引用规范]\n"
@@ -150,8 +164,22 @@ def _safe_attachment_filename(filename: str | None) -> str:
 
 
 _MES_ATTACHMENT_EXTENSIONS = {
-    ".bmp", ".csv", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".md",
-    ".ods", ".pdf", ".png", ".ppt", ".pptx", ".txt", ".webp", ".xls",
+    ".bmp",
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".md",
+    ".ods",
+    ".pdf",
+    ".png",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".webp",
+    ".xls",
     ".xlsx",
 }
 _MES_ZIP_DOCUMENT_EXTENSIONS = {".docx", ".ods", ".pptx", ".xlsx"}
@@ -205,24 +233,40 @@ def _validate_mes_attachment_content(
                 names = {entry.filename.replace("\\", "/").lower() for entry in entries}
                 expanded_bytes = sum(max(0, entry.file_size) for entry in entries)
                 if any(entry.flag_bits & 0x1 for entry in entries):
-                    raise HTTPException(status_code=415, detail="Encrypted Office files are not supported")
+                    raise HTTPException(
+                        status_code=415, detail="Encrypted Office files are not supported"
+                    )
                 if max_expanded_bytes > 0 and expanded_bytes > max_expanded_bytes:
-                    raise HTTPException(status_code=413, detail="Expanded attachment exceeds size limit")
-                if any(name.endswith("/vbaproject.bin") or name == "vbaproject.bin" for name in names):
-                    raise HTTPException(status_code=415, detail="Macro-enabled Office files are not supported")
+                    raise HTTPException(
+                        status_code=413, detail="Expanded attachment exceeds size limit"
+                    )
+                if any(
+                    name.endswith("/vbaproject.bin") or name == "vbaproject.bin" for name in names
+                ):
+                    raise HTTPException(
+                        status_code=415, detail="Macro-enabled Office files are not supported"
+                    )
                 if extension == ".docx":
-                    valid = "[content_types].xml" in names and any(name.startswith("word/") for name in names)
+                    valid = "[content_types].xml" in names and any(
+                        name.startswith("word/") for name in names
+                    )
                 elif extension == ".xlsx":
-                    valid = "[content_types].xml" in names and any(name.startswith("xl/") for name in names)
+                    valid = "[content_types].xml" in names and any(
+                        name.startswith("xl/") for name in names
+                    )
                 elif extension == ".pptx":
-                    valid = "[content_types].xml" in names and any(name.startswith("ppt/") for name in names)
+                    valid = "[content_types].xml" in names and any(
+                        name.startswith("ppt/") for name in names
+                    )
                 else:
                     valid = "content.xml" in names or "mimetype" in names
         except zipfile.BadZipFile:
             valid = False
 
     if not valid:
-        raise HTTPException(status_code=415, detail="Attachment content does not match its file type")
+        raise HTTPException(
+            status_code=415, detail="Attachment content does not match its file type"
+        )
 
 
 def _principal_for_auth(auth: AuthContext | dict[str, Any]) -> Principal:
@@ -311,8 +355,7 @@ def _can_access_snapshot(principal: Principal, snap: dict[str, Any] | None) -> b
     if not owner_source or not owner_subject:
         return principal.source == "os"
     return bool(
-        _owner_source_matches(principal, owner_source)
-        and str(owner_subject) == principal.subject
+        _owner_source_matches(principal, owner_source) and str(owner_subject) == principal.subject
     )
 
 
@@ -550,18 +593,18 @@ def _kb_preference_note(body: MessageRequest) -> str:
     if not kb.enabled:
         return (
             "\n\n[知识库检索设置]（仅本条消息生效）用户已关闭知识库检索："
-            "不要调用知识库检索接口（Kb/Recall），直接基于对话内容和自身知识回答。"
+            "不要调用知识库检索工具（kb_search 或 Kb/Recall），直接基于对话内容和自身知识回答。"
         )
     namespaces = ", ".join(name for name in kb.namespaces if name)
     if namespaces:
         return (
             f"\n\n[知识库检索设置]（仅本条消息生效）用户已启用知识库检索，指定知识库：{namespaces}。"
-            f"回答涉及事实、规范、参数或历史经验时，先按 knowledge-base 技能调用 Kb/Recall"
-            f"（namespaces 填 [{namespaces}]）再作答，并标注引用来源。"
+            f"回答涉及企业规章制度、工艺参数、电气/机械标准、培训规范或历史经验时，请优先调用 `kb_search` 工具"
+            f"（或 `Kb/Recall`，namespaces 填 [{namespaces}]）检索后再作答，并在回复中明确标注参考文档标题与章节/页码。"
         )
     return (
-        "\n\n[知识库检索设置]（仅本条消息生效）用户已启用知识库检索（未指定知识库，使用当前智能体的默认知识库）。"
-        "回答涉及事实、规范、参数或历史经验时，先按 knowledge-base 技能检索再作答，并标注引用来源。"
+        "\n\n[知识库检索设置]（仅本条消息生效）用户已启用知识库检索（默认检索正式企业知识库 official_kb）。"
+        "回答涉及企业规章制度、工艺参数、电气/机械标准、培训规范或历史经验时，请优先调用 `kb_search` 工具检索后再作答，并在回复中明确标注参考文档标题与章节/页码。"
     )
 
 
@@ -624,9 +667,7 @@ def _spill_oversized_input(
     )
     if attachment_notes:
         replacement = f"{replacement}\n\n{attachment_notes}"
-    note = (
-        f"输入约 {estimated:,} tokens，已转存为文件 {spill_path.name}，智能体将按需分段读取。"
-    )
+    note = f"输入约 {estimated:,} tokens，已转存为文件 {spill_path.name}，智能体将按需分段读取。"
     logger.info(
         "Spilled oversized input for session %s: ~%d tokens -> %s",
         session_id,
@@ -782,7 +823,7 @@ def _legacy_path_from_output_line(line: str) -> str | None:
     for prefix in _LEGACY_OUTPUT_PREFIXES:
         if not stripped.startswith(prefix):
             continue
-        raw = stripped[len(prefix):]
+        raw = stripped[len(prefix) :]
         if prefix == "Updated notebook cell ":
             _, _, raw = stripped.partition(" in ")
         return raw.strip().strip("'\"`")
@@ -859,7 +900,9 @@ def _artifacts_from_tool_completion(
     for raw_artifact in raw_artifacts:
         if not isinstance(raw_artifact, dict):
             continue
-        artifact = _artifact_from_metadata(raw_artifact, tool_name=tool_name, tool_use_id=None, roots=roots)
+        artifact = _artifact_from_metadata(
+            raw_artifact, tool_name=tool_name, tool_use_id=None, roots=roots
+        )
         if artifact is None or artifact.path in seen:
             continue
         seen.add(artifact.path)
@@ -867,7 +910,9 @@ def _artifacts_from_tool_completion(
     return artifacts
 
 
-def _collect_artifacts_from_snapshot(snap: dict[str, Any], runtime: _RuntimeState) -> list[ArtifactInfo]:
+def _collect_artifacts_from_snapshot(
+    snap: dict[str, Any], runtime: _RuntimeState
+) -> list[ArtifactInfo]:
     roots = _safe_artifact_roots(snap, runtime)
     try:
         cwd = Path(snap.get("cwd") or runtime.workspace or Path.cwd()).expanduser().resolve()
@@ -887,18 +932,24 @@ def _collect_artifacts_from_snapshot(snap: dict[str, Any], runtime: _RuntimeStat
                 if tool_use_id:
                     tool_uses[tool_use_id] = {
                         "tool_name": block.get("name"),
-                        "tool_input": block.get("input") if isinstance(block.get("input"), dict) else {},
+                        "tool_input": block.get("input")
+                        if isinstance(block.get("input"), dict)
+                        else {},
                     }
             elif block.get("type") == "tool_result" and not block.get("is_error"):
                 metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-                raw_artifacts = metadata.get("artifacts") if isinstance(metadata.get("artifacts"), list) else []
+                raw_artifacts = (
+                    metadata.get("artifacts") if isinstance(metadata.get("artifacts"), list) else []
+                )
                 tool_use_id = str(block.get("tool_use_id") or "")
                 tool_info = tool_uses.get(tool_use_id, {})
                 tool_name = tool_info.get("tool_name")
                 if not raw_artifacts:
                     raw_artifacts = _legacy_artifacts_from_tool(
                         tool_name=str(tool_name) if tool_name else None,
-                        tool_input=tool_info.get("tool_input") if isinstance(tool_info.get("tool_input"), dict) else {},
+                        tool_input=tool_info.get("tool_input")
+                        if isinstance(tool_info.get("tool_input"), dict)
+                        else {},
                         output=str(block.get("content") or ""),
                         cwd=cwd,
                         roots=roots,
@@ -933,7 +984,9 @@ async def list_sessions(
     _user: Annotated[AuthContext, Depends(get_workspace_auth_context)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
     include_remote: bool = Query(False, description="Include sessions created by remote channels."),
-    channel: str | None = Query(None, description="Filter sessions by channel, e.g. web or dingtalk."),
+    channel: str | None = Query(
+        None, description="Filter sessions by channel, e.g. web or dingtalk."
+    ),
     agent_name: str | None = Query(None, description="Filter sessions by agent name."),
 ):
     """List all persisted sessions."""
@@ -1004,7 +1057,9 @@ async def create_session(
         raise HTTPException(status_code=401, detail="Authentication required")
     if _user is None and persist_mode == "session":
         raise HTTPException(status_code=401, detail="Authentication required for web sessions")
-    principal = _principal_for_auth(_user) if _user is not None else _anonymous_principal(session_id)
+    principal = (
+        _principal_for_auth(_user) if _user is not None else _anonymous_principal(session_id)
+    )
     if persist_mode != "none":
         try:
             save_session_snapshot(
@@ -1081,13 +1136,19 @@ async def get_messages(
         role = msg.get("role", "user")
         text = ""
         tool_calls: list[dict] = []
-        attachments: list[dict] = msg.get("attachments", []) if isinstance(msg.get("attachments"), list) else []
+        attachments: list[dict] = (
+            msg.get("attachments", []) if isinstance(msg.get("attachments"), list) else []
+        )
         has_explicit_attachments = bool(attachments)
         for block in msg.get("content", []):
             if isinstance(block, dict):
                 if block.get("type") == "text":
                     text += block.get("text", "")
-                elif block.get("type") == "image" and block.get("source_path") and not has_explicit_attachments:
+                elif (
+                    block.get("type") == "image"
+                    and block.get("source_path")
+                    and not has_explicit_attachments
+                ):
                     attachments.append(
                         {
                             "name": Path(str(block.get("source_path"))).name,
@@ -1114,7 +1175,11 @@ async def get_messages(
                             if call.get("tool_use_id") == target_id:
                                 call["output"] = block.get("content", "")
                                 call["is_error"] = bool(block.get("is_error", False))
-                                call["metadata"] = block.get("metadata", {}) if isinstance(block.get("metadata"), dict) else {}
+                                call["metadata"] = (
+                                    block.get("metadata", {})
+                                    if isinstance(block.get("metadata"), dict)
+                                    else {}
+                                )
                                 matched = True
                                 break
                         if matched:
@@ -1191,7 +1256,11 @@ async def get_artifact_content(
     snap = _load_authorized_session(runtime, session_id, _principal_for_auth(_user))
 
     artifact = next(
-        (item for item in _collect_artifacts_from_snapshot(snap, runtime) if item.id == artifact_id),
+        (
+            item
+            for item in _collect_artifacts_from_snapshot(snap, runtime)
+            if item.id == artifact_id
+        ),
         None,
     )
     if artifact is None:
@@ -1203,7 +1272,11 @@ async def get_artifact_content(
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             raise HTTPException(status_code=404, detail="Artifact not found") from None
-        media_type = "text/html; charset=utf-8" if artifact.preview_kind == "html" else "text/plain; charset=utf-8"
+        media_type = (
+            "text/html; charset=utf-8"
+            if artifact.preview_kind == "html"
+            else "text/plain; charset=utf-8"
+        )
         return PlainTextResponse(text, media_type=media_type)
 
     return FileResponse(
@@ -1348,6 +1421,7 @@ async def delete_attachment(
 # SSE streaming message endpoint
 # ---------------------------------------------------------------------------
 
+
 @router.post("/{session_id}/messages")
 async def send_message(
     session_id: str,
@@ -1407,12 +1481,16 @@ async def send_message(
                     from openharness.permissions import PermissionChecker
 
                     settings_for_session.permission.allowed_tools = list(
-                        dict.fromkeys([
-                            *settings_for_session.permission.allowed_tools,
-                            *_session_allowed_tools.get(session_id, set()),
-                        ])
+                        dict.fromkeys(
+                            [
+                                *settings_for_session.permission.allowed_tools,
+                                *_session_allowed_tools.get(session_id, set()),
+                            ]
+                        )
                     )
-                    engine_for_session.set_permission_checker(PermissionChecker(settings_for_session.permission))
+                    engine_for_session.set_permission_checker(
+                        PermissionChecker(settings_for_session.permission)
+                    )
             return approval.approved
         except asyncio.TimeoutError:
             return False
@@ -1462,18 +1540,20 @@ async def send_message(
 
                     agent_def = get_agent_definition(agent_name)
                     if agent_def is not None:
-                        settings = settings.merge_cli_overrides(
-                            model=agent_def.model if agent_def.model and agent_def.model != "inherit" else None,
-                            system_prompt=agent_def.system_prompt,
-                            permission_mode=agent_def.permission_mode,
-                            max_turns=agent_def.max_turns,
-                        )
-                except Exception:
+                        from openharness.config.model_catalog import resolve_agent_settings
+
+                        settings = resolve_agent_settings(settings, agent_def)
+                except Exception as exc:
                     logger.exception("Failed to apply agent definition for %s", agent_name)
+                    raise HTTPException(
+                        status_code=400, detail="助手模型配置无效，请联系管理员"
+                    ) from exc
             try:
                 api_client = _resolve_api_client_from_settings(settings)
             except SystemExit:
-                logger.warning("Model provider authentication is not configured for session %s", session_id)
+                logger.warning(
+                    "Model provider authentication is not configured for session %s", session_id
+                )
                 await sse_queue.put(
                     _sse_line(SSEError(message=_AUTH_CONFIG_ERROR_MESSAGE, recoverable=False))
                 )
@@ -1486,14 +1566,47 @@ async def send_message(
             )
             await mcp_manager.connect_all()
             tool_metadata["mcp_manager"] = mcp_manager
+            if agent_name:
+                tool_metadata["active_agent_name"] = agent_name
+
+            from ohmo.gateway.routers.teams import (
+                build_team_roster_prompt_suffix,
+                extract_mentioned_experts,
+            )
+
+            async def _team_status_cb(status_text: str) -> None:
+                await sse_queue.put(_sse_line(SSEStatus(message=status_text)))
+
+            is_team_session = agent_def is not None and getattr(agent_def, "kind", "expert") == "team"
+            mentioned_in_turn: list[str] = []
+            if is_team_session:
+                tool_metadata["team_name"] = agent_def.name
+                tool_metadata["team_member_ids"] = list(getattr(agent_def, "member_ids", None) or [])
+                tool_metadata["team_status_callback"] = _team_status_cb
+            else:
+                current_agent_name = getattr(agent_def, "name", "") if agent_def is not None else ""
+                mentioned_in_turn = [
+                    m for m in extract_mentioned_experts(body.content) if m != current_agent_name
+                ]
+                if mentioned_in_turn:
+                    tool_metadata["team_name"] = current_agent_name or "协同会话"
+                    tool_metadata["team_member_ids"] = mentioned_in_turn
+                    tool_metadata["team_status_callback"] = _team_status_cb
+
             tool_registry = create_default_tool_registry(mcp_manager)
             apply_agent_tool_policy(tool_registry, agent_def)
+            if mentioned_in_turn and "ask_agent" not in getattr(tool_registry, "_tools", {}):
+                from openharness.tools.team_collab_tools import AskAgentTool
+
+                tool_registry.register(AskAgentTool())
             if session_id in _session_allowed_tools:
                 settings.permission.allowed_tools = list(
-                    dict.fromkeys([
-                        *settings.permission.allowed_tools,
-                        *_session_allowed_tools.get(session_id, set()),
-                    ])
+                    dict.fromkeys(
+                        [
+                            *settings.permission.allowed_tools,
+                            *_session_allowed_tools.get(session_id, set()),
+                        ]
+                    )
                 )
             settings_holder["settings"] = settings
             permission_checker = PermissionChecker(settings.permission)
@@ -1512,6 +1625,7 @@ async def send_message(
                     logger.exception("Failed to resolve agent cwd for %s", agent_name)
 
             from openharness.prompts.context import build_runtime_system_prompt
+
             attachment_notes = _build_attachment_notes(body.attachments, effective_cwd)
             user_text = _prepare_user_text(body, attachment_notes)
 
@@ -1525,11 +1639,17 @@ async def send_message(
             if spill_note:
                 await sse_queue.put(_sse_line(SSEStatus(message=spill_note)))
 
-            system_prompt = build_runtime_system_prompt(
-                settings,
-                cwd=effective_cwd,
-                latest_user_prompt=user_text,
-            ) + _FILE_LINK_GUIDANCE + _kb_preference_note(body)
+            team_roster_suffix = build_team_roster_prompt_suffix(agent_def, user_text=body.content)
+            system_prompt = (
+                build_runtime_system_prompt(
+                    settings,
+                    cwd=effective_cwd,
+                    latest_user_prompt=user_text,
+                )
+                + team_roster_suffix
+                + _FILE_LINK_GUIDANCE
+                + _kb_preference_note(body)
+            )
 
             budget_error = _input_budget_error(
                 user_text=user_text,
@@ -1550,18 +1670,24 @@ async def send_message(
                 )
                 if spill_note:
                     await sse_queue.put(_sse_line(SSEStatus(message=spill_note)))
-                    system_prompt = build_runtime_system_prompt(
-                        settings,
-                        cwd=effective_cwd,
-                        latest_user_prompt=user_text,
-                    ) + _FILE_LINK_GUIDANCE + _kb_preference_note(body)
+                    system_prompt = (
+                        build_runtime_system_prompt(
+                            settings,
+                            cwd=effective_cwd,
+                            latest_user_prompt=user_text,
+                        )
+                        + _FILE_LINK_GUIDANCE
+                        + _kb_preference_note(body)
+                    )
                     budget_error = _input_budget_error(
                         user_text=user_text,
                         system_prompt=system_prompt,
                         settings=settings,
                     )
             if budget_error:
-                logger.warning("Rejected oversized input for session %s: %s", session_id, budget_error)
+                logger.warning(
+                    "Rejected oversized input for session %s: %s", session_id, budget_error
+                )
                 await sse_queue.put(_sse_line(SSEError(message=budget_error, recoverable=True)))
                 return
 
@@ -1575,7 +1701,8 @@ async def send_message(
                 model=settings.model,
                 system_prompt=system_prompt,
                 max_tokens=settings.max_tokens,
-                context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
+                context_window_tokens=settings.context_window_tokens
+                or settings.memory.context_window_tokens,
                 auto_compact_threshold_tokens=(
                     settings.auto_compact_threshold_tokens
                     or settings.memory.auto_compact_threshold_tokens
@@ -1590,7 +1717,10 @@ async def send_message(
             try:
                 if snap and snap.get("messages"):
                     from openharness.engine.messages import ConversationMessage
-                    msgs = [ConversationMessage(**m) for m in snap["messages"] if isinstance(m, dict)]
+
+                    msgs = [
+                        ConversationMessage(**m) for m in snap["messages"] if isinstance(m, dict)
+                    ]
                     engine.load_messages(msgs)
             except Exception:
                 pass
@@ -1616,7 +1746,9 @@ async def send_message(
             turn_recorded = False
             async for event in engine.submit_message(user_message):
                 if abort_event.is_set():
-                    await sse_queue.put(_sse_line(SSEError(message="Generation aborted", recoverable=True)))
+                    await sse_queue.put(
+                        _sse_line(SSEError(message="Generation aborted", recoverable=True))
+                    )
                     break
 
                 if isinstance(event, AssistantTextDelta):
@@ -1632,7 +1764,11 @@ async def send_message(
                             "metadata": None,
                         }
                     )
-                    await sse_queue.put(_sse_line(SSEToolCall(tool_name=event.tool_name, tool_input=event.tool_input)))
+                    await sse_queue.put(
+                        _sse_line(
+                            SSEToolCall(tool_name=event.tool_name, tool_input=event.tool_input)
+                        )
+                    )
                 elif isinstance(event, ToolExecutionCompleted):
                     matched_tool_input: dict[str, Any] = {}
                     for call in reversed(tool_calls):
@@ -1671,7 +1807,12 @@ async def send_message(
                         pass
                     try:
                         from openharness.api.usage import UsageSnapshot
-                        usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+
+                        usage_snap = (
+                            engine.total_usage
+                            if hasattr(engine, "total_usage")
+                            else UsageSnapshot()
+                        )
                         if not isinstance(usage_snap, UsageSnapshot):
                             usage_snap = UsageSnapshot()
                         if persist_mode == "session":
@@ -1740,14 +1881,25 @@ async def send_message(
                 elif isinstance(event, ErrorEvent):
                     if event.message == _EMPTY_ASSISTANT_MESSAGE:
                         await sse_queue.put(
-                            _sse_line(SSEStatus(message="模型返回了空回复，本轮已跳过，未写入会话。"))
+                            _sse_line(
+                                SSEStatus(message="模型返回了空回复，本轮已跳过，未写入会话。")
+                            )
                         )
                         await sse_queue.put(_sse_line(SSEDone(usage=None)))
                     else:
-                        if not event.recoverable and not turn_recorded and persist_mode in ("session", "log"):
+                        if (
+                            not event.recoverable
+                            and not turn_recorded
+                            and persist_mode in ("session", "log")
+                        ):
                             try:
                                 from openharness.api.usage import UsageSnapshot
-                                usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+
+                                usage_snap = (
+                                    engine.total_usage
+                                    if hasattr(engine, "total_usage")
+                                    else UsageSnapshot()
+                                )
                                 if not isinstance(usage_snap, UsageSnapshot):
                                     usage_snap = UsageSnapshot()
                                 channel = "web" if persist_mode == "session" else "api"
@@ -1774,8 +1926,14 @@ async def send_message(
                                 )
                                 turn_recorded = True
                             except Exception:
-                                logger.exception("Failed to persist error invocation for %s", session_id)
-                        await sse_queue.put(_sse_line(SSEError(message=event.message, recoverable=event.recoverable)))
+                                logger.exception(
+                                    "Failed to persist error invocation for %s", session_id
+                                )
+                        await sse_queue.put(
+                            _sse_line(
+                                SSEError(message=event.message, recoverable=event.recoverable)
+                            )
+                        )
                 elif isinstance(event, CompactProgressEvent):
                     if event.message:
                         status_messages.append(f"[compact:{event.phase}] {event.message}")
@@ -1961,19 +2119,21 @@ async def send_message_sync(
 
                 agent_def = get_agent_definition(agent_name)
                 if agent_def is not None:
-                    settings = settings.merge_cli_overrides(
-                        model=agent_def.model if agent_def.model and agent_def.model != "inherit" else None,
-                        system_prompt=agent_def.system_prompt,
-                        permission_mode=agent_def.permission_mode,
-                        max_turns=agent_def.max_turns,
-                    )
-            except Exception:
+                    from openharness.config.model_catalog import resolve_agent_settings
+
+                    settings = resolve_agent_settings(settings, agent_def)
+            except Exception as exc:
                 logger.exception("Failed to apply agent definition for %s", agent_name)
+                raise HTTPException(
+                    status_code=400, detail="助手模型配置无效，请联系管理员"
+                ) from exc
 
         try:
             api_client = _resolve_api_client_from_settings(settings)
         except SystemExit:
-            logger.warning("Model provider authentication is not configured for session %s", session_id)
+            logger.warning(
+                "Model provider authentication is not configured for session %s", session_id
+            )
             _persist_error_invocation(_AUTH_CONFIG_ERROR_MESSAGE)
             return MessageSyncResponse(
                 session_id=session_id,
@@ -1994,14 +2154,18 @@ async def send_message_sync(
         )
         await mcp_manager.connect_all()
         tool_metadata["mcp_manager"] = mcp_manager
+        if agent_name:
+            tool_metadata["active_agent_name"] = agent_name
         tool_registry = create_default_tool_registry(mcp_manager)
         apply_agent_tool_policy(tool_registry, agent_def)
         if session_id in _session_allowed_tools:
             settings.permission.allowed_tools = list(
-                dict.fromkeys([
-                    *settings.permission.allowed_tools,
-                    *_session_allowed_tools.get(session_id, set()),
-                ])
+                dict.fromkeys(
+                    [
+                        *settings.permission.allowed_tools,
+                        *_session_allowed_tools.get(session_id, set()),
+                    ]
+                )
             )
         permission_checker = PermissionChecker(settings.permission)
 
@@ -2087,7 +2251,8 @@ async def send_message_sync(
             model=settings.model,
             system_prompt=system_prompt,
             max_tokens=settings.max_tokens,
-            context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
+            context_window_tokens=settings.context_window_tokens
+            or settings.memory.context_window_tokens,
             auto_compact_threshold_tokens=(
                 settings.auto_compact_threshold_tokens
                 or settings.memory.auto_compact_threshold_tokens
@@ -2155,7 +2320,9 @@ async def send_message_sync(
                 except Exception:
                     usage_dict = None
                 try:
-                    usage_snap = engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+                    usage_snap = (
+                        engine.total_usage if hasattr(engine, "total_usage") else UsageSnapshot()
+                    )
                     if not isinstance(usage_snap, UsageSnapshot):
                         usage_snap = UsageSnapshot()
                     response_text = "".join(text_parts).strip()

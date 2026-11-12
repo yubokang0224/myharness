@@ -51,3 +51,5 @@ tests/test_ohmo/*
 !tests/test_ohmo/test_mes_agent_mvp_security.py
 !tests/test_ohmo/test_board_image_recognition_worker.py
 docs/
+engine-eli5.html
+architecture-eli5.html

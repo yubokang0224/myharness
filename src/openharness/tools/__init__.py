@@ -21,6 +21,7 @@ from openharness.tools.glob_tool import GlobTool
 from openharness.tools.grep_tool import GrepTool
 from openharness.tools.image_to_text_tool import ImageToTextTool
 from openharness.tools.internal_api_request_tool import InternalApiRequestTool
+from openharness.tools.kb_search_tool import KbSearchTool
 from openharness.tools.list_mcp_resources_tool import ListMcpResourcesTool
 from openharness.tools.lsp_tool import LspTool
 from openharness.tools.mcp_auth_tool import McpAuthTool
@@ -39,6 +40,7 @@ from openharness.tools.task_stop_tool import TaskStopTool
 from openharness.tools.task_update_tool import TaskUpdateTool
 from openharness.tools.team_create_tool import TeamCreateTool
 from openharness.tools.team_delete_tool import TeamDeleteTool
+from openharness.tools.team_collab_tools import AgentListTool, AskAgentTool
 from openharness.tools.todo_write_tool import TodoWriteTool
 from openharness.tools.tool_search_tool import ToolSearchTool
 from openharness.tools.web_fetch_tool import WebFetchTool
@@ -61,6 +63,7 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         GrepTool(),
         ImageToTextTool(),
         InternalApiRequestTool(),
+        KbSearchTool(),
         SkillTool(),
         ToolSearchTool(),
         WebFetchTool(),
@@ -88,6 +91,8 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         SendMessageTool(),
         TeamCreateTool(),
         TeamDeleteTool(),
+        AgentListTool(),
+        AskAgentTool(),
     ):
         registry.register(tool)
     if mcp_manager is not None:

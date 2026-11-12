@@ -28,6 +28,7 @@ from ohmo.gateway.config import build_channel_manager_config, load_gateway_confi
 from ohmo.gateway.models import GatewayState
 from ohmo.gateway.runtime import OhmoSessionRuntimePool
 from ohmo.workspace import (
+    get_gateway_config_path,
     get_gateway_restart_notice_path,
     get_logs_dir,
     get_state_path,
@@ -68,6 +69,64 @@ class OhmoGatewayService:
             restart_gateway=self.request_restart,
         )
         self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
+        self._manager_task: asyncio.Task[None] | None = None
+        self._last_config_sig = self._channel_config_signature(self._config)
+
+    @staticmethod
+    def _channel_config_signature(config: object) -> str:
+        return json.dumps(
+            {
+                "enabled_channels": getattr(config, "enabled_channels", []),
+                "channel_configs": getattr(config, "channel_configs", {}),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    async def _watch_config_loop(self) -> None:
+        """监听 gateway.json 变更并自动热重载消息通道（扫码绑定或切换智能体后立即生效）。"""
+        config_path = get_gateway_config_path(self._workspace)
+        last_mtime = config_path.stat().st_mtime_ns if config_path.exists() else 0
+        while True:
+            await asyncio.sleep(2.0)
+            try:
+                if not config_path.exists():
+                    continue
+                mtime = config_path.stat().st_mtime_ns
+                if mtime == last_mtime:
+                    continue
+                last_mtime = mtime
+                new_config = load_gateway_config(self._workspace)
+                new_sig = self._channel_config_signature(new_config)
+                if new_sig == self._last_config_sig:
+                    continue
+                logger.info(
+                    "ohmo gateway detected channel configuration update in gateway.json; hot-reloading channels..."
+                )
+                self._last_config_sig = new_sig
+                self._config = new_config
+                self._runtime_pool._gateway_config = new_config
+                old_task = self._manager_task
+                old_manager = self._manager
+                if old_task is not None and not old_task.done():
+                    old_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await old_task
+                await old_manager.stop_all()
+                self._manager = ChannelManager(build_channel_manager_config(self._config), self._bus)
+                self._manager_task = asyncio.create_task(
+                    self._manager.start_all(), name="ohmo-gateway-channels"
+                )
+                self.write_state(running=True)
+                logger.info(
+                    "ohmo gateway hot-reloaded channels successfully enabled=%s",
+                    self._config.enabled_channels,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("ohmo gateway failed to hot-reload gateway.json")
 
     @property
     def pid_file(self) -> Path:
@@ -173,7 +232,10 @@ class OhmoGatewayService:
         self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         self.write_state(running=True)
         bridge_task = asyncio.create_task(self._bridge.run(), name="ohmo-gateway-bridge")
-        manager_task = asyncio.create_task(self._manager.start_all(), name="ohmo-gateway-channels")
+        self._manager_task = asyncio.create_task(self._manager.start_all(), name="ohmo-gateway-channels")
+        config_watch_task = asyncio.create_task(
+            self._watch_config_loop(), name="ohmo-gateway-config-watcher"
+        )
         restart_notice_task = asyncio.create_task(
             self._publish_pending_restart_notice(),
             name="ohmo-gateway-restart-notice",
@@ -201,13 +263,18 @@ class OhmoGatewayService:
         finally:
             self._bridge.stop()
             bridge_task.cancel()
-            manager_task.cancel()
+            config_watch_task.cancel()
+            if self._manager_task is not None:
+                self._manager_task.cancel()
             if board_recognition_task is not None:
                 board_recognition_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await bridge_task
             with contextlib.suppress(asyncio.CancelledError):
-                await manager_task
+                await config_watch_task
+            if self._manager_task is not None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._manager_task
             if board_recognition_task is not None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await board_recognition_task

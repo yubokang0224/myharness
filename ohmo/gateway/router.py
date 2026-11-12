@@ -10,7 +10,11 @@ def session_key_for_message(message: InboundMessage) -> str:
     if message.session_key_override:
         return message.session_key_override
     sender_id = str(message.sender_id).strip() or "anonymous"
-    if message.channel == "dingtalk" or message.channel.startswith("dingtalk:"):
+    if (
+        message.channel in ("dingtalk", "feishu", "weixin", "wecom")
+        or message.channel.startswith(("dingtalk:", "feishu:", "weixin:", "wecom:"))
+        or message.metadata.get("default_agent")
+    ):
         agent = str(message.metadata.get("default_agent") or "default").strip() or "default"
         return f"{message.channel}:{agent}:{message.chat_id}:{sender_id}"
     thread_id = (

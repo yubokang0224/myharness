@@ -47,11 +47,24 @@ class DiscordConfig(BaseChannelConfig):
     token: str = ""
 
 
+class FeishuBotConfig(BaseChannelConfig):
+    name: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+    encrypt_key: str = ""
+    verification_token: str = ""
+    default_agent: str = ""
+    react_emoji: str = "THUMBSUP"
+
+
 class FeishuConfig(BaseChannelConfig):
     app_id: str = ""
     app_secret: str = ""
     encrypt_key: str = ""
     verification_token: str = ""
+    default_agent: str = ""
+    react_emoji: str = "THUMBSUP"
+    bots: list[FeishuBotConfig] = Field(default_factory=list)
 
 
 class DingTalkBotConfig(BaseChannelConfig):
@@ -76,6 +89,42 @@ class DingTalkConfig(BaseChannelConfig):
     board_business_domain: str = ""
     board_batch_quiet_seconds: int = Field(default=20, ge=5, le=300)
     bots: list[DingTalkBotConfig] = Field(default_factory=list)
+
+
+class WeixinBotConfig(BaseChannelConfig):
+    name: str = ""
+    account_id: str = ""
+    token: str = ""
+    base_url: str = "https://ilinkai.weixin.qq.com"
+    bot_uin: str = ""
+    user_id: str = ""
+    default_agent: str = ""
+
+
+class WeixinConfig(BaseChannelConfig):
+    account_id: str = ""
+    token: str = ""
+    base_url: str = "https://ilinkai.weixin.qq.com"
+    bot_uin: str = ""
+    user_id: str = ""
+    default_agent: str = ""
+    bots: list[WeixinBotConfig] = Field(default_factory=list)
+
+
+class WecomBotConfig(BaseChannelConfig):
+    name: str = ""
+    bot_id: str = ""
+    secret: str = ""
+    ws_url: str = "wss://openws.work.weixin.qq.com"
+    default_agent: str = ""
+
+
+class WecomConfig(BaseChannelConfig):
+    bot_id: str = ""
+    secret: str = ""
+    ws_url: str = "wss://openws.work.weixin.qq.com"
+    default_agent: str = ""
+    bots: list[WecomBotConfig] = Field(default_factory=list)
 
 
 class EmailConfig(BaseChannelConfig):
@@ -117,6 +166,8 @@ class ChannelConfigs(_CompatModel):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
+    weixin: WeixinConfig = Field(default_factory=WeixinConfig)
+    wecom: WecomConfig = Field(default_factory=WecomConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
@@ -127,4 +178,3 @@ class ChannelConfigs(_CompatModel):
 class Config(_CompatModel):
     channels: ChannelConfigs = Field(default_factory=ChannelConfigs)
     providers: ProviderConfigs = Field(default_factory=ProviderConfigs)
-

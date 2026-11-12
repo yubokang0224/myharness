@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Annotated
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from ohmo.gateway.dependencies import get_current_user, get_runtime, _RuntimeState
+from ohmo.gateway.dependencies import require_agent_admin, get_runtime, _RuntimeState
 from ohmo.gateway.schemas.agents import (
     AgentResponse,
     AgentToolInfo,
@@ -32,7 +33,22 @@ def _agents_dir() -> Path:
 
 
 def _agent_file(name: str) -> Path:
+    if not name.strip() or name in {".", ".."} or re.search(r'[<>:"/\\|?*\x00-\x1f]', name):
+        raise HTTPException(status_code=400, detail="智能体名称不能包含路径或特殊字符")
     return _agents_dir() / f"{name}.md"
+
+
+def _validate_model_binding(profile_name, model):
+    if not profile_name:
+        return
+    from openharness.config import load_settings
+    from openharness.config.model_catalog import profile_models
+
+    profile = load_settings().merged_profiles().get(profile_name)
+    if profile is None:
+        raise HTTPException(status_code=400, detail="选择的模型连接不存在")
+    if model and model != "inherit" and model not in {m.id for m in profile_models(profile)}:
+        raise HTTPException(status_code=400, detail="请先在模型连接中添加该模型")
 
 
 def _definition_to_response(defn) -> AgentResponse:
@@ -41,6 +57,7 @@ def _definition_to_response(defn) -> AgentResponse:
         description=defn.description or "",
         system_prompt=defn.system_prompt or "",
         model=defn.model,
+        provider_profile=defn.provider_profile,
         effort=str(defn.effort) if defn.effort is not None else None,
         permission_mode=defn.permission_mode,
         tools=defn.tools,
@@ -51,14 +68,18 @@ def _definition_to_response(defn) -> AgentResponse:
             for s in (defn.mcp_servers or [])
         ],
         color=defn.color,
+        avatar=getattr(defn, "avatar", None),
         max_turns=defn.max_turns,
         source=defn.source if defn.source in ("builtin", "user") else "user",
+        kind=getattr(defn, "kind", "expert") or "expert",
+        member_ids=list(getattr(defn, "member_ids", None) or []),
+        welcome_message=getattr(defn, "welcome_message", None),
     )
 
 
 @router.get("", response_model=list[AgentResponse])
 async def list_agents(
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """List all agents (builtin + user-defined, user overrides builtin of same name)."""
     from openharness.coordinator.agent_definitions import (
@@ -91,7 +112,7 @@ async def list_agents(
 
 @router.get("/running", response_model=list[RunningAgentInfo])
 async def list_running_agents(
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """List currently running agent instances from TeamRegistry."""
     from openharness.coordinator import get_team_registry
@@ -112,7 +133,7 @@ async def list_running_agents(
 
 @router.get("/tools", response_model=list[AgentToolInfo])
 async def list_agent_tools(
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
     runtime: Annotated[_RuntimeState, Depends(get_runtime)],
 ):
     """List tools that can be selected in an agent definition."""
@@ -134,7 +155,7 @@ async def list_agent_tools(
 @router.get("/{name}", response_model=AgentResponse)
 async def get_agent(
     name: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """Get a single agent definition by name. User override takes priority over builtin."""
     from openharness.coordinator.agent_definitions import (
@@ -160,9 +181,10 @@ async def get_agent(
 @router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
     body: CreateAgentRequest,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """Create a new user-defined agent (written to ~/.openharness/agents/)."""
+    _validate_model_binding(body.provider_profile, body.model)
     agent_file = _agent_file(body.name)
     if agent_file.exists():
         raise HTTPException(
@@ -175,6 +197,8 @@ async def create_agent(
         "description": body.description,
         "source": "user",
     }
+    if body.provider_profile:
+        frontmatter["provider_profile"] = body.provider_profile
     if body.model:
         frontmatter["model"] = body.model
     if body.effort:
@@ -191,26 +215,48 @@ async def create_agent(
         frontmatter["mcp_servers"] = body.mcp_servers
     if body.color:
         frontmatter["color"] = body.color
+    if body.avatar:
+        frontmatter["avatar"] = body.avatar
     if body.max_turns is not None:
         frontmatter["max_turns"] = body.max_turns
+    if body.kind and body.kind != "expert":
+        frontmatter["kind"] = body.kind
+    if body.member_ids:
+        frontmatter["member_ids"] = body.member_ids
+    if body.welcome_message:
+        frontmatter["welcome_message"] = body.welcome_message
 
-    content = f"---\n{yaml.dump(frontmatter, allow_unicode=True)}---\n\n{body.system_prompt or ''}"
+    effective_prompt = body.system_prompt or ""
+    if body.kind == "team":
+        if "tools" not in frontmatter or not frontmatter["tools"]:
+            frontmatter["tools"] = ["agent_list", "ask_agent"]
+        if not effective_prompt.strip():
+            from ohmo.gateway.routers.teams import build_default_team_system_prompt
+
+            effective_prompt = build_default_team_system_prompt()
+
+    content = f"---\n{yaml.dump(frontmatter, allow_unicode=True)}---\n\n{effective_prompt}"
     agent_file.write_text(content, encoding="utf-8")
 
     return AgentResponse(
         name=body.name,
         description=body.description,
-        system_prompt=body.system_prompt or "",
+        system_prompt=effective_prompt,
         model=body.model,
+        provider_profile=body.provider_profile,
         effort=body.effort,
         permission_mode=body.permission_mode,
-        tools=body.tools,
+        tools=frontmatter.get("tools"),
         disallowed_tools=body.disallowed_tools,
         skills=body.skills,
         mcp_servers=body.mcp_servers,
         color=body.color,
+        avatar=body.avatar,
         max_turns=body.max_turns,
         source="user",
+        kind=body.kind or "expert",
+        member_ids=body.member_ids or [],
+        welcome_message=body.welcome_message,
     )
 
 
@@ -218,7 +264,7 @@ async def create_agent(
 async def update_agent(
     name: str,
     body: UpdateAgentRequest,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """Update a user-defined agent or create/update an override for a builtin agent."""
     from openharness.coordinator.agent_definitions import (
@@ -236,9 +282,17 @@ async def update_agent(
         existing = next((d for d in get_builtin_agent_definitions() if d.name == name), None)
 
     if existing is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent '{name}' not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent '{name}' not found"
+        )
 
+    preserved = {}
+    if agent_file.exists():
+        raw = agent_file.read_text(encoding="utf-8")
+        if raw.startswith("---"):
+            preserved = yaml.safe_load(raw.split("---", 2)[1]) or {}
     frontmatter: dict = {
+        **preserved,
         "name": name,
         "description": body.description if body.description is not None else existing.description,
         "source": "user",
@@ -249,6 +303,7 @@ async def update_agent(
 
     for field, attr in [
         ("model", "model"),
+        ("provider_profile", "provider_profile"),
         ("effort", "effort"),
         ("permission_mode", "permission_mode"),
         ("tools", "tools"),
@@ -256,7 +311,11 @@ async def update_agent(
         ("skills", "skills"),
         ("mcp_servers", "mcp_servers"),
         ("color", "color"),
+        ("avatar", "avatar"),
         ("max_turns", "max_turns"),
+        ("kind", "kind"),
+        ("member_ids", "member_ids"),
+        ("welcome_message", "welcome_message"),
     ]:
         if field in body.model_fields_set:
             val = getattr(body, field)
@@ -264,7 +323,17 @@ async def update_agent(
             val = getattr(existing, attr, None)
         if val is not None:
             frontmatter[field] = val
+        else:
+            frontmatter.pop(field, None)
 
+    _validate_model_binding(frontmatter.get("provider_profile"), frontmatter.get("model"))
+    if frontmatter.get("kind") == "team":
+        if not frontmatter.get("tools"):
+            frontmatter["tools"] = ["agent_list", "ask_agent"]
+        if not new_system_prompt.strip():
+            from ohmo.gateway.routers.teams import build_default_team_system_prompt
+
+            new_system_prompt = build_default_team_system_prompt()
     content = f"---\n{yaml.dump(frontmatter, allow_unicode=True)}---\n\n{new_system_prompt}"
     agent_file.write_text(content, encoding="utf-8")
 
@@ -273,6 +342,7 @@ async def update_agent(
         description=frontmatter.get("description", ""),
         system_prompt=new_system_prompt,
         model=frontmatter.get("model"),
+        provider_profile=frontmatter.get("provider_profile"),
         effort=str(frontmatter["effort"]) if frontmatter.get("effort") is not None else None,
         permission_mode=frontmatter.get("permission_mode"),
         tools=frontmatter.get("tools"),
@@ -280,15 +350,19 @@ async def update_agent(
         skills=frontmatter.get("skills", []),
         mcp_servers=frontmatter.get("mcp_servers", []),
         color=frontmatter.get("color"),
+        avatar=frontmatter.get("avatar"),
         max_turns=frontmatter.get("max_turns"),
         source="user",
+        kind="team" if str(frontmatter.get("kind") or "").lower() == "team" else "expert",
+        member_ids=list(frontmatter.get("member_ids") or []),
+        welcome_message=frontmatter.get("welcome_message"),
     )
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agent(
     name: str,
-    _user: Annotated[dict, Depends(get_current_user)],
+    _user: Annotated[dict, Depends(require_agent_admin)],
 ):
     """Delete a user-defined agent or reset a builtin override (restores original)."""
     from openharness.coordinator.agent_definitions import get_builtin_agent_definitions

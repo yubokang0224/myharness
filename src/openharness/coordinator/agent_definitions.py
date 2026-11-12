@@ -34,7 +34,7 @@ AGENT_COLORS: frozenset[str] = frozenset(
 )
 
 #: Valid effort level strings (maps to EFFORT_LEVELS in TS).
-EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high")
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "max")
 
 #: Valid permission mode strings (maps to PERMISSION_MODES in TS).
 PERMISSION_MODES: tuple[str, ...] = (
@@ -98,6 +98,7 @@ class AgentDefinition(BaseModel):
 
     # --- model & effort ---
     model: str | None = None  # model override; None means inherit default
+    provider_profile: str | None = None
     effort: str | int | None = None  # "low" | "medium" | "high" or positive int
 
     # --- permissions ---
@@ -116,6 +117,7 @@ class AgentDefinition(BaseModel):
 
     # --- ui ---
     color: str | None = None  # one of AGENT_COLORS
+    avatar: str | None = None  # 数字员工卡通头像标识或自定义图片 URL
 
     # --- lifecycle ---
     background: bool = False  # always run as background task when spawned
@@ -135,6 +137,9 @@ class AgentDefinition(BaseModel):
     subagent_type: str = "general-purpose"  # routing key used by the harness
     source: Literal["builtin", "user", "plugin"] = "builtin"
     cwd: str | None = None  # working directory override; None means use server process cwd
+    kind: Literal["expert", "team"] = "expert"
+    member_ids: list[str] = Field(default_factory=list)
+    welcome_message: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -559,11 +564,11 @@ _BUILTIN_AGENTS: list[AgentDefinition] = [
         name="Explore",
         description=(
             "Fast agent specialized for exploring codebases. Use this when you need to "
-            "quickly find files by patterns (eg. \"src/components/**/*.tsx\"), search code "
-            "for keywords (eg. \"API endpoints\"), or answer questions about the codebase "
-            "(eg. \"how do API endpoints work?\"). When calling this agent, specify the "
-            "desired thoroughness level: \"quick\" for basic searches, \"medium\" for "
-            "moderate exploration, or \"very thorough\" for comprehensive analysis across "
+            'quickly find files by patterns (eg. "src/components/**/*.tsx"), search code '
+            'for keywords (eg. "API endpoints"), or answer questions about the codebase '
+            '(eg. "how do API endpoints work?"). When calling this agent, specify the '
+            'desired thoroughness level: "quick" for basic searches, "medium" for '
+            'moderate exploration, or "very thorough" for comprehensive analysis across '
             "multiple locations and naming conventions."
         ),
         disallowed_tools=["agent", "exit_plan_mode", "file_edit", "file_write", "notebook_edit"],
@@ -750,9 +755,7 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
             tools = _parse_str_list(frontmatter.get("tools"))
 
             # --- disallowed tools ---
-            disallowed_raw = frontmatter.get(
-                "disallowedTools", frontmatter.get("disallowed_tools")
-            )
+            disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools"))
             disallowed_tools = _parse_str_list(disallowed_raw)
 
             # --- model ---
@@ -806,8 +809,18 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
             # --- color ---
             color_raw = frontmatter.get("color")
             color: str | None = None
-            if isinstance(color_raw, str) and color_raw in AGENT_COLORS:
-                color = color_raw
+            if isinstance(color_raw, str) and (
+                color_raw in AGENT_COLORS or color_raw.strip().startswith("#")
+            ):
+                color = color_raw.strip()
+
+            # --- avatar ---
+            avatar_raw = frontmatter.get("avatar")
+            avatar: str | None = (
+                avatar_raw.strip()
+                if isinstance(avatar_raw, str) and avatar_raw.strip()
+                else None
+            )
 
             # --- background ---
             bg_raw = frontmatter.get("background")
@@ -848,9 +861,7 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
                 critical_system_reminder = csr_raw
 
             # --- requiredMcpServers ---
-            rms_raw = frontmatter.get(
-                "requiredMcpServers", frontmatter.get("required_mcp_servers")
-            )
+            rms_raw = frontmatter.get("requiredMcpServers", frontmatter.get("required_mcp_servers"))
             required_mcp_servers = _parse_str_list(rms_raw)
 
             # --- permissions (Python-specific) ---
@@ -865,6 +876,17 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
             if isinstance(cwd_raw, str) and cwd_raw.strip():
                 cwd = cwd_raw.strip()
 
+            # --- kind / member_ids / welcome_message (Octop 专家团队支持) ---
+            kind_raw = str(frontmatter.get("kind") or "expert").strip().lower()
+            kind: Literal["expert", "team"] = "team" if kind_raw == "team" else "expert"
+            member_ids = (
+                _parse_str_list(frontmatter.get("member_ids", frontmatter.get("members"))) or []
+            )
+            welcome_raw = frontmatter.get("welcome_message", frontmatter.get("welcomeMessage"))
+            welcome_message: str | None = (
+                welcome_raw.strip() if isinstance(welcome_raw, str) and welcome_raw.strip() else None
+            )
+
             agents.append(
                 AgentDefinition(
                     name=name,
@@ -873,6 +895,7 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
                     tools=tools,
                     disallowed_tools=disallowed_tools,
                     model=model,
+                    provider_profile=frontmatter.get("provider_profile") or None,
                     effort=effort,
                     permission_mode=permission_mode,
                     max_turns=max_turns,
@@ -880,6 +903,7 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
                     mcp_servers=mcp_servers,
                     hooks=hooks,
                     color=color,
+                    avatar=avatar,
                     background=background,
                     initial_prompt=initial_prompt,
                     memory=memory,
@@ -893,6 +917,9 @@ def load_agents_dir(directory: Path) -> list[AgentDefinition]:
                     subagent_type=str(frontmatter.get("subagent_type", name)),
                     source="user",
                     cwd=cwd,
+                    kind=kind,
+                    member_ids=member_ids,
+                    welcome_message=welcome_message,
                 )
             )
         except Exception:

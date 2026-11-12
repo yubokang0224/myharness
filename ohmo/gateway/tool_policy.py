@@ -22,6 +22,9 @@ _TOOL_NAME_ALIASES = {
     "webfetch": {"web_fetch"},
     "websearch": {"web_search"},
     "agent": {"agent"},
+    "agentlist": {"agent_list"},
+    "askagent": {"ask_agent"},
+    "kbsearch": {"kb_search"},
     "sendmessage": {"send_message"},
     "todowrite": {"todo_write"},
     "task": {"task_create", "task_get", "task_list", "task_stop", "task_output", "task_update"},
@@ -59,6 +62,17 @@ def apply_agent_tool_policy(tool_registry: Any, agent_def: Any | None) -> None:
 
     allowed = expand_tool_names(getattr(agent_def, "tools", None))
     if allowed is not None:
+        # 若智能体开启了企业知识库检索且非禁用全部工具 (len(allowed) > 0)，自动放行只读 kb_search 工具
+        if allowed:
+            try:
+                from openharness.config import load_settings
+
+                kb = load_settings().kb
+                agent_name = getattr(agent_def, "name", None)
+                if kb.is_configured and kb.is_agent_enabled(agent_name):
+                    allowed.add("kb_search")
+            except Exception:
+                pass
         for name in list(tools):
             if name not in allowed:
                 tools.pop(name, None)

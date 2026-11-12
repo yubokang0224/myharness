@@ -9,7 +9,17 @@ from typing import Any
 
 from openharness.channels.bus.queue import MessageBus
 from openharness.channels.impl.base import BaseChannel
-from openharness.config.schema import Config, DingTalkBotConfig, DingTalkConfig
+from openharness.config.schema import (
+    Config,
+    DingTalkBotConfig,
+    DingTalkConfig,
+    FeishuBotConfig,
+    FeishuConfig,
+    WecomBotConfig,
+    WecomConfig,
+    WeixinBotConfig,
+    WeixinConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +29,7 @@ class ChannelManager:
     Manages chat channels and coordinates message routing.
 
     Responsibilities:
-    - Initialize enabled channels (Telegram, WhatsApp, etc.)
+    - Initialize enabled channels (Telegram, WhatsApp, Feishu, DingTalk, Weixin, WeCom, etc.)
     - Start/stop channels
     - Route outbound messages
     """
@@ -70,16 +80,107 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning("Discord channel not available: %s", e)
 
-        # Feishu channel
+        # Feishu channel(s)
         if self.config.channels.feishu.enabled:
             try:
                 from openharness.channels.impl.feishu import FeishuChannel
-                self.channels["feishu"] = FeishuChannel(
-                    self.config.channels.feishu, self.bus
-                )
-                logger.info("Feishu channel enabled")
+
+                feishu_bots = self._resolve_feishu_bots(self.config.channels.feishu)
+                for bot in feishu_bots:
+                    if not bot.enabled:
+                        continue
+                    bot_name = bot.name or "default"
+                    default_agent = (bot.default_agent or "").strip()
+                    if default_agent and not self._agent_exists(default_agent):
+                        logger.error(
+                            "Feishu bot %s skipped: default_agent %s not found",
+                            bot_name,
+                            default_agent,
+                        )
+                        continue
+                    channel_name = (
+                        "feishu"
+                        if len(feishu_bots) == 1 and bot_name in ("default", "feishu-bot")
+                        else f"feishu:{bot_name}"
+                    )
+                    self.channels[channel_name] = FeishuChannel(
+                        bot,
+                        self.bus,
+                        channel_name=channel_name,
+                        bot_name=bot_name,
+                        default_agent=default_agent or None,
+                    )
+                    logger.info("Feishu bot %s enabled as %s", bot_name, channel_name)
             except ImportError as e:
                 logger.warning("Feishu channel not available: %s", e)
+
+        # Weixin (personal WeChat iLink) channel(s)
+        if self.config.channels.weixin.enabled:
+            try:
+                from openharness.channels.impl.weixin import WeixinChannel
+
+                weixin_bots = self._resolve_weixin_bots(self.config.channels.weixin)
+                for bot in weixin_bots:
+                    if not bot.enabled:
+                        continue
+                    bot_name = bot.name or "default"
+                    default_agent = (bot.default_agent or "").strip()
+                    if default_agent and not self._agent_exists(default_agent):
+                        logger.error(
+                            "Weixin bot %s skipped: default_agent %s not found",
+                            bot_name,
+                            default_agent,
+                        )
+                        continue
+                    channel_name = (
+                        "weixin"
+                        if len(weixin_bots) == 1 and bot_name in ("default", "weixin-bot")
+                        else f"weixin:{bot_name}"
+                    )
+                    self.channels[channel_name] = WeixinChannel(
+                        bot,
+                        self.bus,
+                        channel_name=channel_name,
+                        bot_name=bot_name,
+                        default_agent=default_agent or None,
+                    )
+                    logger.info("Weixin bot %s enabled as %s", bot_name, channel_name)
+            except ImportError as e:
+                logger.warning("Weixin channel not available: %s", e)
+
+        # WeCom (Enterprise WeChat AI Bot) channel(s)
+        if self.config.channels.wecom.enabled:
+            try:
+                from openharness.channels.impl.wecom import WeComChannel
+
+                wecom_bots = self._resolve_wecom_bots(self.config.channels.wecom)
+                for bot in wecom_bots:
+                    if not bot.enabled:
+                        continue
+                    bot_name = bot.name or "default"
+                    default_agent = (bot.default_agent or "").strip()
+                    if default_agent and not self._agent_exists(default_agent):
+                        logger.error(
+                            "WeCom bot %s skipped: default_agent %s not found",
+                            bot_name,
+                            default_agent,
+                        )
+                        continue
+                    channel_name = (
+                        "wecom"
+                        if len(wecom_bots) == 1 and bot_name in ("default", "wecom-bot")
+                        else f"wecom:{bot_name}"
+                    )
+                    self.channels[channel_name] = WeComChannel(
+                        bot,
+                        self.bus,
+                        channel_name=channel_name,
+                        bot_name=bot_name,
+                        default_agent=default_agent or None,
+                    )
+                    logger.info("WeCom bot %s enabled as %s", bot_name, channel_name)
+            except ImportError as e:
+                logger.warning("WeCom channel not available: %s", e)
 
         # Mochat channel
         if self.config.channels.mochat.enabled:
@@ -177,6 +278,72 @@ class ChannelManager:
                 )
 
     @staticmethod
+    def _resolve_feishu_bots(config: FeishuConfig) -> list[FeishuBotConfig]:
+        if config.bots:
+            return [
+                bot.model_copy(update={"name": bot.name or f"feishu-bot-{idx + 1}"})
+                for idx, bot in enumerate(config.bots)
+            ]
+        if config.app_id:
+            return [
+                FeishuBotConfig(
+                    name="default",
+                    enabled=True,
+                    allow_from=list(config.allow_from),
+                    app_id=config.app_id,
+                    app_secret=config.app_secret,
+                    encrypt_key=config.encrypt_key,
+                    verification_token=config.verification_token,
+                    default_agent=config.default_agent,
+                )
+            ]
+        return []
+
+    @staticmethod
+    def _resolve_weixin_bots(config: WeixinConfig) -> list[WeixinBotConfig]:
+        if config.bots:
+            return [
+                bot.model_copy(update={"name": bot.name or f"weixin-bot-{idx + 1}"})
+                for idx, bot in enumerate(config.bots)
+            ]
+        if config.token:
+            return [
+                WeixinBotConfig(
+                    name="default",
+                    enabled=True,
+                    allow_from=list(config.allow_from) or ["*"],
+                    account_id=config.account_id or config.bot_uin or "weixin",
+                    token=config.token,
+                    base_url=config.base_url or "https://ilinkai.weixin.qq.com",
+                    bot_uin=config.bot_uin or config.account_id,
+                    user_id=config.user_id,
+                    default_agent=config.default_agent,
+                )
+            ]
+        return []
+
+    @staticmethod
+    def _resolve_wecom_bots(config: WecomConfig) -> list[WecomBotConfig]:
+        if config.bots:
+            return [
+                bot.model_copy(update={"name": bot.name or f"wecom-bot-{idx + 1}"})
+                for idx, bot in enumerate(config.bots)
+            ]
+        if config.bot_id:
+            return [
+                WecomBotConfig(
+                    name="default",
+                    enabled=True,
+                    allow_from=list(config.allow_from) or ["*"],
+                    bot_id=config.bot_id,
+                    secret=config.secret,
+                    ws_url=config.ws_url or "wss://openws.work.weixin.qq.com",
+                    default_agent=config.default_agent,
+                )
+            ]
+        return []
+
+    @staticmethod
     def _resolve_dingtalk_bots(config: DingTalkConfig) -> list[DingTalkBotConfig]:
         if config.bots:
             return [
@@ -208,7 +375,7 @@ class ChannelManager:
 
             return get_agent_definition(name) is not None
         except Exception:
-            logger.exception("Failed to validate DingTalk default_agent %s", name)
+            logger.exception("Failed to validate channel default_agent %s", name)
             return False
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:

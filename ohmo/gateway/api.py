@@ -14,6 +14,7 @@ from ohmo.gateway.dependencies import get_runtime
 from ohmo.gateway.routers import (
     agents,
     board_memo,
+    channels,
     chat,
     cron,
     invocations,
@@ -24,6 +25,8 @@ from ohmo.gateway.routers import (
     production_issue,
     skills,
     tasks,
+    teams,
+    workbench,
 )
 from ohmo.workspace import initialize_workspace
 
@@ -54,8 +57,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         server_configs = load_mcp_server_configs(settings, [])
         runtime.mcp_manager = McpClientManager(server_configs)
         await runtime.mcp_manager.connect_all()
-        connected = sum(1 for status in runtime.mcp_manager.list_statuses() if status.state == "connected")
-        failed = sum(1 for status in runtime.mcp_manager.list_statuses() if status.state == "failed")
+        connected = sum(
+            1 for status in runtime.mcp_manager.list_statuses() if status.state == "connected"
+        )
+        failed = sum(
+            1 for status in runtime.mcp_manager.list_statuses() if status.state == "failed"
+        )
         logger.info("McpClientManager initialized connected=%s failed=%s", connected, failed)
     except Exception as exc:
         logger.warning("Could not initialize McpClientManager: %s", exc)
@@ -121,10 +128,13 @@ def create_app(
     app.include_router(chat.router, prefix=prefix)
     app.include_router(invocations.router, prefix=prefix)
     app.include_router(agents.router, prefix=prefix)
+    app.include_router(teams.router, prefix=prefix)
     app.include_router(skills.router, prefix=prefix)
     app.include_router(tasks.router, prefix=prefix)
+    app.include_router(workbench.router, prefix=prefix)
     app.include_router(cron.router, prefix=prefix)
     app.include_router(models.router, prefix=prefix)
+    app.include_router(channels.router, prefix=prefix)
     app.include_router(production_issue.router, prefix=prefix)
     app.include_router(board_memo.router, prefix=prefix)
     app.include_router(kb.router, prefix=prefix)

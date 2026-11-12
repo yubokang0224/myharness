@@ -32,7 +32,12 @@ from jose import jwt
 from openharness.config import load_settings
 from openharness.config.settings import KbSettings
 
-from ohmo.gateway.dependencies import _decode_bearer_credentials, get_current_user, get_runtime
+from ohmo.gateway.dependencies import (
+    _decode_bearer_credentials,
+    get_current_user,
+    get_runtime,
+    require_agent_admin,
+)
 
 # Existing shared knowledge-base helpers: source-channel resolution,
 # token forwarding and attachment upload to the internal (C#) API. Kept as a
@@ -73,32 +78,232 @@ async def get_kb_config(
     """Knowledge-base configuration for UI pickers (namespaces, agent access)."""
 
     kb = load_settings().kb
+    effective_ns = kb.effective_namespaces()
     hub_titles = await _hub_workspace_titles(kb) if kb.is_configured else {}
+    secret = kb.resolved_jwt_secret()
+    masked_secret = (
+        f"{secret[:6]}...{secret[-4:]}" if len(secret) > 12 else ("***" if secret else "")
+    )
     payload: dict[str, Any] = {
         "configured": kb.is_configured,
+        "hub_base_url": kb.resolved_base_url(),
+        "actor_id": kb.actor_id or "human:1",
+        "has_jwt_secret": bool(secret),
+        "jwt_secret_masked": masked_secret,
         "default_mode": kb.default_mode,
         "default_top_k": kb.default_top_k,
         # 显示名优先取 RAG 侧 workspace 标题；本地 label 只是 hub 不可达兜底
         "namespaces": [
             {"name": name, "label": hub_titles.get(name) or label or name}
-            for name, label in sorted(kb.namespaces.items())
+            for name, label in sorted(effective_ns.items())
         ],
         "agents": {
-            name: {"read": access.read, "write": access.write, "enabled": access.enabled}
+            name: {
+                "read": access.read,
+                "write": access.write,
+                "enabled": access.enabled,
+                "scope_mode": getattr(access, "scope_mode", "all") or "all",
+                "folder_ids": list(getattr(access, "folder_ids", None) or []),
+                "doc_ids": list(getattr(access, "doc_ids", None) or []),
+            }
             for name, access in kb.agents.items()
         },
         "writable_namespaces": sorted(kb.writable_namespaces()),
     }
     if request.query_params.get("probe") and kb.is_configured:
-        payload["hub_ok"] = await _probe_hub(kb)
+        probe_info = await _probe_hub_detailed(kb)
+        payload["hub_ok"] = probe_info["ok"]
+        payload["doc_count"] = probe_info.get("doc_count")
+        payload["searchable_doc_count"] = probe_info.get("searchable_doc_count")
     return payload
+
+
+@router.put("/Settings")
+async def put_kb_settings(
+    request: Request,
+    _user: Annotated[dict[str, Any], Depends(require_agent_admin)],
+) -> dict[str, Any]:
+    """Save KB146 gateway connection settings (base URL, JWT secret, actor_id, top_k)."""
+    from openharness.config import save_settings
+    from openharness.config.settings import DEFAULT_KB146_BASE_URL, DEFAULT_KB146_NAMESPACES
+
+    payload, _channel = await _read_json_body(request)
+    settings = load_settings()
+    kb = settings.kb
+
+    if "hub_base_url" in payload:
+        kb.hub_base_url = _text(payload.get("hub_base_url")) or DEFAULT_KB146_BASE_URL
+    if "jwt_secret" in payload:
+        new_secret = _text(payload.get("jwt_secret"))
+        if new_secret:
+            kb.jwt_secret = new_secret
+    if "actor_id" in payload:
+        kb.actor_id = _text(payload.get("actor_id")) or "human:1"
+    if "default_top_k" in payload:
+        kb.default_top_k = _clamp_int(payload.get("default_top_k"), kb.default_top_k, 1, _MAX_TOP_K)
+    if not kb.namespaces:
+        kb.namespaces = dict(DEFAULT_KB146_NAMESPACES)
+
+    save_settings(settings)
+    probe_info = await _probe_hub_detailed(kb) if kb.is_configured else {"ok": False}
+    secret = kb.resolved_jwt_secret()
+    masked_secret = (
+        f"{secret[:6]}...{secret[-4:]}" if len(secret) > 12 else ("***" if secret else "")
+    )
+    return {
+        "configured": kb.is_configured,
+        "hub_base_url": kb.resolved_base_url(),
+        "actor_id": kb.actor_id,
+        "has_jwt_secret": bool(secret),
+        "jwt_secret_masked": masked_secret,
+        "default_top_k": kb.default_top_k,
+        "hub_ok": probe_info.get("ok", False),
+        "doc_count": probe_info.get("doc_count"),
+        "searchable_doc_count": probe_info.get("searchable_doc_count"),
+    }
+
+
+@router.get("/Documents")
+async def list_kb_documents(
+    request: Request,
+    _user: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> dict[str, Any]:
+    """List documents in the KB146 namespace (read-only preview for web UI)."""
+    kb = _require_kb_configured()
+    namespace = _text(request.query_params.get("namespace")) or "official_kb"
+    skip = _clamp_int(request.query_params.get("skip"), 0, 0, 10000)
+    limit = _clamp_int(request.query_params.get("limit"), 100, 1, 200)
+
+    headers = _build_kb146_headers(kb)
+    try:
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+            docs_task = client.get(
+                _hub_url(kb, "/semantic-api/v1/dashboard/documents"),
+                params={"namespace": namespace, "skip": skip, "limit": limit},
+                headers=headers,
+            )
+            folders_task = client.get(
+                _hub_url(kb, "/semantic-api/v1/dashboard/folders/tree"),
+                params={"namespace": namespace},
+                headers=headers,
+            )
+            response, folders_resp = await asyncio.gather(
+                docs_task, folders_task, return_exceptions=True
+            )
+            if isinstance(response, BaseException):
+                raise response
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 documents endpoint unavailable: {exc}",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 documents query failed (HTTP {response.status_code}): {response.text[:200]}",
+        )
+
+    folders: list[dict[str, Any]] = []
+    if isinstance(folders_resp, httpx.Response) and folders_resp.status_code < 400:
+        tree_data = _safe_json(folders_resp)
+        folders = _flatten_kb146_folder_tree(tree_data.get("tree") or [])
+
+    data = _safe_json(response)
+    raw_items = data.get("items") if isinstance(data.get("items"), list) else []
+    base_url = kb.resolved_base_url()
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        doc_id = _text(raw.get("doc_id"))
+        doc_status = (
+            raw.get("document_status") if isinstance(raw.get("document_status"), dict) else {}
+        )
+        searchable = bool(
+            doc_status.get("searchable")
+            if "searchable" in doc_status
+            else raw.get("semantic_status") in {"ready", "degraded"}
+        )
+        state_label = _text(doc_status.get("state_label")) or (
+            "可检索" if searchable else _text(raw.get("semantic_status")) or "处理中"
+        )
+        items.append(
+            {
+                "doc_id": doc_id,
+                "namespace": _text(raw.get("namespace")) or namespace,
+                "title": _text(raw.get("title")) or _text(raw.get("original_file_name")) or doc_id,
+                "original_file_name": _text(raw.get("original_file_name")),
+                "folder_id": _text(raw.get("folder_id")),
+                "folder_path": _text(raw.get("folder_path")) or "/共享文件/",
+                "chunk_count": int(raw.get("chunk_count") or raw.get("chunks_count") or 0),
+                "semantic_status": _text(raw.get("semantic_status")) or "ready",
+                "state_label": state_label,
+                "searchable": searchable,
+                "created_at": _text(raw.get("created_at")),
+                "updated_at": _text(raw.get("updated_at")),
+                "download_url": (
+                    f"{base_url}/semantic-api/v1/dashboard/documents/{doc_id}/original"
+                    f"?namespace={namespace}&download=true"
+                    if doc_id
+                    else ""
+                ),
+            }
+        )
+
+    return {
+        "namespace": namespace,
+        "total": int(data.get("total") or len(items)),
+        "searchable_total": sum(1 for item in items if item.get("searchable")),
+        "folders": folders,
+        "items": items,
+    }
+
+
+@router.get("/Evidence/{ref_id:path}")
+async def get_kb_evidence(
+    ref_id: str,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
+    request: Request,
+) -> dict[str, Any]:
+    """Fetch full chunk evidence and locator metadata from KB146 /v2/rag/evidence/{ref_id}."""
+    kb = _require_kb_configured()
+    source_channel = _source_channel(request, b"")
+    _require_caller(credentials, source_channel)
+    clean_ref = ref_id.strip().lstrip("/")
+    if not clean_ref:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="ref_id is required"
+        )
+
+    headers = _build_kb146_headers(kb)
+    try:
+        async with httpx.AsyncClient(timeout=kb.timeout, trust_env=False) as client:
+            response = await client.get(
+                _hub_url(kb, f"/v2/rag/evidence/{clean_ref}"),
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 evidence endpoint unavailable: {exc}",
+        ) from exc
+
+    if response.status_code == 404:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Evidence not found")
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 evidence failed (HTTP {response.status_code}): {response.text[:200]}",
+        )
+    return _safe_json(response)
 
 
 @router.put("/AgentAccess/{agent_name}")
 async def put_kb_agent_access(
     agent_name: str,
     request: Request,
-    _user: Annotated[dict[str, Any], Depends(get_current_user)],
+    _user: Annotated[dict[str, Any], Depends(require_agent_admin)],
 ) -> dict[str, Any]:
     """Set one agent's knowledge-base authorization (called by the Agent 配置 UI).
 
@@ -111,11 +316,13 @@ async def put_kb_agent_access(
     payload, _channel = await _read_json_body(request)
     agent_name = agent_name.strip()
     if not agent_name:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="agent name is required")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="agent name is required"
+        )
 
     settings = load_settings()
     kb = settings.kb
-    known = set(kb.namespaces)
+    known = set(kb.effective_namespaces())
     read = _string_list(payload.get("read"))
     write = _string_list(payload.get("write"))
     unknown = [ns for ns in {*read, *write} if ns not in known]
@@ -131,14 +338,41 @@ async def put_kb_agent_access(
             detail=f"writable namespaces must also be readable: {not_readable}",
         )
 
-    access = KbAgentAccess(read=read, write=write, enabled=bool(payload.get("enabled", True)))
+    scope_mode = _text(payload.get("scope_mode")) or "all"
+    if scope_mode not in {"all", "folders", "documents"}:
+        scope_mode = "all"
+    folder_ids = _string_list(payload.get("folder_ids"))
+    doc_ids = _string_list(payload.get("doc_ids"))
+
+    access = KbAgentAccess(
+        read=read,
+        write=write,
+        enabled=bool(payload.get("enabled", True)),
+        scope_mode=scope_mode,
+        folder_ids=folder_ids,
+        doc_ids=doc_ids,
+    )
     kb.agents[agent_name] = access
     save_settings(settings)
     logger.info(
-        "Kb agent access updated agent=%s read=%s write=%s enabled=%s",
-        agent_name, read, write, access.enabled,
+        "Kb agent access updated agent=%s read=%s write=%s enabled=%s scope_mode=%s folders=%s docs=%s",
+        agent_name,
+        read,
+        write,
+        access.enabled,
+        scope_mode,
+        len(folder_ids),
+        len(doc_ids),
     )
-    return {"agent": agent_name, "read": read, "write": write, "enabled": access.enabled}
+    return {
+        "agent": agent_name,
+        "read": read,
+        "write": write,
+        "enabled": access.enabled,
+        "scope_mode": scope_mode,
+        "folder_ids": folder_ids,
+        "doc_ids": doc_ids,
+    }
 
 
 @router.post("/Recall")
@@ -146,7 +380,7 @@ async def kb_recall(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
 ) -> dict[str, Any]:
-    """Recall chunks from one or more namespaces and merge by score."""
+    """Recall chunks from KB146 (/v2/rag/queries) or legacy semantic hub."""
 
     kb = _require_kb_configured()
     payload, source_channel = await _read_json_body(request)
@@ -154,10 +388,12 @@ async def kb_recall(
 
     query = _text(payload.get("query"))
     if not query:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="query is required")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="query is required"
+        )
     query = query[:_MAX_QUERY_CHARS]
 
-    mode = _text(payload.get("mode")) or kb.default_mode
+    mode = _text(payload.get("mode")) or kb.default_mode or "hybrid"
     if mode == "hybrid_dense":
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -171,11 +407,109 @@ async def kb_recall(
 
     top_k = _clamp_int(payload.get("top_k") or payload.get("topK"), kb.default_top_k, 1, _MAX_TOP_K)
     namespaces = _resolve_recall_namespaces(kb, payload, source_channel)
+    caller_agent = _resolve_caller_agent(kb, payload, source_channel)
+    explicit_folder_ids = _string_list(payload.get("folder_ids"))
+    explicit_doc_ids = _string_list(payload.get("doc_ids"))
+
+    return await execute_kb_recall(
+        kb=kb,
+        query=query,
+        namespaces=namespaces,
+        mode=mode,
+        top_k=top_k,
+        min_importance=payload.get("min_importance") or payload.get("minImportance"),
+        agent_name=caller_agent or None,
+        folder_ids=explicit_folder_ids or None,
+        doc_ids=explicit_doc_ids or None,
+    )
+
+
+async def execute_kb_recall(
+    *,
+    kb: KbSettings | None = None,
+    query: str,
+    namespaces: list[str] | None = None,
+    mode: str | None = None,
+    top_k: int | None = None,
+    min_importance: Any = None,
+    agent_name: str | None = None,
+    folder_ids: list[str] | None = None,
+    doc_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Execute KB recall in-process (shared by POST /Kb/Recall and the native kb_search tool)."""
+    kb = _require_kb_configured(kb)
+    clean_query = _text(query)[:_MAX_QUERY_CHARS]
+    if not clean_query:
+        return {
+            "success": True,
+            "mode": mode or kb.default_mode or "hybrid",
+            "namespaces": namespaces or ["official_kb"],
+            "total": 0,
+            "chunks": [],
+            "warnings": ["query is empty"],
+            "latency_ms": 0.0,
+        }
+
+    resolved_top_k = _clamp_int(top_k, kb.default_top_k or 5, 1, _MAX_TOP_K)
+    resolved_mode = _text(mode) or kb.default_mode or "hybrid"
+    if namespaces:
+        resolved_namespaces = [ns.strip() for ns in namespaces if str(ns).strip()]
+    elif agent_name:
+        resolved_namespaces = kb.agent_readable_namespaces(agent_name)
+    else:
+        resolved_namespaces = sorted(kb.readable_namespaces())
+    if not resolved_namespaces:
+        resolved_namespaces = ["official_kb"]
+
+    # 解析智能体专属目录 (folder_ids) 或专属文档 (doc_ids) 过滤范围
+    effective_folder_ids = [f.strip() for f in (folder_ids or []) if f.strip()]
+    effective_doc_ids = [d.strip() for d in (doc_ids or []) if d.strip()]
+    if not effective_folder_ids and not effective_doc_ids and agent_name:
+        access = kb.agents.get(agent_name.strip())
+        if access is not None:
+            scope_mode = getattr(access, "scope_mode", "all") or "all"
+            if scope_mode == "folders" and getattr(access, "folder_ids", None):
+                effective_folder_ids = [f.strip() for f in access.folder_ids if f.strip()]
+            elif scope_mode == "documents" and getattr(access, "doc_ids", None):
+                effective_doc_ids = [d.strip() for d in access.doc_ids if d.strip()]
 
     started = time.monotonic()
-    chunks: list[dict[str, Any]] = []
-    warnings: list[str] = []
 
+    # 若配置了 KB_JWT_SECRET 且未强制使用旧版账号密码模式，优先走 KB146 /v2/rag/queries
+    if kb.resolved_jwt_secret() and not (kb.hub_username.strip() and kb.hub_password):
+        has_scope_filter = bool(effective_folder_ids or effective_doc_ids)
+        fetch_top_k = (
+            min(_MAX_TOP_K, max(resolved_top_k * 6, 30))
+            if has_scope_filter
+            else resolved_top_k
+        )
+        chunks, warnings = await _recall_kb146(
+            kb,
+            query=clean_query,
+            namespaces=resolved_namespaces,
+            top_k=fetch_top_k,
+        )
+        if has_scope_filter and chunks:
+            allowed_docs = await _resolve_allowed_doc_ids(
+                kb,
+                namespace=resolved_namespaces[0],
+                folder_ids=effective_folder_ids,
+                doc_ids=effective_doc_ids,
+            )
+            chunks = [c for c in chunks if c.get("doc_id") in allowed_docs]
+        return {
+            "success": True,
+            "mode": resolved_mode,
+            "namespaces": resolved_namespaces,
+            "total": len(chunks[:resolved_top_k]),
+            "chunks": chunks[:resolved_top_k],
+            "warnings": warnings,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        }
+
+    # 旧版 /v1/hub/recall 兼容分支
+    chunks = []
+    warnings = []
     async with httpx.AsyncClient(timeout=kb.timeout, trust_env=False) as client:
         results = await asyncio.gather(
             *(
@@ -183,17 +517,17 @@ async def kb_recall(
                     client,
                     kb,
                     namespace=namespace,
-                    query=query,
-                    mode=mode,
-                    top_k=top_k,
-                    min_importance=payload.get("min_importance") or payload.get("minImportance"),
+                    query=clean_query,
+                    mode=resolved_mode,
+                    top_k=resolved_top_k,
+                    min_importance=min_importance,
                 )
-                for namespace in namespaces
+                for namespace in resolved_namespaces
             ),
             return_exceptions=True,
         )
 
-    for namespace, result in zip(namespaces, results):
+    for namespace, result in zip(resolved_namespaces, results):
         if isinstance(result, BaseException):
             logger.warning("Kb recall failed namespace=%s err=%s", namespace, result)
             warnings.append(f"namespace '{namespace}' recall failed: {result}")
@@ -202,18 +536,18 @@ async def kb_recall(
         chunks.extend(ns_chunks)
         warnings.extend(ns_warnings)
 
-    if not chunks and len(warnings) >= len(namespaces) and namespaces:
+    if not chunks and len(warnings) >= len(resolved_namespaces) and resolved_namespaces:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"knowledge base unavailable: {warnings[0]}",
         )
 
     chunks.sort(key=lambda item: item.get("score") or 0.0, reverse=True)
-    chunks = chunks[:top_k]
+    chunks = chunks[:resolved_top_k]
     return {
         "success": True,
-        "mode": mode,
-        "namespaces": namespaces,
+        "mode": resolved_mode,
+        "namespaces": resolved_namespaces,
         "total": len(chunks),
         "chunks": chunks,
         "warnings": warnings,
@@ -235,7 +569,9 @@ async def kb_ingest(
 
     namespace = _text(payload.get("namespace"))
     if not namespace:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="namespace is required")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="namespace is required"
+        )
     agent_name, access = _caller_access(kb, payload, source_channel)
     writable = set(access.write) if access is not None else kb.writable_namespaces()
     if namespace not in writable:
@@ -247,7 +583,9 @@ async def kb_ingest(
 
     text = _text(payload.get("text")) or _text(payload.get("content"))
     if not text:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="text is required"
+        )
     title = _text(payload.get("title"))
     text_full = f"{title}\n\n{text}" if title and title not in text else text
     text_full = text_full[:_MAX_ITEM_TEXT_CHARS]
@@ -363,8 +701,339 @@ async def kb_ingest_status(
 
 
 # ---------------------------------------------------------------------------
-# Recall helpers
+# Recall helpers (KB146 /v2/rag/queries + legacy semantic-hub fallback)
 # ---------------------------------------------------------------------------
+def _build_kb146_headers(kb: KbSettings, *, actor_id: str | None = None) -> dict[str, str]:
+    """构造 KB146 (/v2/rag/queries & /v2/rag/evidence) 标准请求头。
+
+    注意：将 iat 回拨 180 秒以消除客户端与 KB146 服务器之间的时钟漂移（避免 401 Invalid or expired service token）。
+    """
+    secret = kb.resolved_jwt_secret()
+    sub = _text(actor_id) or _text(getattr(kb, "actor_id", "")) or "human:1"
+    now = int(time.time())
+    token = (
+        jwt.encode(
+            {
+                "sub": sub,
+                "iat": now - 180,
+                "exp": now + max(600, int(kb.jwt_ttl_seconds or 3600)),
+            },
+            secret,
+            algorithm="HS256",
+        )
+        if secret
+        else ""
+    )
+    headers = {
+        "X-Actor-Id": sub,
+        "X-Access-Scope": "rag.search:read",
+        "X-Contract-Version": "0.2.0",
+        "X-Correlation-Id": str(uuid.uuid4()),
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def _recall_kb146(
+    kb: KbSettings,
+    *,
+    query: str,
+    namespaces: list[str],
+    top_k: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """调用 KB146 生产检索网关 POST /v2/rag/queries 并关联文档来源元数据。"""
+    headers = _build_kb146_headers(kb)
+    body = {
+        "query": query,
+        "top_k": top_k,
+        "scope_filter": {"namespaces": namespaces},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=kb.timeout, trust_env=False) as client:
+            response = await client.post(
+                _hub_url(kb, "/v2/rag/queries"),
+                headers=headers,
+                json=body,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 query gateway unavailable: {exc}",
+        ) from exc
+
+    # 手册 2.2 节契约：HTTP 404 (search.004) 代表空库或无相关命中，正常兜底返回空列表
+    if response.status_code == 404:
+        return [], []
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"KB146 query failed (HTTP {response.status_code}): {response.text[:300]}",
+        )
+
+    data = _safe_json(response)
+    default_ns = namespaces[0] if namespaces else "official_kb"
+    chunks = _parse_kb146_query_response(data, kb=kb, default_namespace=default_ns)
+    warnings = [str(w) for w in data.get("warnings") or [] if w]
+    return chunks, warnings
+
+
+def _parse_kb146_query_response(
+    data: dict[str, Any],
+    *,
+    kb: KbSettings,
+    default_namespace: str = "official_kb",
+) -> list[dict[str, Any]]:
+    """将 KB146 /v2/rag/queries 返回的 chunks 与 sources 关联拼装为统一格式。"""
+    raw_sources = data.get("sources") if isinstance(data.get("sources"), list) else []
+    sources_by_ref: dict[str, dict[str, Any]] = {}
+    sources_by_doc_id: dict[str, dict[str, Any]] = {}
+    for src in raw_sources:
+        if not isinstance(src, dict):
+            continue
+        ref_id = _text(src.get("ref_id"))
+        doc_id = _text(src.get("doc_id"))
+        if ref_id:
+            sources_by_ref[ref_id] = src
+        if doc_id:
+            sources_by_doc_id[doc_id] = src
+            sources_by_ref.setdefault(f"{default_namespace}/{doc_id}", src)
+
+    base_url = kb.resolved_base_url()
+    raw_chunks = data.get("chunks") if isinstance(data.get("chunks"), list) else []
+    parsed_chunks: list[dict[str, Any]] = []
+
+    for raw in raw_chunks:
+        if not isinstance(raw, dict):
+            continue
+        ref_id = _text(raw.get("ref_id") or raw.get("chunk_id") or raw.get("item_id"))
+        source_ref = _text(raw.get("source_ref"))
+        doc_id = _text(raw.get("doc_id"))
+        if not doc_id and "/" in source_ref:
+            doc_id = source_ref.split("/", 1)[1]
+
+        src = (
+            sources_by_ref.get(source_ref)
+            or sources_by_doc_id.get(doc_id)
+            or {}
+        )
+        if not doc_id:
+            doc_id = _text(src.get("doc_id"))
+
+        locator = src.get("locator") if isinstance(src.get("locator"), dict) else {}
+        ns = (
+            _text(locator.get("namespace"))
+            or (ref_id.split("/", 1)[0] if "/" in ref_id else "")
+            or default_namespace
+        )
+        chunks_locator_map = (
+            locator.get("chunks") if isinstance(locator.get("chunks"), dict) else {}
+        )
+        chunk_loc = (
+            chunks_locator_map.get(ref_id)
+            if isinstance(chunks_locator_map.get(ref_id), dict)
+            else {}
+        )
+
+        title = (
+            _text(chunk_loc.get("original_file_name"))
+            or _text(locator.get("original_file_name"))
+            or _text(src.get("title"))
+            or _text(raw.get("title"))
+            or doc_id
+        )
+        heading_path = (
+            _text(raw.get("heading_path"))
+            or _text(chunk_loc.get("heading_path"))
+            or _text(locator.get("heading_path"))
+        )
+        page_val = raw.get("page")
+        if page_val is None:
+            page_val = chunk_loc.get("page")
+        if page_val is None:
+            page_val = locator.get("page")
+
+        source_locator = (
+            chunk_loc.get("source_locator")
+            if isinstance(chunk_loc.get("source_locator"), dict)
+            else {}
+        )
+        slide_index = source_locator.get("slide_index")
+        location_parts: list[str] = []
+        if heading_path:
+            location_parts.append(heading_path)
+        if isinstance(page_val, int) and page_val > 0:
+            location_parts.append(f"第 {page_val} 页")
+        elif isinstance(slide_index, int) and slide_index > 0:
+            page_val = slide_index
+            location_parts.append(f"第 {slide_index} 页 (PPT)")
+
+        content_kind = (
+            _text(raw.get("content_kind"))
+            or _text(chunk_loc.get("content_kind"))
+            or "body"
+        )
+        source_uri = (
+            f"{base_url}/semantic-api/v1/dashboard/documents/{doc_id}/original"
+            f"?namespace={ns}&download=true"
+            if doc_id and base_url
+            else _text(raw.get("source_uri"))
+        )
+        text = str(raw.get("text") or raw.get("chunk_text") or "")[:_MAX_CHUNK_TEXT_CHARS]
+
+        parsed_chunks.append(
+            {
+                "namespace": ns,
+                "score": raw.get("score"),
+                "text": text,
+                "item_id": ref_id or _text(raw.get("chunk_id")),
+                "ref_id": ref_id,
+                "doc_id": doc_id,
+                "layer": content_kind,
+                "title": title,
+                "heading_path": heading_path,
+                "page": page_val if isinstance(page_val, int) else None,
+                "location_label": " · ".join(location_parts),
+                "source_uri": source_uri,
+                "image_urls": [],
+            }
+        )
+
+    parsed_chunks.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return parsed_chunks
+
+
+_kb_catalog_cache: dict[str, dict[str, Any]] = {}
+_KB_CATALOG_TTL = 60.0
+
+
+def _flatten_kb146_folder_tree(tree: Any) -> list[dict[str, Any]]:
+    """递归展平 KB146 /semantic-api/v1/dashboard/folders/tree 返回的目录树。"""
+    results: list[dict[str, Any]] = []
+    if not isinstance(tree, list):
+        return results
+
+    def _walk(nodes: list[Any], depth: int = 0) -> None:
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            folder_id = _text(node.get("folder_id"))
+            if not folder_id:
+                continue
+            path = _text(node.get("path")) or f"/{_text(node.get('name'))}/"
+            results.append(
+                {
+                    "folder_id": folder_id,
+                    "name": _text(node.get("name")) or folder_id,
+                    "path": path,
+                    "parent_folder_id": _text(node.get("parent_folder_id")) or None,
+                    "doc_count": int(node.get("doc_count") or 0),
+                    "depth": depth,
+                }
+            )
+            children = node.get("children")
+            if isinstance(children, list) and children:
+                _walk(children, depth + 1)
+
+    _walk(tree, 0)
+    return results
+
+
+async def _fetch_kb146_catalog(kb: KbSettings, namespace: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """拉取并缓存 60 秒 KB146 目录树与文档列表，供按目录/文档范围过滤使用。"""
+    now = time.monotonic()
+    cached = _kb_catalog_cache.get(namespace)
+    if cached and now - float(cached.get("at") or 0.0) < _KB_CATALOG_TTL:
+        return cached.get("folders") or [], cached.get("docs") or []
+
+    headers = _build_kb146_headers(kb)
+    folders: list[dict[str, Any]] = []
+    docs: list[dict[str, Any]] = []
+    try:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+            docs_task = client.get(
+                _hub_url(kb, "/semantic-api/v1/dashboard/documents"),
+                params={"namespace": namespace, "skip": 0, "limit": 200},
+                headers=headers,
+            )
+            folders_task = client.get(
+                _hub_url(kb, "/semantic-api/v1/dashboard/folders/tree"),
+                params={"namespace": namespace},
+                headers=headers,
+            )
+            docs_resp, folders_resp = await asyncio.gather(
+                docs_task, folders_task, return_exceptions=True
+            )
+            if isinstance(folders_resp, httpx.Response) and folders_resp.status_code < 400:
+                folders = _flatten_kb146_folder_tree(_safe_json(folders_resp).get("tree") or [])
+            if isinstance(docs_resp, httpx.Response) and docs_resp.status_code < 400:
+                raw_items = _safe_json(docs_resp).get("items")
+                if isinstance(raw_items, list):
+                    for raw in raw_items:
+                        if isinstance(raw, dict) and _text(raw.get("doc_id")):
+                            docs.append(
+                                {
+                                    "doc_id": _text(raw.get("doc_id")),
+                                    "folder_id": _text(raw.get("folder_id")),
+                                    "folder_path": _text(raw.get("folder_path")) or "/共享文件/",
+                                }
+                            )
+    except httpx.HTTPError as exc:
+        logger.warning("Failed to fetch KB146 catalog for scope filtering: %s", exc)
+        if cached:
+            return cached.get("folders") or [], cached.get("docs") or []
+        return [], []
+
+    _kb_catalog_cache[namespace] = {"at": now, "folders": folders, "docs": docs}
+    return folders, docs
+
+
+async def _resolve_allowed_doc_ids(
+    kb: KbSettings,
+    *,
+    namespace: str,
+    folder_ids: list[str],
+    doc_ids: list[str],
+) -> set[str]:
+    """根据智能体或请求指定的 folder_ids（含子目录）与 doc_ids 解析允许召回的 doc_id 集合。"""
+    allowed: set[str] = {d.strip() for d in doc_ids if d and d.strip()}
+    clean_folders = {f.strip() for f in folder_ids if f and f.strip()}
+    if not clean_folders:
+        return allowed
+
+    folders, docs = await _fetch_kb146_catalog(kb, namespace)
+    matched_folder_ids = set(clean_folders)
+    matched_paths: list[str] = []
+
+    # 收集所选目录的路径，并级联纳入所有子目录
+    folder_by_id = {f["folder_id"]: f for f in folders if f.get("folder_id")}
+    for fid in list(clean_folders):
+        f_obj = folder_by_id.get(fid)
+        if f_obj and f_obj.get("path"):
+            matched_paths.append(str(f_obj["path"]))
+        elif fid.startswith("/"):
+            matched_paths.append(fid)
+
+    for f_obj in folders:
+        f_path = str(f_obj.get("path") or "")
+        if f_path and any(f_path.startswith(prefix) for prefix in matched_paths):
+            matched_folder_ids.add(str(f_obj["folder_id"]))
+
+    for doc in docs:
+        doc_id = doc.get("doc_id")
+        if not doc_id:
+            continue
+        doc_fid = doc.get("folder_id") or ""
+        doc_fpath = doc.get("folder_path") or ""
+        if doc_fid in matched_folder_ids or (
+            doc_fpath and any(doc_fpath.startswith(prefix) for prefix in matched_paths)
+        ):
+            allowed.add(doc_id)
+
+    return allowed
+
+
 async def _recall_one(
     client: httpx.AsyncClient,
     kb: KbSettings,
@@ -385,7 +1054,9 @@ async def _recall_one(
     if isinstance(min_importance, (int, float)):
         body["min_importance"] = max(0.0, min(1.0, float(min_importance)))
 
-    response = await _hub_post(client, kb, "/v1/hub/recall", body, namespaces=[namespace], permission="read")
+    response = await _hub_post(
+        client, kb, "/v1/hub/recall", body, namespaces=[namespace], permission="read"
+    )
     if response.status_code >= 400:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
 
@@ -619,16 +1290,18 @@ async def _read_json_body(request: Request) -> tuple[dict[str, Any], str]:
 
 def _sign_hub_token(kb: KbSettings, *, namespaces: list[str], permission: str) -> str:
     now = int(time.time())
+    secret = kb.resolved_jwt_secret()
+    sub = _text(getattr(kb, "actor_id", "")) or "human:1"
     payload = {
-        "sub": "os-agent-gateway",
-        "user_id": "os-agent-gateway",
+        "sub": sub,
+        "user_id": sub,
         "namespaces": namespaces,
         "roles": [],
         "permission": permission,
-        "iat": now,
-        "exp": now + max(60, kb.jwt_ttl_seconds),
+        "iat": now - 180,
+        "exp": now + max(600, kb.jwt_ttl_seconds),
     }
-    return jwt.encode(payload, kb.jwt_secret, algorithm="HS256")
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 # Hub 登录 token 缓存:hub 已从共享 JWT 密钥改为账号登录签发长效 access_token,
@@ -704,7 +1377,9 @@ async def _resolve_hub_token(
         if not ttl or ttl <= 0:
             ttl = 12 * 3600.0
         # 提前 10 分钟视为过期,避免边界 401;真过期还有 401 重登兜底
-        _hub_login_cache.update({"key": key, "token": token, "expires_at": time.time() + max(600.0, ttl - 600.0)})
+        _hub_login_cache.update(
+            {"key": key, "token": token, "expires_at": time.time() + max(600.0, ttl - 600.0)}
+        )
         logger.info("Kb hub login ok user=%s ttl=%ss", username, int(ttl))
         return token
 
@@ -720,16 +1395,22 @@ async def _hub_post(
 ) -> httpx.Response:
     """POST to the hub with auth; on 401 (login mode) re-login once and retry."""
     token = await _resolve_hub_token(kb, namespaces=namespaces, permission=permission)
-    response = await client.post(_hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body)
+    response = await client.post(
+        _hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body
+    )
     if response.status_code == 401 and kb.hub_username.strip():
         logger.info("Kb hub token rejected (401), re-login and retry path=%s", path)
-        token = await _resolve_hub_token(kb, namespaces=namespaces, permission=permission, force_refresh=True)
-        response = await client.post(_hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body)
+        token = await _resolve_hub_token(
+            kb, namespaces=namespaces, permission=permission, force_refresh=True
+        )
+        response = await client.post(
+            _hub_url(kb, path), headers={"Authorization": f"Bearer {token}"}, json=body
+        )
     return response
 
 
 def _hub_url(kb: KbSettings, path: str) -> str:
-    return kb.hub_base_url.rstrip("/") + path
+    return kb.resolved_base_url() + path
 
 
 # 库显示名以 RAG 侧 workspace 标题为准（他们改名自动跟随）；本地 label 仅作
@@ -740,8 +1421,16 @@ _WORKSPACE_TITLE_TTL = 60.0
 
 async def _hub_workspace_titles(kb: KbSettings) -> dict[str, str]:
     now = time.monotonic()
-    if now - _workspace_title_cache["at"] < _WORKSPACE_TITLE_TTL and _workspace_title_cache["titles"]:
+    if (
+        now - _workspace_title_cache["at"] < _WORKSPACE_TITLE_TTL
+        and _workspace_title_cache["titles"]
+    ):
         return _workspace_title_cache["titles"]
+    # KB146 (:27517) 使用固定正式空间 official_kb，直接返回本地配置标签即可
+    if kb.resolved_jwt_secret() and not (kb.hub_username.strip() and kb.hub_password):
+        titles = kb.effective_namespaces()
+        _workspace_title_cache.update(at=now, titles=titles)
+        return titles
     try:
         token = await _resolve_hub_token(kb, namespaces=["*"], permission="read")
         async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
@@ -758,19 +1447,68 @@ async def _hub_workspace_titles(kb: KbSettings) -> dict[str, str]:
             }
             _workspace_title_cache.update(at=now, titles=titles)
             return titles
-        logger.warning("Kb workspace titles fetch failed HTTP %s", response.status_code)
     except (HTTPException, httpx.HTTPError) as exc:
-        logger.warning("Kb workspace titles unavailable, using local labels: %s", exc)
+        logger.debug("Kb workspace titles unavailable, using local labels: %s", exc)
     return _workspace_title_cache["titles"] or {}
 
 
-async def _probe_hub(kb: KbSettings) -> bool:
+async def _probe_hub_detailed(kb: KbSettings) -> dict[str, Any]:
+    """探测 KB146 检索接口与文档列表，返回连通性与文档统计。"""
+    headers = _build_kb146_headers(kb)
+    try:
+        async with httpx.AsyncClient(timeout=8.0, trust_env=False) as client:
+            docs_resp = await client.get(
+                _hub_url(kb, "/semantic-api/v1/dashboard/documents"),
+                params={"namespace": "official_kb", "limit": 200},
+                headers=headers,
+            )
+            query_resp = await client.post(
+                _hub_url(kb, "/v2/rag/queries"),
+                headers=headers,
+                json={
+                    "query": "规范",
+                    "top_k": 1,
+                    "scope_filter": {"namespaces": ["official_kb"]},
+                },
+            )
+        query_ok = query_resp.status_code in {200, 404}
+        if docs_resp.status_code < 400:
+            data = _safe_json(docs_resp)
+            items = data.get("items") if isinstance(data.get("items"), list) else []
+            searchable_count = sum(
+                1
+                for item in items
+                if isinstance(item, dict)
+                and (
+                    (
+                        isinstance(item.get("document_status"), dict)
+                        and item["document_status"].get("searchable")
+                    )
+                    or item.get("semantic_status") in {"ready", "degraded"}
+                )
+            )
+            return {
+                "ok": query_ok,
+                "doc_count": int(data.get("total") or len(items)),
+                "searchable_doc_count": searchable_count,
+            }
+        if query_ok:
+            return {"ok": True, "doc_count": None, "searchable_doc_count": None}
+    except httpx.HTTPError:
+        pass
+
+    # 回退探测旧版 /v1/hub/health
     try:
         async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
             response = await client.get(_hub_url(kb, "/v1/hub/health"))
-        return response.status_code < 400
+        return {"ok": response.status_code < 400, "doc_count": None, "searchable_doc_count": None}
     except httpx.HTTPError:
-        return False
+        return {"ok": False, "doc_count": None, "searchable_doc_count": None}
+
+
+async def _probe_hub(kb: KbSettings) -> bool:
+    info = await _probe_hub_detailed(kb)
+    return bool(info.get("ok"))
 
 
 def _safe_json(response: httpx.Response) -> dict[str, Any]:

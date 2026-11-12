@@ -1,59 +1,382 @@
 {
-  "generated_at": 1776338766.0050209,
-  "repo_name": "Xiaojin-AI",
-  "repo_path": "/home/tangjiabin/Xiaojin-AI",
-  "focus": null,
-  "counts": {
-    "queued": 0,
-    "accepted": 0,
-    "preparing": 0,
-    "running": 0,
-    "verifying": 0,
-    "pr_open": 0,
-    "waiting_ci": 0,
-    "repairing": 0,
-    "completed": 0,
-    "merged": 0,
-    "failed": 0,
-    "rejected": 0,
-    "superseded": 0
-  },
-  "status_order": [
-    "queued",
-    "accepted",
-    "preparing",
-    "running",
-    "verifying",
-    "pr_open",
-    "waiting_ci",
-    "repairing",
-    "completed",
-    "merged",
-    "failed",
-    "rejected",
-    "superseded"
+ "generated_at": 1789483269.9828877,
+ "repo_name": "Xiaojin-AI",
+ "repo_path": "/home/tangjiabin/Xiaojin-AI",
+ "focus": {
+  "id": "task-003",
+  "title": "feat(engine): 流式压缩长对话上下文",
+  "body": "接近窗口上限时自动压缩历史",
+  "status": "running",
+  "score": 91,
+  "score_reasons": [
+   "docs",
+   "tests"
   ],
-  "columns": {
-    "queued": [],
-    "accepted": [],
-    "preparing": [],
-    "running": [],
-    "verifying": [],
-    "pr_open": [],
-    "waiting_ci": [],
-    "repairing": [],
-    "completed": [],
-    "merged": [],
-    "failed": [],
-    "rejected": [],
-    "superseded": []
+  "source_kind": "issue",
+  "source_ref": "task-003",
+  "labels": [],
+  "updated_at": 1789479669.9828877,
+  "metadata": {
+   "last_note": "agent 正在改 src/services"
+  }
+ },
+ "counts": {
+  "queued": 2,
+  "running": 2,
+  "verifying": 1,
+  "merged": 2,
+  "failed": 1
+ },
+ "status_order": [
+  "queued",
+  "accepted",
+  "preparing",
+  "running",
+  "verifying",
+  "pr_open",
+  "waiting_ci",
+  "repairing",
+  "completed",
+  "merged",
+  "failed",
+  "rejected",
+  "superseded"
+ ],
+ "columns": {
+  "queued": [
+   {
+    "id": "task-001",
+    "title": "docs(engine): 补 QueryEngine ELI5 讲解页",
+    "body": "把 6 道门和循环图讲给新人",
+    "status": "queued",
+    "score": 82,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-001",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "已建卡待取"
+    }
+   },
+   {
+    "id": "task-002",
+    "title": "feat(channels): 钉钉断线重连退避",
+    "body": "WebSocket 断线指数退避重连",
+    "status": "queued",
+    "score": 77,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-002",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "已建卡待取"
+    }
+   }
+  ],
+  "running": [
+   {
+    "id": "task-003",
+    "title": "feat(engine): 流式压缩长对话上下文",
+    "body": "接近窗口上限时自动压缩历史",
+    "status": "running",
+    "score": 91,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-003",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "agent 正在改 src/services"
+    }
+   },
+   {
+    "id": "task-004",
+    "title": "fix(tui): 主题切换时闪烁",
+    "body": "Ink 重挂载导致的全屏闪",
+    "status": "running",
+    "score": 74,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-004",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "定位到 key 缺失"
+    }
+   }
+  ],
+  "verifying": [
+   {
+    "id": "task-005",
+    "title": "feat(auth): profile 级凭据隔离",
+    "body": "每套 provider 配置独立 key",
+    "status": "verifying",
+    "score": 88,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-005",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "42 个用例全绿"
+    }
+   }
+  ],
+  "merged": [
+   {
+    "id": "task-006",
+    "title": "feat(tools): MCP 外援工具热插拔",
+    "body": "运行时加载 MCP 服务器",
+    "status": "merged",
+    "score": 95,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-006",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "PR #214 已合并"
+    }
+   },
+   {
+    "id": "task-007",
+    "title": "fix(setup): 引导流程空指针",
+    "body": "workflow 选择器空值崩溃",
+    "status": "merged",
+    "score": 90,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-007",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "已合入主干"
+    }
+   }
+  ],
+  "failed": [
+   {
+    "id": "task-008",
+    "title": "feat(voice): 语音输入实验",
+    "body": "Web Speech 接入 TUI",
+    "status": "failed",
+    "score": 41,
+    "score_reasons": [
+     "docs",
+     "tests"
+    ],
+    "source_kind": "issue",
+    "source_ref": "task-008",
+    "labels": [],
+    "updated_at": 1789479669.9828877,
+    "metadata": {
+     "last_note": "浏览器兼容性差，挂起"
+    }
+   }
+  ]
+ },
+ "cards": [
+  {
+   "id": "task-001",
+   "title": "docs(engine): 补 QueryEngine ELI5 讲解页",
+   "body": "把 6 道门和循环图讲给新人",
+   "status": "queued",
+   "score": 82,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-001",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "已建卡待取"
+   }
   },
-  "cards": [],
-  "journal": [],
-  "policies": {
-    "autopilot": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/autopilot_policy.yaml",
-    "verification": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/verification_policy.yaml",
-    "release": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/release_policy.yaml"
+  {
+   "id": "task-002",
+   "title": "feat(channels): 钉钉断线重连退避",
+   "body": "WebSocket 断线指数退避重连",
+   "status": "queued",
+   "score": 77,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-002",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "已建卡待取"
+   }
   },
-  "active_context": "# Active Repo Context\n\nGenerated at: 2026-04-16 11:05:49 UTC\n\n## Current Task Focus\n- No active repo task focus yet.\n\n## In Progress\n- None.\n\n## Next Up\n- No queued items.\n\n## Recently Completed\n- None yet.\n\n## Recent Failures\n- None.\n\n## Recent Repo Journal\n- Journal is empty.\n\n## Policies\n- Autopilot: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/autopilot_policy.yaml\n- Verification: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/verification_policy.yaml\n- Release: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/release_policy.yaml"
+  {
+   "id": "task-003",
+   "title": "feat(engine): 流式压缩长对话上下文",
+   "body": "接近窗口上限时自动压缩历史",
+   "status": "running",
+   "score": 91,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-003",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "agent 正在改 src/services"
+   }
+  },
+  {
+   "id": "task-004",
+   "title": "fix(tui): 主题切换时闪烁",
+   "body": "Ink 重挂载导致的全屏闪",
+   "status": "running",
+   "score": 74,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-004",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "定位到 key 缺失"
+   }
+  },
+  {
+   "id": "task-005",
+   "title": "feat(auth): profile 级凭据隔离",
+   "body": "每套 provider 配置独立 key",
+   "status": "verifying",
+   "score": 88,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-005",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "42 个用例全绿"
+   }
+  },
+  {
+   "id": "task-006",
+   "title": "feat(tools): MCP 外援工具热插拔",
+   "body": "运行时加载 MCP 服务器",
+   "status": "merged",
+   "score": 95,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-006",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "PR #214 已合并"
+   }
+  },
+  {
+   "id": "task-007",
+   "title": "fix(setup): 引导流程空指针",
+   "body": "workflow 选择器空值崩溃",
+   "status": "merged",
+   "score": 90,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-007",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "已合入主干"
+   }
+  },
+  {
+   "id": "task-008",
+   "title": "feat(voice): 语音输入实验",
+   "body": "Web Speech 接入 TUI",
+   "status": "failed",
+   "score": 41,
+   "score_reasons": [
+    "docs",
+    "tests"
+   ],
+   "source_kind": "issue",
+   "source_ref": "task-008",
+   "labels": [],
+   "updated_at": 1789479669.9828877,
+   "metadata": {
+    "last_note": "浏览器兼容性差，挂起"
+   }
+  }
+ ],
+ "journal": [
+  {
+   "timestamp": 1789481469.9828877,
+   "kind": "TaskPickedUp",
+   "task_id": "task-003",
+   "summary": "✅ 取到任务卡：流式压缩上下文"
+  },
+  {
+   "timestamp": 1789481769.9828877,
+   "kind": "PostToolUse",
+   "summary": "🔧 修改 src/services，重试通过"
+  },
+  {
+   "timestamp": 1789482069.9828877,
+   "kind": "VerificationRun",
+   "summary": "✅ 42 个用例全绿，进入验证"
+  },
+  {
+   "timestamp": 1789482369.9828877,
+   "kind": "CardCompleted",
+   "task_id": "task-006",
+   "summary": "🎉 PR #214 合并，快照已写入"
+  },
+  {
+   "timestamp": 1789482669.9828877,
+   "kind": "JournalExported",
+   "summary": "📦 快照导出到 dashboard"
+  }
+ ],
+ "policies": {
+  "autopilot": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/autopilot_policy.yaml",
+  "verification": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/verification_policy.yaml",
+  "release": "/home/tangjiabin/Xiaojin-AI/.openharness/autopilot/release_policy.yaml"
+ },
+ "active_context": "# Active Repo Context\n\nGenerated at: 2026-04-16 11:05:49 UTC\n\n## Current Task Focus\n- No active repo task focus yet.\n\n## In Progress\n- None.\n\n## Next Up\n- No queued items.\n\n## Recently Completed\n- None yet.\n\n## Recent Failures\n- None.\n\n## Recent Repo Journal\n- Journal is empty.\n\n## Policies\n- Autopilot: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/autopilot_policy.yaml\n- Verification: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/verification_policy.yaml\n- Release: /home/tangjiabin/Xiaojin-AI/.openharness/autopilot/release_policy.yaml"
 }

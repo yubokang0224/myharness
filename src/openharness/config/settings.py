@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from openharness.hooks.schemas import HookDefinition
 from openharness.mcp.types import McpServerConfig
@@ -106,6 +106,38 @@ class SandboxSettings(BaseModel):
     docker: DockerSandboxSettings = Field(default_factory=DockerSandboxSettings)
 
 
+class ModelSpec(BaseModel):
+    """Optional per-model metadata; legacy profile fields remain valid defaults."""
+
+    id: str = Field(min_length=1, max_length=160)
+    name: str = ""
+    context_window_tokens: int | None = Field(default=None, gt=0)
+    max_tokens: int | None = Field(default=None, gt=0)
+    auto_compact_threshold_tokens: int | None = Field(default=None, gt=0)
+    supports_vision: bool | None = None
+    reasoning_mode: str = "auto"
+    reasoning_effort: str | None = None
+
+    @model_validator(mode="after")
+    def validate_limits(self):
+        self.id = self.id.strip()
+        if not self.id:
+            raise ValueError("模型 ID 不能为空")
+        if self.reasoning_mode not in {"auto", "enabled", "disabled"}:
+            raise ValueError("无效的思考模式")
+        if self.reasoning_effort not in {None, "", "low", "medium", "high", "max"}:
+            raise ValueError("无效的思考强度")
+        if self.context_window_tokens:
+            if self.max_tokens and self.max_tokens > self.context_window_tokens:
+                raise ValueError("最大输出不能超过上下文容量")
+            if (
+                self.auto_compact_threshold_tokens
+                and self.auto_compact_threshold_tokens >= self.context_window_tokens
+            ):
+                raise ValueError("压缩阈值必须小于上下文容量")
+        return self
+
+
 class ProviderProfile(BaseModel):
     """Named provider workflow configuration."""
 
@@ -118,10 +150,18 @@ class ProviderProfile(BaseModel):
     last_model: str | None = None
     credential_slot: str | None = None
     allowed_models: list[str] = Field(default_factory=list)
+    models: list[ModelSpec] = Field(default_factory=list)
     max_tokens: int | None = None
     context_window_tokens: int | None = None
     auto_compact_threshold_tokens: int | None = None
     supports_vision: bool | None = None
+
+    @model_validator(mode="after")
+    def unique_model_ids(self):
+        ids = [m.id for m in self.models]
+        if len(ids) != len(set(ids)):
+            raise ValueError("同一连接下的模型 ID 不能重复")
+        return self
 
     @property
     def resolved_model(self) -> str:
@@ -173,7 +213,7 @@ def normalize_anthropic_model_name(model: str) -> str:
     normalized = model.strip()
     lower = normalized.lower()
     if lower.startswith("anthropic/"):
-        normalized = normalized[len("anthropic/"):]
+        normalized = normalized[len("anthropic/") :]
         lower = normalized.lower()
     if lower.startswith("claude-"):
         return normalized.replace(".", "-")
@@ -455,12 +495,11 @@ def _profile_from_flat_settings(settings: "Settings") -> tuple[str, ProviderProf
     defaults = default_provider_profiles()
     name = _infer_profile_name_from_flat_settings(settings)
     existing = defaults.get(name)
-    if existing is not None and (
-        existing.provider == settings.provider or not settings.provider
-    ) and (
-        existing.api_format == settings.api_format
-    ) and (
-        existing.base_url == settings.base_url
+    if (
+        existing is not None
+        and (existing.provider == settings.provider or not settings.provider)
+        and (existing.api_format == settings.api_format)
+        and (existing.base_url == settings.base_url)
     ):
         profile = existing.model_copy(
             update={
@@ -469,19 +508,27 @@ def _profile_from_flat_settings(settings: "Settings") -> tuple[str, ProviderProf
         )
         return name, profile
 
-    provider = settings.provider or ("copilot" if settings.api_format == "copilot" else ("openai" if settings.api_format == "openai" else "anthropic"))
+    provider = settings.provider or (
+        "copilot"
+        if settings.api_format == "copilot"
+        else ("openai" if settings.api_format == "openai" else "anthropic")
+    )
     profile = ProviderProfile(
         label=f"Imported {provider}",
         provider=provider,
         api_format=settings.api_format,
         auth_source=default_auth_source_for_provider(provider, settings.api_format),
-        default_model=settings.model or defaults.get("claude-api", ProviderProfile(
-            label="Claude API",
-            provider="anthropic",
-            api_format="anthropic",
-            auth_source="anthropic_api_key",
-            default_model="sonnet",
-        )).default_model,
+        default_model=settings.model
+        or defaults.get(
+            "claude-api",
+            ProviderProfile(
+                label="Claude API",
+                provider="anthropic",
+                api_format="anthropic",
+                auth_source="anthropic_api_key",
+                default_model="sonnet",
+            ),
+        ).default_model,
         last_model=settings.model or None,
         base_url=settings.base_url,
     )
@@ -523,44 +570,77 @@ class InternalApiSettings(BaseModel):
     dingtalk_token: str = ""
 
 
-class KbAgentAccess(BaseModel):
-    """Knowledge-base namespaces one agent may read from / write to."""
+DEFAULT_KB146_BASE_URL = "http://58.216.139.134:27517"
+DEFAULT_KB146_NAMESPACES: dict[str, str] = {
+    "official_kb": "正式企业知识库 (official_kb)",
+}
 
-    read: list[str] = Field(default_factory=list)
+
+class KbAgentAccess(BaseModel):
+    """Knowledge-base namespaces, folders, or specific documents one agent may read from."""
+
+    read: list[str] = Field(default_factory=lambda: ["official_kb"])
     write: list[str] = Field(default_factory=list)
     enabled: bool = True
+    # 检索粒度模式: "all" (全库) | "folders" (指定目录/子知识库) | "documents" (指定专属文档)
+    scope_mode: str = "all"
+    folder_ids: list[str] = Field(default_factory=list)
+    doc_ids: list[str] = Field(default_factory=list)
 
 
 class KbSettings(BaseModel):
-    """RAG semantic-hub integration used by the gateway /Kb proxy routes.
+    """RAG knowledge-base (KB146 / semantic-hub) integration used by the gateway /Kb proxy routes.
 
-    The hub JWT secret stays server-side: skills and the web UI always go
+    The JWT secret stays server-side: skills, tools, and the web UI always go
     through the gateway, which signs short-lived tokens scoped to the
     namespaces allowed for the calling agent.
     """
 
-    hub_base_url: str = ""
-    # 登录换 token 模式(hub 2026-07 起用账号签发 30 天 access_token):
-    # 配置了 hub_username/hub_password 时优先走登录;jwt_secret 仅作旧部署回退。
+    hub_base_url: str = DEFAULT_KB146_BASE_URL
+    # 兼容旧版登录换 token 模式；KB146 (:27517) 正式环境优先使用 jwt_secret + /v2/rag/queries
     hub_username: str = ""
     hub_password: str = ""
     jwt_secret: str = ""
-    jwt_ttl_seconds: int = 600
-    default_mode: str = "express"
-    default_top_k: int = 8
+    actor_id: str = "human:1"
+    jwt_ttl_seconds: int = 3600
+    default_mode: str = "hybrid"
+    default_top_k: int = 5
     timeout: float = 30.0
     # namespace -> human-readable label, drives the web UI pickers.
-    namespaces: dict[str, str] = Field(default_factory=dict)
+    namespaces: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_KB146_NAMESPACES)
+    )
     # agent name -> namespace access; the union of all lists is the hard ACL.
     agents: dict[str, KbAgentAccess] = Field(default_factory=dict)
 
+    def resolved_base_url(self) -> str:
+        raw = (
+            self.hub_base_url.strip()
+            or os.environ.get("KB146_BASE_URL", "").strip()
+            or DEFAULT_KB146_BASE_URL
+        )
+        return raw.rstrip("/")
+
+    def resolved_jwt_secret(self) -> str:
+        return (
+            self.jwt_secret.strip()
+            or os.environ.get("KB_JWT_SECRET", "").strip()
+        )
+
+    def effective_namespaces(self) -> dict[str, str]:
+        if self.namespaces:
+            return dict(self.namespaces)
+        return dict(DEFAULT_KB146_NAMESPACES)
+
     @property
     def is_configured(self) -> bool:
-        has_auth = bool(self.hub_username.strip() and self.hub_password) or bool(self.jwt_secret)
-        return bool(self.hub_base_url.strip() and has_auth)
+        has_auth = bool(self.resolved_jwt_secret()) or bool(
+            self.hub_username.strip() and self.hub_password
+        )
+        return bool(self.resolved_base_url() and has_auth)
 
     def readable_namespaces(self) -> set[str]:
-        names = set(self.namespaces)
+        names = set(self.effective_namespaces())
         for access in self.agents.values():
             names.update(access.read)
         return names
@@ -570,6 +650,25 @@ class KbSettings(BaseModel):
         for access in self.agents.values():
             names.update(access.write)
         return names
+
+    def is_agent_enabled(self, agent_name: str | None) -> bool:
+        if not agent_name:
+            return True
+        access = self.agents.get(agent_name.strip())
+        if access is None:
+            return True
+        return bool(access.enabled)
+
+    def agent_readable_namespaces(self, agent_name: str | None) -> list[str]:
+        default_ns = list(self.effective_namespaces().keys())
+        if not agent_name:
+            return default_ns
+        access = self.agents.get(agent_name.strip())
+        if access is None:
+            return default_ns
+        if not access.enabled:
+            return []
+        return list(access.read) if access.read else default_ns
 
 
 class Settings(BaseModel):
@@ -606,6 +705,8 @@ class Settings(BaseModel):
     voice_mode: bool = False
     fast_mode: bool = False
     effort: str = "medium"
+    model_reasoning_mode: str = "auto"
+    model_reasoning_effort: str | None = None
     passes: int = 1
     verbose: bool = False
 
@@ -647,7 +748,7 @@ class Settings(BaseModel):
         """Project the active profile back onto legacy flat settings fields."""
         profile_name, profile = self.resolve_profile()
         configured_model = (profile.last_model or "").strip() or profile.default_model
-        return self.model_copy(
+        resolved = self.model_copy(
             update={
                 "active_profile": profile_name,
                 "profiles": self.merged_profiles(),
@@ -665,6 +766,10 @@ class Settings(BaseModel):
                 ),
             }
         )
+
+        from openharness.config.model_catalog import apply_model_parameters
+
+        return apply_model_parameters(resolved, profile, resolved.model)
 
     def sync_active_profile_from_flat_fields(self) -> Settings:
         """Fold legacy flat provider fields back into the active profile.
@@ -699,7 +804,9 @@ class Settings(BaseModel):
             next_model = flat_model
         else:
             next_model = profile.last_model
-        current_default_auth = default_auth_source_for_provider(profile.provider, profile.api_format)
+        current_default_auth = default_auth_source_for_provider(
+            profile.provider, profile.api_format
+        )
         next_auth_source = profile.auth_source
         if not next_auth_source or next_auth_source == current_default_auth:
             next_auth_source = default_auth_source_for_provider(next_provider, next_api_format)
@@ -768,7 +875,9 @@ class Settings(BaseModel):
         """Resolve auth for the current provider, including subscription bridges."""
         profile_name, profile = self.resolve_profile()
         provider = profile.provider.strip()
-        auth_source = profile.auth_source.strip() or default_auth_source_for_provider(provider, profile.api_format)
+        auth_source = profile.auth_source.strip() or default_auth_source_for_provider(
+            provider, profile.api_format
+        )
         if auth_source in {"codex_subscription", "claude_subscription"}:
             from openharness.auth.external import (
                 is_third_party_anthropic_endpoint,
@@ -776,7 +885,9 @@ class Settings(BaseModel):
             )
             from openharness.auth.storage import load_external_binding
 
-            if auth_source == "claude_subscription" and is_third_party_anthropic_endpoint(profile.base_url):
+            if auth_source == "claude_subscription" and is_third_party_anthropic_endpoint(
+                profile.base_url
+            ):
                 raise ValueError(
                     "Claude subscription auth only supports direct Anthropic/Claude endpoints. "
                     "Use an API-key-backed Anthropic-compatible profile for third-party base URLs."
@@ -919,7 +1030,9 @@ def _apply_env_overrides(settings: Settings) -> Settings:
     _, active_profile = settings.resolve_profile()
     profile_has_base_url = active_profile.base_url is not None
     profile_explicit_model = (active_profile.last_model or "").strip()
-    profile_has_explicit_model = bool(profile_explicit_model) and profile_explicit_model.lower() not in {"", "default"}
+    profile_has_explicit_model = bool(
+        profile_explicit_model
+    ) and profile_explicit_model.lower() not in {"", "default"}
 
     # --- model ---
     openharness_model = os.environ.get("OPENHARNESS_MODEL")
@@ -974,9 +1087,7 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         internal_updates["agent_api_base_url"] = internal_agent_base_url.strip()
     if internal_allowlist is not None:
         internal_updates["allowlist"] = [
-            item.strip()
-            for item in internal_allowlist.split(",")
-            if item.strip()
+            item.strip() for item in internal_allowlist.split(",") if item.strip()
         ]
     if internal_dingtalk_token is not None:
         internal_updates["dingtalk_token"] = internal_dingtalk_token.strip()

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from typing import Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from openharness.config.settings import ModelSpec
 
 
 class ProviderProfileOut(BaseModel):
@@ -22,6 +23,7 @@ class ProviderProfileOut(BaseModel):
     auto_compact_threshold_tokens: int | None = None
     supports_vision: bool | None = None
     credential_slot: str | None = None
+    models: list[ModelSpec] = Field(default_factory=list)
     is_builtin: bool = True
     # resolved model actually in use
     resolved_model: str = ""
@@ -95,9 +97,11 @@ class CreateProfileIn(BaseModel):
     auto_compact_threshold_tokens: int | None = None
     supports_vision: bool | None = None
     credential_slot: str | None = None
+    models: list[ModelSpec] = Field(default_factory=list)
 
 
 class UpdateProfileIn(BaseModel):
+    models: list[ModelSpec] | None = None
     """Request body to update an existing profile."""
 
     label: str | None = None
@@ -123,3 +127,7 @@ class ApiKeyStatusOut(BaseModel):
     auth_source: str
     status: str  # "configured" | "missing"
     source: str = ""  # "env" | "file" | "missing"
+
+
+class TestModelIn(BaseModel):
+    model: str | None = None

@@ -15,7 +15,12 @@ from openharness.api.copilot_client import CopilotClient
 from openharness.api.openai_client import OpenAICompatibleClient
 from openharness.api.provider import auth_status, detect_provider
 from openharness.bridge import get_bridge_manager
-from openharness.commands import CommandContext, CommandResult, MemoryCommandBackend, create_default_command_registry
+from openharness.commands import (
+    CommandContext,
+    CommandResult,
+    MemoryCommandBackend,
+    create_default_command_registry,
+)
 from openharness.config import get_config_file_path, load_settings
 from openharness.engine import QueryEngine
 from openharness.engine.messages import (
@@ -140,7 +145,9 @@ class RuntimeBundle:
             if status.tools:
                 lines.append(f"  tools: {', '.join(tool.name for tool in status.tools)}")
             if status.resources:
-                lines.append(f"  resources: {', '.join(resource.uri for resource in status.resources)}")
+                lines.append(
+                    f"  resources: {', '.join(resource.uri for resource in status.resources)}"
+                )
         return "\n".join(lines)
 
 
@@ -166,7 +173,8 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
 
         copilot_model = (
             COPILOT_DEFAULT_MODEL
-            if settings.model in {"claude-sonnet-4-20250514", "claude-sonnet-4-6", "sonnet", "default"}
+            if settings.model
+            in {"claude-sonnet-4-20250514", "claude-sonnet-4-6", "sonnet", "default"}
             else settings.model
         )
         return CopilotClient(model=copilot_model)
@@ -189,6 +197,8 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             api_key=auth.value,
             base_url=settings.base_url,
             timeout=settings.timeout,
+            reasoning_mode=settings.model_reasoning_mode,
+            reasoning_effort=settings.model_reasoning_effort,
         )
     auth = _safe_resolve_auth()
     return AnthropicApiClient(
@@ -220,6 +230,7 @@ async def build_runtime(
     extra_plugin_roots: Iterable[str | Path] | None = None,
     memory_backend: MemoryCommandBackend | None = None,
     include_project_memory: bool = True,
+    resolved_settings: Any | None = None,
 ) -> RuntimeBundle:
     """Build the shared runtime for an OpenHarness session."""
     settings_overrides: dict[str, Any] = {
@@ -232,7 +243,7 @@ async def build_runtime(
         "active_profile": active_profile,
         "permission_mode": permission_mode,
     }
-    settings = load_settings().merge_cli_overrides(**settings_overrides)
+    settings = resolved_settings or load_settings().merge_cli_overrides(**settings_overrides)
     _, active_provider_profile = settings.resolve_profile()
     from openharness.utils.internal_api_auth import (
         USER_BEARER_TOKEN_ENV,
@@ -242,8 +253,12 @@ async def build_runtime(
     hsjm_auth_metadata = make_hsjm_auth_metadata(os.environ.get(USER_BEARER_TOKEN_ENV))
     hsjm_tool_metadata = {"hsjm_auth": hsjm_auth_metadata} if hsjm_auth_metadata else {}
     cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(Path.cwd())
-    normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
-    normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
+    normalized_skill_dirs = tuple(
+        str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ())
+    )
+    normalized_plugin_roots = tuple(
+        str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ())
+    )
     plugins = load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
     if api_client:
         resolved_api_client = api_client
@@ -280,7 +295,9 @@ async def build_runtime(
             fast_mode=settings.fast_mode,
             effort=settings.effort,
             passes=settings.passes,
-            mcp_connected=sum(1 for status in mcp_manager.list_statuses() if status.state == "connected"),
+            mcp_connected=sum(
+                1 for status in mcp_manager.list_statuses() if status.state == "connected"
+            ),
             mcp_failed=sum(1 for status in mcp_manager.list_statuses() if status.state == "failed"),
             bridge_sessions=len(bridge_manager.list_sessions()),
             output_style=settings.output_style,
@@ -289,7 +306,9 @@ async def build_runtime(
     )
     hook_reloader = HookReloader(get_config_file_path())
     hook_executor = HookExecutor(
-        hook_reloader.current_registry() if api_client is None else load_hook_registry(settings, plugins),
+        hook_reloader.current_registry()
+        if api_client is None
+        else load_hook_registry(settings, plugins),
         HookExecutionContext(
             cwd=Path(cwd).resolve(),
             api_client=resolved_api_client,
@@ -340,10 +359,10 @@ async def build_runtime(
         model=settings.model,
         system_prompt=system_prompt_text,
         max_tokens=settings.max_tokens,
-        context_window_tokens=settings.context_window_tokens or settings.memory.context_window_tokens,
+        context_window_tokens=settings.context_window_tokens
+        or settings.memory.context_window_tokens,
         auto_compact_threshold_tokens=(
-            settings.auto_compact_threshold_tokens
-            or settings.memory.auto_compact_threshold_tokens
+            settings.auto_compact_threshold_tokens or settings.memory.auto_compact_threshold_tokens
         ),
         max_turns=engine_max_turns,
         permission_prompt=permission_prompt,
@@ -383,10 +402,7 @@ async def build_runtime(
         engine=engine,
         commands=create_default_command_registry(
             plugin_commands=[
-                command
-                for plugin in plugins
-                if plugin.enabled
-                for command in plugin.commands
+                command for plugin in plugins if plugin.enabled for command in plugin.commands
             ]
         ),
         external_api_client=api_client is not None,
@@ -417,6 +433,7 @@ async def close_runtime(bundle: RuntimeBundle) -> None:
     # Extract local environment rules from session before closing
     try:
         from openharness.personalization.session_hook import update_rules_from_session
+
         update_rules_from_session(bundle.engine.messages)
     except Exception:
         pass  # personalization is best-effort, never block session end
@@ -480,9 +497,7 @@ def _format_pending_tool_results(messages: list[ConversationMessage]) -> str | N
                 f"- {tu.name} {_truncate(raw_input, 200)} -> {_truncate(tr.content.strip(), 400)}"
             )
         else:
-            lines.append(
-                f"- tool_result[{tr.tool_use_id}] -> {_truncate(tr.content.strip(), 400)}"
-            )
+            lines.append(f"- tool_result[{tr.tool_use_id}] -> {_truncate(tr.content.strip(), 400)}")
 
     if len(tool_results) > max_results:
         lines.append(f"(+{len(tool_results) - max_results} more tool results)")
@@ -512,8 +527,12 @@ def sync_app_state(bundle: RuntimeBundle) -> None:
         fast_mode=settings.fast_mode,
         effort=settings.effort,
         passes=settings.passes,
-        mcp_connected=sum(1 for status in bundle.mcp_manager.list_statuses() if status.state == "connected"),
-        mcp_failed=sum(1 for status in bundle.mcp_manager.list_statuses() if status.state == "failed"),
+        mcp_connected=sum(
+            1 for status in bundle.mcp_manager.list_statuses() if status.state == "connected"
+        ),
+        mcp_failed=sum(
+            1 for status in bundle.mcp_manager.list_statuses() if status.state == "failed"
+        ),
         bridge_sessions=len(get_bridge_manager().list_sessions()),
         output_style=settings.output_style,
         keybindings=load_keybindings(),
@@ -620,7 +639,11 @@ async def handle_line(
                 include_project_memory=bundle.include_project_memory,
             )
             bundle.engine.set_system_prompt(system_prompt)
-            turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
+            turns = (
+                result.continue_turns
+                if result.continue_turns is not None
+                else bundle.engine.max_turns
+            )
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
                     await render_event(event)

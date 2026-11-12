@@ -43,10 +43,220 @@ def _system_exception_ack_status() -> int:
 
 # 网页对话可就地渲染 ```echarts 代码块;钉钉渲染不了,发送前替换为提示
 _ECHARTS_BLOCK_RE = re.compile(r"```echarts\s*\n.*?```", re.DOTALL | re.IGNORECASE)
+_THINKING_BLOCK_RE = re.compile(
+    r"<(?:think|thinking)>[\s\S]*?</(?:think|thinking)>\s*",
+    re.IGNORECASE,
+)
+_THINKING_OPEN_RE = re.compile(r"<(?:think|thinking)>", re.IGNORECASE)
+_THINKING_CLOSE_RE = re.compile(r"</(?:think|thinking)>", re.IGNORECASE)
+_THINKING_TAG_RE = re.compile(r"</?(?:think|thinking)>", re.IGNORECASE)
+_FENCED_CODE_SPLIT_RE = re.compile(r"(```[\s\S]*?```)")
+_ARTIFACT_LINK_RE = re.compile(r"\[([^\]]+)\]\(artifact://([^)]+)\)")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_ATX_HEADING_MISSING_SPACE_RE = re.compile(r"^(#{1,6})([^\s#])", re.MULTILINE)
+_EXCESS_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+DEFAULT_DINGTALK_MARKDOWN_TITLE = "小锦助手"
+MAX_DINGTALK_MARKDOWN_CHARS = 3500
 
 
 def _strip_echarts_blocks(content: str) -> str:
-    return _ECHARTS_BLOCK_RE.sub("(图表仅网页对话可显示，此处省略；数据见上方表格)", content)
+    return _ECHARTS_BLOCK_RE.sub(
+        "> 📊 *（图表仅支持在网页对话界面交互查看，核心数据见正文说明）*",
+        content,
+    )
+
+
+def _strip_thinking_blocks(content: str) -> str:
+    """剥离模型输出中的 <think>/<thinking> 推理标签块，避免内部推理草稿泄露到钉钉消息。"""
+    if not content:
+        return ""
+    cleaned = _THINKING_BLOCK_RE.sub("", content)
+
+    while True:
+        close_match = _THINKING_CLOSE_RE.search(cleaned)
+        if close_match is None:
+            break
+        open_match = _THINKING_OPEN_RE.search(cleaned)
+        if open_match is not None and open_match.start() < close_match.start():
+            break
+        cleaned = cleaned[close_match.end() :]
+
+    open_match = _THINKING_OPEN_RE.search(cleaned)
+    if open_match is not None:
+        cleaned = cleaned[: open_match.start()]
+
+    cleaned = cleaned.strip()
+    if cleaned:
+        return cleaned
+    return _THINKING_TAG_RE.sub("", content).strip()
+
+
+def _replace_artifact_links(segment: str) -> str:
+    """将网页端专用的 [文件名](artifact://文件名) 链接转换为钉钉友好的文本标注。"""
+    def _repl(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        raw_target = unquote(match.group(2).strip())
+        target_name = os.path.basename(raw_target) or raw_target
+        if not label or label == target_name or target_name in label:
+            return f"📄 **{label or target_name}**"
+        return f"📄 **{label}**（`{target_name}`）"
+
+    return _ARTIFACT_LINK_RE.sub(_repl, segment)
+
+
+def _format_dingtalk_markdown(content: str) -> str:
+    """净化并优化钉钉 sampleMarkdown 文本：剥离思考块、转换产物死链、修正标题空格。"""
+    cleaned = _strip_thinking_blocks(content)
+    if not cleaned:
+        return ""
+    cleaned = _strip_echarts_blocks(cleaned)
+
+    parts = _FENCED_CODE_SPLIT_RE.split(cleaned)
+    formatted_parts: list[str] = []
+    for index, part in enumerate(parts):
+        if index % 2 == 1:
+            # 围栏代码块内部保持原样
+            formatted_parts.append(part)
+            continue
+        segment = _replace_artifact_links(part)
+        segment = _ATX_HEADING_MISSING_SPACE_RE.sub(r"\1 \2", segment)
+        segment = _EXCESS_BLANK_LINES_RE.sub("\n\n", segment)
+        formatted_parts.append(segment)
+
+    return "".join(formatted_parts).strip()
+
+
+def _clean_title_line(line: str) -> str:
+    text = line.strip()
+    text = re.sub(r"^#{1,6}\s*", "", text)
+    text = re.sub(r"^>\s*", "", text)
+    text = re.sub(r"^[-*+]\s+", "", text)
+    text = re.sub(r"^\d+[.)、]\s*", "", text)
+    text = _ARTIFACT_LINK_RE.sub(r"\1", text)
+    text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = re.sub(r"[*_`~]+", "", text)
+    text = " ".join(text.split())
+    return text.strip(" ：:;；，,。!！?？-")
+
+
+def _extract_dingtalk_markdown_title(
+    content: str,
+    *,
+    default_title: str = DEFAULT_DINGTALK_MARKDOWN_TITLE,
+    max_len: int = 28,
+) -> str:
+    """从 Markdown 正文中提取钉钉会话列表预览标题，替代固定的英文 Nanobot Reply。"""
+    fallback = (
+        (default_title or DEFAULT_DINGTALK_MARKDOWN_TITLE).strip()
+        or DEFAULT_DINGTALK_MARKDOWN_TITLE
+    )
+    if not content or not content.strip():
+        return fallback
+
+    in_fence = False
+    non_empty_lines: list[str] = []
+    heading_candidate: str | None = None
+
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not stripped:
+            continue
+        if re.fullmatch(r"[-*_]{3,}", stripped):
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            continue
+        if stripped.startswith("#") and heading_candidate is None and len(non_empty_lines) < 5:
+            cleaned_heading = _clean_title_line(stripped)
+            if cleaned_heading:
+                heading_candidate = cleaned_heading
+                break
+        cleaned_line = _clean_title_line(stripped)
+        if cleaned_line:
+            non_empty_lines.append(cleaned_line)
+            if len(non_empty_lines) >= 5:
+                break
+
+    chosen = heading_candidate or (non_empty_lines[0] if non_empty_lines else "")
+    if not chosen:
+        return fallback
+    if len(chosen) > max_len:
+        return chosen[: max_len - 1].rstrip() + "…"
+    return chosen
+
+
+def _split_dingtalk_markdown_chunks(
+    content: str,
+    *,
+    max_chars: int = MAX_DINGTALK_MARKDOWN_CHARS,
+) -> list[str]:
+    """将超长钉钉 Markdown 消息按段落与代码块边界安全分段，防止代码块截断或接口拒收。"""
+    text = (content or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    raw_chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+    in_fence = False
+    fence_header = "```"
+
+    def _flush_chunk(*, reopen_fence: bool) -> None:
+        nonlocal current_lines, current_len
+        if not current_lines:
+            return
+        if reopen_fence:
+            current_lines.append("```")
+        chunk_text = "\n".join(current_lines).strip()
+        if chunk_text:
+            raw_chunks.append(chunk_text)
+        current_lines = [fence_header] if reopen_fence else []
+        current_len = len(fence_header) + 1 if reopen_fence else 0
+
+    for line in text.splitlines():
+        line_cost = len(line) + (1 if current_lines else 0)
+        if current_lines and current_len + line_cost > max_chars:
+            _flush_chunk(reopen_fence=in_fence)
+
+        while len(line) > max_chars:
+            slice_len = max(200, max_chars - current_len - 10)
+            part = line[:slice_len]
+            line = line[slice_len:]
+            current_lines.append(part)
+            current_len += len(part) + 1
+            _flush_chunk(reopen_fence=in_fence)
+
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if not in_fence:
+                in_fence = True
+                fence_header = stripped
+            else:
+                in_fence = False
+                fence_header = "```"
+
+        current_lines.append(line)
+        current_len += len(line) + 1
+
+    if current_lines:
+        if in_fence:
+            current_lines.append("```")
+        chunk_text = "\n".join(current_lines).strip()
+        if chunk_text:
+            raw_chunks.append(chunk_text)
+
+    total = len(raw_chunks)
+    if total <= 1:
+        return raw_chunks
+    return [
+        f"{chunk}\n\n---\n> 📄 *第 {idx}/{total} 页*"
+        for idx, chunk in enumerate(raw_chunks, start=1)
+    ]
 
 try:
     from dingtalk_stream import (
@@ -1200,13 +1410,40 @@ class DingTalkChannel(BaseChannel):
             logger.error("Error sending DingTalk message msgKey=%s err=%s", msg_key, e)
             return False
 
+    def _default_markdown_title(self) -> str:
+        for candidate in (self.default_agent, self.bot_name):
+            text = str(candidate or "").strip()
+            if text and text.lower() not in {
+                "default",
+                "dingtalk",
+                "dingtalk-bot",
+                "general-purpose",
+            }:
+                return text
+        return DEFAULT_DINGTALK_MARKDOWN_TITLE
+
     async def _send_markdown_text(self, token: str, chat_id: str, content: str) -> bool:
-        return await self._send_batch_message(
-            token,
-            chat_id,
-            "sampleMarkdown",
-            {"text": _strip_echarts_blocks(content), "title": "Nanobot Reply"},
+        formatted = _format_dingtalk_markdown(content)
+        if not formatted:
+            return True
+        base_title = _extract_dingtalk_markdown_title(
+            formatted,
+            default_title=self._default_markdown_title(),
         )
+        chunks = _split_dingtalk_markdown_chunks(formatted)
+        total = len(chunks)
+        all_ok = True
+        for index, chunk in enumerate(chunks, start=1):
+            title = f"{base_title} ({index}/{total})" if total > 1 else base_title
+            ok = await self._send_batch_message(
+                token,
+                chat_id,
+                "sampleMarkdown",
+                {"text": chunk, "title": title},
+            )
+            if not ok:
+                all_ok = False
+        return all_ok
 
     async def _send_media_ref(self, token: str, chat_id: str, media_ref: str) -> bool:
         media_ref = (media_ref or "").strip()
@@ -1286,7 +1523,7 @@ class DingTalkChannel(BaseChannel):
             await self._send_markdown_text(
                 token,
                 msg.chat_id,
-                f"[Attachment send failed: {filename}]",
+                f"⚠️ 附件发送失败：{filename}",
             )
 
     async def _on_message(

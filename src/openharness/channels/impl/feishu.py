@@ -254,9 +254,21 @@ class FeishuChannel(BaseChannel):
 
     name = "feishu"
 
-    def __init__(self, config: FeishuConfig, bus: MessageBus):
+    def __init__(
+        self,
+        config: FeishuConfig,
+        bus: MessageBus,
+        *,
+        channel_name: str | None = None,
+        bot_name: str = "default",
+        default_agent: str | None = None,
+    ):
         super().__init__(config, bus)
         self.config: FeishuConfig = config
+        if channel_name:
+            self.name = channel_name
+        self.bot_name = bot_name
+        self.default_agent = default_agent or getattr(config, "default_agent", None) or None
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
@@ -1025,6 +1037,10 @@ class FeishuChannel(BaseChannel):
                 content=content,
                 media=media_paths,
                 metadata={
+                    "bot_name": getattr(self, "bot_name", "default"),
+                    "default_agent": getattr(self, "default_agent", None),
+                    "platform": "feishu",
+                    "source_app_id": str(self.config.app_id or ""),
                     "message_id": message_id,
                     "thread_id": thread_id,
                     "root_id": getattr(message, "root_id", None),
